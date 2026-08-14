@@ -7,7 +7,7 @@
   "mcpServers": {
     "toolgate": {
       "transport": "stdio",
-      "command": "python",
+      "command": ".venv-toolgate-mcp/bin/python",
       "args": ["../toolgate/toolgate/mcp/toolgate_mcp.py"],
       "lifecycle": "eager",
       "env": {
@@ -18,4 +18,3 @@
     }
   }
 }
-
