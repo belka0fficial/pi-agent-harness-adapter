@@ -1,0 +1,21 @@
+{
+  "settings": {
+    "toolPrefix": "mcp",
+    "requestTimeoutMs": 30000,
+    "maxRetries": 5
+  },
+  "mcpServers": {
+    "toolgate": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["../toolgate/toolgate/mcp/toolgate_mcp.py"],
+      "lifecycle": "eager",
+      "env": {
+        "TOOLGATE_MCP_ACTOR": "Brain Pi MCP",
+        "TOOLGATE_MCP_PRESERVE_IDS": "0",
+        "TOOLGATE_SKILL_INJECTION": "1"
+      }
+    }
+  }
+}
+

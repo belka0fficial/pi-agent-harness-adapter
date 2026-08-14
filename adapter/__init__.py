@@ -1,0 +1,2 @@
+"""Brain AgentGate compatibility adapter."""
+
