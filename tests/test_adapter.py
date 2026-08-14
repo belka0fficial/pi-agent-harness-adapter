@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from fastapi.testclient import TestClient
 
 from adapter.main import app
-from adapter.pi_client import PiEvent
+from adapter.pi_client import PiEvent, translate_pi_item
 
 
 @dataclass
@@ -39,3 +39,72 @@ def test_unimplemented_contract_returns_501():
     with TestClient(app) as client:
         assert client.get("/api/model/options").status_code == 501
 
+
+def test_translate_real_pi_text_and_tool_events():
+    run_id = "run-real"
+    text_state = {"seen_delta": False}
+
+    session_events = translate_pi_item(
+        {
+            "type": "session",
+            "id": "01-session",
+            "cwd": "/tmp/project",
+            "timestamp": "2026-08-14T19:48:10.880Z",
+        },
+        run_id=run_id,
+        text_state=text_state,
+    )
+    tool_start_events = translate_pi_item(
+        {
+            "type": "tool_execution_start",
+            "toolName": "ls",
+            "args": {"path": ".", "limit": 2},
+        },
+        run_id=run_id,
+        text_state=text_state,
+    )
+    delta_events = translate_pi_item(
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "OK"},
+        },
+        run_id=run_id,
+        text_state=text_state,
+    )
+    completed_events = translate_pi_item(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "OK"}],
+                "stopReason": "stop",
+            },
+        },
+        run_id=run_id,
+        text_state=text_state,
+    )
+
+    assert session_events[0].event == "run.started"
+    assert session_events[0].data["session_id"] == "01-session"
+    assert tool_start_events[0].event == "tool.started"
+    assert tool_start_events[0].data["tool_name"] == "ls"
+    assert delta_events == [PiEvent("message.delta", {"run_id": run_id, "delta": "OK"})]
+    assert completed_events[0].event == "message.completed"
+
+
+def test_translate_real_pi_aborted_turn_into_run_failed():
+    events = translate_pi_item(
+        {
+            "type": "turn_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "aborted",
+                "errorMessage": "Request was aborted",
+            },
+        },
+        run_id="run-abort",
+        text_state={"seen_delta": False},
+    )
+
+    assert events == [PiEvent("run.failed", {"run_id": "run-abort", "message": "Request was aborted"})]
