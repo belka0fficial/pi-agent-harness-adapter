@@ -1,6 +1,6 @@
 # AgentGate-Hermes Compatibility Contract
 
-Frozen from `agentgate/api/agentgate/main.py` on this overnight run. `brain/adapter` must expose this surface before AgentGate can be pointed at Brain instead of Hermes.
+Frozen from `agentgate/api/agentgate/main.py` on this overnight run. `pi-agent-harness-adapter/adapter` must expose this surface before AgentGate can be pointed at the Pi adapter instead of Hermes.
 
 ## Health
 
@@ -96,5 +96,4 @@ Job fields rendered by AgentGate:
 
 Pi supports non-interactive `--mode json` and `--mode rpc`, and project trust for non-interactive modes is controlled with `--approve` / `--no-approve` or global `defaultProjectTrust`. Pi's MCP support is extension-based through `pi-mcp-extension`, which reads `~/.pi/agent/mcp.json` or project `.pi/mcp.json`.
 
-For tonight, Brain includes a project `.pi/mcp.json` registering the ToolGate stdio bridge. If Pi's native RPC event schema differs from the assumed JSON-line events in `adapter/pi_client.py`, the next pass should replace that small parser only; the AgentGate contract should stay unchanged.
-
+For tonight, Pi Agent Harness Adapter includes a project `.pi/mcp.json` registering the ToolGate stdio bridge. If Pi's native RPC event schema differs from the assumed JSON-line events in `adapter/pi_client.py`, the next pass should replace that small parser only; the AgentGate contract should stay unchanged.

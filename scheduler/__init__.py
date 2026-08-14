@@ -1,2 +1,1 @@
-"""Brain scheduler service."""
-
+"""Pi agent harness scheduler service."""

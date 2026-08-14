@@ -20,7 +20,7 @@ class ChatInput(BaseModel):
     instructions: str | None = None
 
 
-app = FastAPI(title="Brain Adapter", version="0.1.0")
+app = FastAPI(title="Pi Agent Harness Adapter", version="0.1.0")
 app.state.sessions = {}
 app.state.messages = {}
 app.state.pi = PiClient()
@@ -31,17 +31,17 @@ def now() -> str:
 
 
 def not_ready(name: str):
-    raise HTTPException(501, f"TODO: Brain adapter contract stub for {name}")
+    raise HTTPException(501, f"TODO: Pi adapter contract stub for {name}")
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "brain-adapter"}
+    return {"status": "ok", "service": "pi-agent-harness-adapter"}
 
 
 @app.get("/health/detailed")
 def detailed_health():
-    return {"status": "ok", "service": "brain-adapter", "pi": "configured"}
+    return {"status": "ok", "service": "pi-agent-harness-adapter", "pi": "configured"}
 
 
 @app.post("/api/sessions")
@@ -129,4 +129,3 @@ def stop_run(run_id: str):
 @app.post("/v1/runs/{run_id}/approval")
 def approve_run(run_id: str, payload: dict[str, Any]):
     return not_ready("run approval")
-

@@ -1,4 +1,4 @@
-# Brain
+# Pi Agent Harness Adapter
 
 Pi-backed adapter scaffold for the AgentGate/Hermes contract.
 
@@ -29,4 +29,3 @@ pi install npm:pi-mcp-extension
 ```
 
 Pi supports JSON/RPC modes and project MCP config through `pi-mcp-extension`; see `CONTRACT.md` for notes.
-

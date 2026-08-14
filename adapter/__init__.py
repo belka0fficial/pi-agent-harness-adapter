@@ -1,2 +1,1 @@
-"""Brain AgentGate compatibility adapter."""
-
+"""Pi AgentGate compatibility adapter."""

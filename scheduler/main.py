@@ -20,7 +20,7 @@ class JobInput(BaseModel):
     webhook_url: str | None = None
 
 
-app = FastAPI(title="Brain Scheduler", version="0.1.0")
+app = FastAPI(title="Pi Agent Harness Scheduler", version="0.1.0")
 app.state.scheduler = AsyncIOScheduler()
 app.state.jobs = {}
 app.state.pi = PiClient()
