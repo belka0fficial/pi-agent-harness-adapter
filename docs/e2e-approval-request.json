@@ -1,0 +1,28 @@
+{
+  "kind": "verification",
+  "title": "Run Approval Test Echo",
+  "details": "Owner confirmation is required for this exact immutable tool invocation.",
+  "actor": "Hermes MCP",
+  "payload": {
+    "subject_type": "tool",
+    "subject_id": "approval.test-echo",
+    "args": {
+      "value": "APPROVAL_OK"
+    },
+    "binding": {
+      "subject_type": "tool",
+      "subject_id": "approval.test-echo",
+      "version": 1,
+      "args_digest": "21354296b39425370cb4d921f6d882192bcbe89db9398fbbd040602b0c042962",
+      "nonce": "-k8rlaskB9NVjcZ1Ned7oBJNzvabXgDH",
+      "expires_at": "2026-08-14T20:16:01.058855+00:00",
+      "consumed_at": null
+    },
+    "created_by_agent_key": "local-mcp"
+  },
+  "severity": "warning",
+  "status": "pending",
+  "id": "60d7dd67-4cc0-4577-9bd2-60d4d778de5c",
+  "created_at": "2026-08-14T20:15:01.058942+00:00",
+  "updated_at": "2026-08-14T20:15:01.058942+00:00"
+}

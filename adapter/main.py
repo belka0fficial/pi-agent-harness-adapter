@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
+import subprocess
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -28,10 +30,6 @@ app.state.pi = PiClient()
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def not_ready(name: str):
-    raise HTTPException(501, f"TODO: Pi adapter contract stub for {name}")
 
 
 @app.get("/health")
@@ -60,17 +58,30 @@ def list_sessions():
 
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: str):
-    return app.state.sessions.get(session_id) or not_ready("get session")
+    item = app.state.sessions.get(session_id)
+    if not item:
+        raise HTTPException(404, "session not found")
+    return item
 
 
 @app.patch("/api/sessions/{session_id}")
 def update_session(session_id: str, payload: dict[str, Any]):
-    return not_ready("update session")
+    item = app.state.sessions.get(session_id)
+    if not item:
+        raise HTTPException(404, "session not found")
+    if isinstance(payload.get("title"), str) and payload["title"].strip():
+        item["title"] = payload["title"].strip()
+    item["updated_at"] = now()
+    return item
 
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
-    return not_ready("delete session")
+    if session_id not in app.state.sessions:
+        raise HTTPException(404, "session not found")
+    app.state.sessions.pop(session_id, None)
+    app.state.messages.pop(session_id, None)
+    return {"deleted": True}
 
 
 @app.get("/api/sessions/{session_id}/messages")
@@ -79,8 +90,23 @@ def messages(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/fork")
-def fork_session(session_id: str, payload: dict[str, Any]):
-    return not_ready("fork session")
+async def fork_session(session_id: str, payload: dict[str, Any]):
+    source = app.state.sessions.get(session_id)
+    if not source:
+        raise HTTPException(404, "session not found")
+    new_session_id = f"sess_{uuid.uuid4().hex[:12]}"
+    item = {
+        "id": new_session_id,
+        "session_id": new_session_id,
+        "title": payload.get("title") or f"Fork of {source.get('title') or session_id}",
+        "created_at": now(),
+        "updated_at": now(),
+        "parent_session_id": session_id,
+    }
+    app.state.sessions[new_session_id] = item
+    app.state.messages[new_session_id] = list(app.state.messages.get(session_id, []))
+    await app.state.pi.fork_session(session_id, new_session_id)
+    return item
 
 
 @app.post("/api/sessions/{session_id}/chat/stream")
@@ -106,26 +132,47 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
 
 @app.get("/api/model/options")
 def models():
-    return not_ready("model options")
+    command = app.state.pi.command
+    try:
+        result = subprocess.run([command, "--list-models"], check=True, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return {"models": [], "providers": []}
+    models = []
+    for line in result.stdout.splitlines():
+        value = line.strip()
+        if value and not value.lower().startswith("provider"):
+            models.append({"id": value, "name": value})
+    return {"models": models, "providers": sorted({value.split("/", 1)[0] for value in [item["id"] for item in models] if "/" in value})}
 
 
 @app.get("/v1/capabilities")
 def capabilities():
-    return {"skills": False, "toolsets": False, "runs": False, "jobs": True}
+    return {"skills": False, "toolsets": False, "runs": True, "jobs": True}
 
 
 @app.get("/v1/{kind}")
 def capability_kind(kind: str):
     if kind in {"skills", "toolsets"}:
         return []
-    return not_ready(kind)
+    raise HTTPException(404, "capability kind not found")
 
 
 @app.post("/v1/runs/{run_id}/stop")
-def stop_run(run_id: str):
-    return not_ready("stop run")
+async def stop_run(run_id: str):
+    try:
+        await app.state.pi.stop_run(run_id)
+    except ValueError:
+        raise HTTPException(404, "run not found")
+    return {"run_id": run_id, "status": "stopping"}
 
 
 @app.post("/v1/runs/{run_id}/approval")
-def approve_run(run_id: str, payload: dict[str, Any]):
-    return not_ready("run approval")
+async def approve_run(run_id: str, payload: dict[str, Any]):
+    decision = str(payload.get("decision") or "").strip().lower()
+    if decision not in {"approved", "rejected"}:
+        raise HTTPException(422, "decision must be approved or rejected")
+    try:
+        record = await app.state.pi.approve_run(run_id, decision)
+    except ValueError as exc:
+        raise HTTPException(404 if "run not found" in str(exc) else 409, str(exc))
+    return {"run_id": run_id, "decision": decision, "request_id": record["id"], "status": record["status"]}

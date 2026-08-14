@@ -1,0 +1,12 @@
+event: run.started
+data: {"run_id": "run_c39eb066a97f", "session_id": "sess_2b945696255e", "session_file": "/home/alexeybe1kin/.pi/agent/sessions/--home-alexeybe1kin-repos-pi-agent-harness-adapter--/2026-08-14T20-09-07-592Z_sess_2b945696255e.jsonl"}
+
+event: message.delta
+data: {"run_id": "run_c39eb066a97f", "delta": "RPC"}
+
+event: message.delta
+data: {"run_id": "run_c39eb066a97f", "delta": "_OK"}
+
+event: message.completed
+data: {"run_id": "run_c39eb066a97f", "message_id": "msg_0c3f04eb928b"}
+

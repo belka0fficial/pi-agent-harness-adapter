@@ -1,0 +1,18 @@
+event: run.started
+data: {"run_id": "run_9dee67535709", "session_id": "sess_74dda030b5a8", "session_file": "/home/alexeybe1kin/.pi/agent/sessions/--home-alexeybe1kin-repos-pi-agent-harness-adapter--/2026-08-14T20-16-45-226Z_sess_74dda030b5a8.jsonl"}
+
+event: message.delta
+data: {"run_id": "run_9dee67535709", "delta": "STOP"}
+
+event: message.delta
+data: {"run_id": "run_9dee67535709", "delta": "_REC"}
+
+event: message.delta
+data: {"run_id": "run_9dee67535709", "delta": "OVERY"}
+
+event: message.delta
+data: {"run_id": "run_9dee67535709", "delta": "_OK"}
+
+event: message.completed
+data: {"run_id": "run_9dee67535709", "message_id": "msg_8a87cc29b633"}
+

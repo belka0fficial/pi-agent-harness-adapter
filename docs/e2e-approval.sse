@@ -1,0 +1,51 @@
+event: run.started
+data: {"run_id": "run_7a08f49f4357", "session_id": "sess_8ca39c096cad", "session_file": "/home/alexeybe1kin/.pi/agent/sessions/--home-alexeybe1kin-repos-pi-agent-harness-adapter--/2026-08-14T20-14-57-404Z_sess_8ca39c096cad.jsonl"}
+
+event: message.completed
+data: {"run_id": "run_7a08f49f4357", "message_id": "msg_06812505b57c"}
+
+event: tool.started
+data: {"run_id": "run_7a08f49f4357", "tool_name": "mcp_toolgate_approval_test_echo", "name": "mcp_toolgate_approval_test_echo", "args": {"value": "APPROVAL_OK"}}
+
+event: approval.required
+data: {"run_id": "run_7a08f49f4357", "approval_id": "60d7dd67-4cc0-4577-9bd2-60d4d778de5c", "request_id": "60d7dd67-4cc0-4577-9bd2-60d4d778de5c", "id": "60d7dd67-4cc0-4577-9bd2-60d4d778de5c", "expires_at": "2026-08-14T20:16:01.058855+00:00", "tool_name": "mcp_toolgate_approval_test_echo", "name": "mcp_toolgate_approval_test_echo", "summary": {"title": "Run Approval Test Echo", "details": "Owner confirmation is required for this exact immutable tool invocation.", "action": {"subject_type": "tool", "subject_id": "approval.test-echo", "args": {"value": "APPROVAL_OK"}, "binding": {"subject_type": "tool", "subject_id": "approval.test-echo", "version": 1, "args_digest": "21354296b39425370cb4d921f6d882192bcbe89db9398fbbd040602b0c042962", "nonce": "-k8rlaskB9NVjcZ1Ned7oBJNzvabXgDH", "expires_at": "2026-08-14T20:16:01.058855+00:00", "consumed_at": null}, "created_by_agent_key": "local-mcp"}, "severity": "warning"}}
+
+event: message.completed
+data: {"run_id": "run_7a08f49f4357", "message_id": "msg_7be5f710aa20"}
+
+event: tool.started
+data: {"run_id": "run_7a08f49f4357", "tool_name": "mcp_toolgate_approval_test_echo", "name": "mcp_toolgate_approval_test_echo", "args": {"value": "APPROVAL_OK", "approval_request_id": "60d7dd67-4cc0-4577-9bd2-60d4d778de5c"}}
+
+event: tool.completed
+data: {"run_id": "run_7a08f49f4357", "tool_name": "mcp_toolgate_approval_test_echo", "name": "mcp_toolgate_approval_test_echo", "is_error": false, "result": {"content": [{"type": "text", "text": "{\"code\": \"OK\", \"message\": \"Tool completed\", \"result\": {\"ok\": true, \"result\": {\"value\": \"APPROVAL_OK\"}, \"value\": \"APPROVAL_OK\"}}"}], "details": {}}}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": "The"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": " final"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": " echoed"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": " value"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": " is"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": " APPRO"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": "VAL"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": "_OK"}
+
+event: message.delta
+data: {"run_id": "run_7a08f49f4357", "delta": "."}
+
+event: message.completed
+data: {"run_id": "run_7a08f49f4357", "message_id": "msg_d245ed9ff741"}
+

@@ -7,8 +7,8 @@
   "mcpServers": {
     "toolgate": {
       "transport": "stdio",
-      "command": ".venv-toolgate-mcp/bin/python",
-      "args": ["../toolgate/toolgate/mcp/toolgate_mcp.py"],
+      "command": "docker",
+      "args": ["exec", "-i", "toolgate-api", "python3", "/app/toolgate/mcp/toolgate_mcp.py"],
       "lifecycle": "eager",
       "env": {
         "TOOLGATE_MCP_ACTOR": "Brain Pi MCP",

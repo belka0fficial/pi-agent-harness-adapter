@@ -1,0 +1,12 @@
+event: run.started
+data: {"run_id": "run_aabcf441e719", "session_id": "sess_b00ab66671d4", "session_file": "/home/alexeybe1kin/.pi/agent/sessions/--home-alexeybe1kin-repos-pi-agent-harness-adapter--/2026-08-14T20-18-05-071Z_sess_b00ab66671d4.jsonl"}
+
+event: message.completed
+data: {"run_id": "run_aabcf441e719", "message_id": "msg_4d18ab91e5d4"}
+
+event: tool.started
+data: {"run_id": "run_aabcf441e719", "tool_name": "mcp_toolgate_approval_test_echo", "name": "mcp_toolgate_approval_test_echo", "args": {"value": "REJECT_OK"}}
+
+event: approval.required
+data: {"run_id": "run_aabcf441e719", "approval_id": "7e90305e-6e77-48ba-a6d0-bdd82ce7c136", "request_id": "7e90305e-6e77-48ba-a6d0-bdd82ce7c136", "id": "7e90305e-6e77-48ba-a6d0-bdd82ce7c136", "expires_at": "2026-08-14T20:19:08.715118+00:00", "tool_name": "mcp_toolgate_approval_test_echo", "name": "mcp_toolgate_approval_test_echo", "summary": {"title": "Run Approval Test Echo", "details": "Owner confirmation is required for this exact immutable tool invocation.", "action": {"subject_type": "tool", "subject_id": "approval.test-echo", "args": {"value": "REJECT_OK"}, "binding": {"subject_type": "tool", "subject_id": "approval.test-echo", "version": 1, "args_digest": "b46d101ec93f99f30931cea8d2bf675709e9547a8206e60c7aa100d70fc1b16e", "nonce": "GeP-l7rLavJolfxhlkasATL0UEkV_gtL", "expires_at": "2026-08-14T20:19:08.715118+00:00", "consumed_at": null}, "created_by_agent_key": "local-mcp"}, "severity": "warning"}}
+

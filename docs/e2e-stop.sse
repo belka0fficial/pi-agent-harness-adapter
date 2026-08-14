@@ -1,0 +1,6 @@
+event: run.started
+data: {"run_id": "run_246e993088fa", "session_id": "sess_74dda030b5a8", "session_file": "/home/alexeybe1kin/.pi/agent/sessions/--home-alexeybe1kin-repos-pi-agent-harness-adapter--/2026-08-14T20-16-45-226Z_sess_74dda030b5a8.jsonl"}
+
+event: run.stopped
+data: {"run_id": "run_246e993088fa", "message": "Run stopped by owner"}
+
