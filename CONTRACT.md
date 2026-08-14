@@ -69,6 +69,11 @@ Frozen from `agentgate/api/agentgate/main.py` on this overnight run. `pi-agent-h
 
 These are read-only discovery calls. AgentGate tolerates unavailable features by hiding or disabling related UI.
 
+Current adapter behavior:
+
+- `/api/model/options` returns a best-effort `pi --list-models` snapshot and falls back to empty arrays.
+- `/v1/skills` and `/v1/toolsets` return valid empty arrays instead of `501`.
+
 ## Cron Jobs
 
 - `GET /api/jobs`
@@ -96,4 +101,8 @@ Job fields rendered by AgentGate:
 
 Pi supports non-interactive `--mode json` and `--mode rpc`, and project trust for non-interactive modes is controlled with `--approve` / `--no-approve` or global `defaultProjectTrust`. Pi's MCP support is extension-based through `pi-mcp-extension`, which reads `~/.pi/agent/mcp.json` or project `.pi/mcp.json`.
 
-For tonight, Pi Agent Harness Adapter includes a project `.pi/mcp.json` registering the ToolGate stdio bridge. If Pi's native RPC event schema differs from the assumed JSON-line events in `adapter/pi_client.py`, the next pass should replace that small parser only; the AgentGate contract should stay unchanged.
+The adapter now uses long-lived Pi RPC sessions per active chat session, keyed by `--session-id`.
+
+Project `.pi/mcp.json` uses a stdio bridge into the running `toolgate-api` container via `docker exec -i toolgate-api python3 /app/toolgate/mcp/toolgate_mcp.py` so approvals and request consumption operate on the live writable ToolGate state.
+
+The session-start SOUL block is feature-flagged through `PI_SOUL_TEXT` or `PI_SOUL_FILE` and is injected with `--append-system-prompt` when the Pi RPC session is created.
