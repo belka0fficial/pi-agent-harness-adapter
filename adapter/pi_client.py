@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -41,10 +42,12 @@ def _build_command(
     session_id: str,
     options: dict[str, Any] | None,
 ) -> list[str]:
-    args = [command, "--mode", "json", "--approve", "--session-id", session_id]
+    args = [command, "--mode", "json", "--approve", "--session-id", _pi_session_id(session_id)]
+    default_provider = os.environ.get("PI_PROVIDER")
+    default_model = os.environ.get("PI_MODEL")
     if options:
-        provider = options.get("provider")
-        model = options.get("model")
+        provider = options.get("provider") or default_provider
+        model = options.get("model") or default_model
         instructions = options.get("instructions")
         if isinstance(provider, str) and provider:
             args.extend(["--provider", provider])
@@ -55,8 +58,18 @@ def _build_command(
             args.extend(["--thinking", thinking])
         if isinstance(instructions, str) and instructions:
             args.extend(["--append-system-prompt", instructions])
+    else:
+        if default_provider:
+            args.extend(["--provider", default_provider])
+        if default_model:
+            args.extend(["--model", default_model])
     args.append(prompt)
     return args
+
+
+def _pi_session_id(session_id: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", session_id).strip("-.")
+    return normalized or "pi-session"
 
 
 def translate_pi_item(

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from fastapi.testclient import TestClient
 
 from adapter.main import app
-from adapter.pi_client import PiEvent, translate_pi_item
+from adapter.pi_client import PiEvent, _pi_session_id, translate_pi_item
 
 
 @dataclass
@@ -108,3 +108,8 @@ def test_translate_real_pi_aborted_turn_into_run_failed():
     )
 
     assert events == [PiEvent("run.failed", {"run_id": "run-abort", "message": "Request was aborted"})]
+
+
+def test_pi_session_id_normalizes_invalid_characters():
+    assert _pi_session_id("job:abc/123") == "job-abc-123"
+    assert _pi_session_id("...") == "pi-session"

@@ -1,0 +1,16 @@
+{
+  "messages": [
+    {
+      "id": "msg_93d383c8af19",
+      "role": "user",
+      "content": "Reply with exactly ADAPTER_OK.",
+      "created_at": "2026-08-14T19:52:40.573306+00:00"
+    },
+    {
+      "id": "msg_8dc2b4771ff0",
+      "role": "assistant",
+      "content": "ADAPTER_OK",
+      "created_at": "2026-08-14T19:52:48.925577+00:00"
+    }
+  ]
+}

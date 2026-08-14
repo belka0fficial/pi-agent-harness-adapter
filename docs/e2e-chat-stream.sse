@@ -1,0 +1,15 @@
+event: run.started
+data: {"run_id": "run_ee8790eb7641", "session_id": "sess_8a6cdcac15b4", "cwd": "/home/alexeybe1kin/repos/pi-agent-harness-adapter", "timestamp": "2026-08-14T19:52:41.466Z"}
+
+event: message.delta
+data: {"run_id": "run_ee8790eb7641", "delta": "AD"}
+
+event: message.delta
+data: {"run_id": "run_ee8790eb7641", "delta": "APTER"}
+
+event: message.delta
+data: {"run_id": "run_ee8790eb7641", "delta": "_OK"}
+
+event: message.completed
+data: {"run_id": "run_ee8790eb7641", "message_id": "msg_b886db703e56"}
+

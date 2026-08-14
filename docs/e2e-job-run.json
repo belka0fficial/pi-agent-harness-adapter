@@ -1,0 +1,21 @@
+{
+  "id": "job_230248e80a62",
+  "job_id": "job_230248e80a62",
+  "name": "Pi validation job 2",
+  "schedule": "0 10 * * *",
+  "prompt": "Reply with exactly SCHED_OK.",
+  "deliver": "local",
+  "webhook_url": null,
+  "paused": false,
+  "created_at": "2026-08-14T19:53:49.220407+00:00",
+  "updated_at": "2026-08-14T19:53:49.220418+00:00",
+  "last_run_at": "2026-08-14T19:53:49.223230+00:00",
+  "next_run_at": "2026-08-15T10:00:00+00:00",
+  "last_result": {
+    "job_id": "job_230248e80a62",
+    "status": "ok",
+    "prompt": "Reply with exactly SCHED_OK.",
+    "output": "SCHED_OK",
+    "error": null
+  }
+}
