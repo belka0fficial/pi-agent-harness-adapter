@@ -1,8 +1,8 @@
 # Pi Agent Harness Adapter
 
-Pi-backed adapter scaffold for the AgentGate/Hermes contract.
+Pi-backed brain adapter for the AgentGate runtime contract.
 
-This repo does **not** replace Hermes yet. It freezes the API surface AgentGate currently consumes and provides a small compatibility adapter that can be tested with Pi mocked.
+This repo is now the active upstream behind AgentGate in the Conker stack.
 
 ## Run Adapter
 
@@ -10,7 +10,7 @@ This repo does **not** replace Hermes yet. It freezes the API surface AgentGate 
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn adapter.main:app --host 127.0.0.1 --port 8642
+uvicorn adapter.main:app --host 127.0.0.1 --port 8644
 ```
 
 ## Run Scheduler
@@ -28,4 +28,4 @@ npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 pi install npm:pi-mcp-extension
 ```
 
-Pi supports JSON/RPC modes and project MCP config through `pi-mcp-extension`; see `CONTRACT.md` for notes.
+Pi auth must already exist at `~/.pi/agent/auth.json` before running the containerized stack.
