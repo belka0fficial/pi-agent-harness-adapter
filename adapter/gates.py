@@ -49,6 +49,37 @@ class GateClients:
             raise RuntimeError(f"{service} is unavailable") from exc
         return json.loads(body.decode("utf-8")) if body else {}
 
+    def _memory_read_request(
+        self,
+        path: str,
+        *,
+        agent_id: str | None,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        timeout: float = 8,
+    ):
+        base_url = self.services["memorygate"][0]
+        read_key = os.environ.get("MEMORYGATE_READ_KEY", "")
+        if not read_key:
+            return self._request("memorygate", path, method=method, payload=payload, timeout=timeout)
+        headers = {"Accept": "application/json", "X-MemoryGate-Key": read_key}
+        if agent_id:
+            headers["X-Agent-Id"] = agent_id
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"memorygate returned HTTP {exc.code}: {detail}") from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            raise RuntimeError("memorygate is unavailable") from exc
+        return json.loads(body.decode("utf-8")) if body else {}
+
     def health(self) -> dict[str, dict[str, str]]:
         result: dict[str, dict[str, str]] = {}
         for service in self.services:
@@ -105,11 +136,11 @@ class GateClients:
         )
 
     def memory_context(self, query: str, *, agent_id: str | None = None) -> dict[str, Any]:
-        payload = self._request(
-            "memorygate",
+        payload = self._memory_read_request(
             "/runtime/context",
             method="POST",
             payload={"query": query, "max_items": 10, "include_evidence": False, "agent_id": agent_id},
+            agent_id=agent_id,
         )
         return payload if isinstance(payload, dict) else {}
 
