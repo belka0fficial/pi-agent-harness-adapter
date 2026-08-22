@@ -22,10 +22,16 @@ class FakeGates:
         return {"vitals": {"cpu_percent": 12, "memory": {"percent": 34}, "disk": {"percent": 56}, "cpu_count": 8}, "containers": [], "errors": [], "packages": [], "backups": {"latest": None}}
 
     def tools(self):
-        return [{"id": "echo", "name": "Echo", "description": "Test tool", "status": "active", "authorization": "auto"}]
+        return [
+            {"id": "echo", "name": "Echo", "description": "Test tool", "status": "active", "authorization": "auto"},
+            {"id": "danger.write", "name": "Danger Write", "description": "Should stay hidden unless granted", "status": "active", "authorization": "approval"},
+        ]
 
     def skills(self):
-        return [{"id": "skill-1", "title": "Reply clearly", "version": "1", "active": True, "linked_tools": ["echo"]}]
+        return [
+            {"id": "skill-1", "title": "Reply clearly", "version": "1", "active": True, "linked_tools": ["echo"]},
+            {"id": "skill-secret", "title": "Secret workflow", "version": "1", "active": True, "linked_tools": ["danger.write"]},
+        ]
 
     def decide_approval(self, request_id: str, decision: str):
         return {"id": request_id, "decision": decision}
@@ -283,6 +289,28 @@ def test_agentgate_facade_exposes_toolgate_tools_and_memorygate_skills():
     assert skills.status_code == 200
     assert tools.json()["tools"][0]["id"] == "echo"
     assert skills.json()["skills"][0]["id"] == "skill-1"
+
+
+def test_agentgate_filters_tools_and_skills_by_agent_team_grants():
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = ["echo"]
+        app.state.agents["agent_pi_operator"]["skill_ids"] = []
+        app.state.teams["team_core"]["tool_ids"] = []
+        app.state.teams["team_core"]["skill_ids"] = ["skill-1"]
+        tools = client.get("/api/tools?agent_id=agent_pi_operator&team_id=team_core")
+        skills = client.get("/api/skills?agent_id=agent_pi_operator&team_id=team_core")
+
+    assert tools.status_code == 200
+    assert skills.status_code == 200
+    assert tools.json()["scope"] == "agent-effective"
+    assert tools.json()["total"] == 2
+    assert tools.json()["visible"] == 1
+    assert [tool["id"] for tool in tools.json()["tools"]] == ["echo"]
+    assert [skill["id"] for skill in skills.json()["skills"]] == ["skill-1"]
+    assert "skill-secret" not in [skill["id"] for skill in skills.json()["skills"]]
 
 
 def test_pi_discovery_exposes_memorygate_skills_and_toolgate_capabilities():

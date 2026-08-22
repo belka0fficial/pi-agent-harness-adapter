@@ -268,6 +268,14 @@ def _tool_allowed(tool_id: str | None, allowed: list[str]) -> bool:
     return any(tool_id == item or (item.endswith("*") and tool_id.startswith(item[:-1])) for item in allowed)
 
 
+def _capability_allowed(capability_id: str | None, allowed: list[str]) -> bool:
+    if not capability_id:
+        return False
+    if "*" in allowed:
+        return True
+    return any(capability_id == item or (item.endswith("*") and capability_id.startswith(item[:-1])) for item in allowed)
+
+
 def _sync_loaded_jobs() -> None:
     for job_id, item in list(app.state.jobs.items()):
         try:
@@ -1075,13 +1083,41 @@ def agentgate_approve_memory_candidate(payload: MemoryCandidateInput):
 
 
 @app.get("/api/tools")
-def agentgate_tools():
-    return {"tools": app.state.gates.tools()}
+def agentgate_tools(agent_id: str | None = None, team_id: str | None = None):
+    rows = app.state.gates.tools()
+    if not agent_id and not team_id:
+        return {"tools": rows, "scope": "owner-catalog", "total": len(rows), "visible": len(rows)}
+    actor = _permission_context(agent_id, team_id)
+    allowed = actor["tool_ids"]
+    visible = [row for row in rows if _capability_allowed(str(row.get("id") or ""), allowed)]
+    return {
+        "tools": visible,
+        "scope": "agent-effective",
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "allowed_ids": allowed,
+        "total": len(rows),
+        "visible": len(visible),
+    }
 
 
 @app.get("/api/skills")
-def agentgate_skills():
-    return {"skills": app.state.gates.skills()}
+def agentgate_skills(agent_id: str | None = None, team_id: str | None = None):
+    rows = app.state.gates.skills()
+    if not agent_id and not team_id:
+        return {"skills": rows, "scope": "owner-catalog", "total": len(rows), "visible": len(rows)}
+    actor = _permission_context(agent_id, team_id)
+    allowed = actor["skill_ids"]
+    visible = [row for row in rows if _capability_allowed(str(row.get("id") or ""), allowed)]
+    return {
+        "skills": visible,
+        "scope": "agent-effective",
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "allowed_ids": allowed,
+        "total": len(rows),
+        "visible": len(visible),
+    }
 
 
 @app.get("/api/suggestions")
