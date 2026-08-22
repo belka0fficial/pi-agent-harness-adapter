@@ -356,6 +356,22 @@ def test_chat_retrieves_memorygate_context_and_records_completed_transcript():
     assert app.state.gates.recorded["messages"][-1]["content"] == "context-aware"
 
 
+def test_chat_uses_selected_agent_model_defaults_when_payload_omits_model():
+    reset_state()
+    main._ensure_registry_seeded()
+    app.state.agents["agent_pi_operator"]["primary_provider"] = "openai-codex"
+    app.state.agents["agent_pi_operator"]["primary_model"] = "gpt-5.6-luna"
+    pi = CapturingPi()
+    app.state.pi = pi
+
+    with TestClient(app) as client:
+        response = client.post("/api/sessions/sess-1/chat/stream", json={"input": "Use default model"})
+
+    assert response.status_code == 200
+    assert pi.options["provider"] == "openai-codex"
+    assert pi.options["model"] == "gpt-5.6-luna"
+
+
 def test_chat_defaults_to_no_memory_side_effects():
     reset_state()
     pi = CapturingPi()

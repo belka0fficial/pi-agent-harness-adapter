@@ -224,6 +224,32 @@ def test_model_discovery_does_not_treat_no_models_help_text_as_models(monkeypatc
     assert payload == {"models": [], "providers": []}
 
 
+def test_model_discovery_parses_pi_table_output(monkeypatch):
+    class Result:
+        stdout = (
+            "provider      model                context  max-out  thinking  images\n"
+            "openai-codex  gpt-5.6-luna         272K     128K     yes       yes\n"
+            "openai-codex  gpt-5.6-sol          272K     128K     yes       yes\n"
+        )
+
+    monkeypatch.setattr("adapter.main.subprocess.run", lambda *args, **kwargs: Result())
+    app.state.pi = FakePi()
+    app.state.pi.command = "pi"
+    with TestClient(app) as client:
+        payload = client.get("/api/model/options").json()
+    assert payload["providers"] == ["openai-codex"]
+    assert payload["models"][0] == {
+        "id": "openai-codex/gpt-5.6-luna",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "name": "gpt-5.6-luna",
+        "context": "272K",
+        "max_output": "128K",
+        "thinking": True,
+        "images": True,
+    }
+
+
 class FailingPi:
     async def stream(self, prompt: str, *, session_id: str, options=None):
         if False:
