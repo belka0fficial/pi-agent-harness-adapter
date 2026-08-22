@@ -9,11 +9,13 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import subprocess
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -41,6 +43,7 @@ class JobInput(BaseModel):
     webhook_url: str | None = None
     agent_id: str = "agent_pi_operator"
     team_id: str | None = None
+    timezone: str = "UTC"
 
 
 class MemoryCandidateInput(BaseModel):
@@ -268,9 +271,14 @@ def _tool_allowed(tool_id: str | None, allowed: list[str]) -> bool:
 def _sync_loaded_jobs() -> None:
     for job_id, item in list(app.state.jobs.items()):
         try:
+            item.setdefault("timezone", "UTC")
+            item.setdefault("runs", 0)
+            item.setdefault("history", "------------")
+            item.setdefault("run_history", [])
             _sync_scheduler(job_id)
             scheduled = app.state.scheduler.get_job(job_id)
             item["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
+            item["schedule_preview"] = _schedule_preview(item["schedule"], item.get("timezone"))
             _save_registry_item("job", item)
         except HTTPException as exc:
             item["paused"] = True
@@ -278,9 +286,10 @@ def _sync_loaded_jobs() -> None:
             item["last_result"] = {
                 "job_id": job_id,
                 "status": "failed",
-                "prompt": item.get("prompt", ""),
-                "output": "",
+                "output_summary": "",
+                "output_chars": 0,
                 "error": str(exc.detail),
+                "completed_at": now(),
             }
             _save_registry_item("job", item)
 
@@ -360,9 +369,49 @@ def _cron_kwargs(schedule: str) -> dict[str, Any]:
     if len(parts) != 5:
         raise HTTPException(422, "schedule must be five-field cron syntax")
     minute, hour, day, month, day_of_week = parts
-    if minute == "*" or minute.startswith("*/1") or minute.startswith("*/2") or minute.startswith("*/3") or minute.startswith("*/4"):
+    if _minute_runs_too_often(minute):
         raise HTTPException(422, "schedule must not run more often than every 5 minutes")
     return {"minute": minute, "hour": hour, "day": day, "month": month, "day_of_week": day_of_week}
+
+
+def _minute_runs_too_often(minute: str) -> bool:
+    if minute == "*":
+        return True
+    if minute.startswith("*/"):
+        try:
+            return int(minute[2:]) < 5
+        except ValueError:
+            return False
+    return False
+
+
+def _job_timezone(timezone_name: str | None) -> ZoneInfo:
+    value = (timezone_name or "UTC").strip() or "UTC"
+    try:
+        return ZoneInfo(value)
+    except ZoneInfoNotFoundError:
+        raise HTTPException(422, "timezone must be a valid IANA timezone")
+
+
+def _cron_trigger(schedule: str, timezone_name: str | None) -> CronTrigger:
+    _cron_kwargs(schedule)
+    return CronTrigger.from_crontab(schedule, timezone=_job_timezone(timezone_name))
+
+
+def _schedule_preview(schedule: str, timezone_name: str | None, *, limit: int = 3) -> list[str]:
+    trigger = _cron_trigger(schedule, timezone_name)
+    timezone = _job_timezone(timezone_name)
+    current = datetime.now(timezone)
+    previous = None
+    rows = []
+    for _ in range(limit):
+        next_run = trigger.get_next_fire_time(previous, current)
+        if not next_run:
+            break
+        rows.append(next_run.astimezone(UTC).isoformat())
+        previous = next_run
+        current = next_run
+    return rows
 
 
 def _webhooks_enabled() -> bool:
@@ -389,15 +438,29 @@ def _sync_scheduler(job_id: str):
         return
     app.state.scheduler.add_job(
         run_job,
-        "cron",
+        trigger=_cron_trigger(item["schedule"], item.get("timezone")),
         id=job_id,
         args=[job_id],
         replace_existing=True,
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
-        **_cron_kwargs(item["schedule"]),
     )
+
+
+def _append_job_run_history(item: dict[str, Any], result: dict[str, Any]) -> None:
+    status = str(result.get("status") or "unknown")
+    item["runs"] = int(item.get("runs") or 0) + 1
+    history_token = "s" if status == "ok" else "f"
+    item["history"] = (str(item.get("history") or "") + history_token)[-12:].rjust(12, "-")
+    run_record = {
+        "status": status,
+        "completed_at": result.get("completed_at"),
+        "output_summary": result.get("output_summary") or "",
+        "output_chars": result.get("output_chars") or 0,
+        "error": result.get("error"),
+    }
+    item["run_history"] = [run_record, *list(item.get("run_history") or [])][:12]
 
 
 async def run_job(job_id: str):
@@ -421,8 +484,10 @@ async def run_job(job_id: str):
         "output_summary": _summarize_job_output(output),
         "output_chars": len(output),
         "error": error,
+        "completed_at": now(),
     }
     item["last_result"] = result
+    _append_job_run_history(item, result)
     if status == "failed":
         item["failure_count"] = int(item.get("failure_count") or 0) + 1
         if item["failure_count"] >= 3:
@@ -448,6 +513,7 @@ def list_jobs():
 def create_job(payload: JobInput):
     _validate_job_payload(payload.webhook_url)
     actor = _permission_context(payload.agent_id, payload.team_id)
+    schedule_preview = _schedule_preview(payload.schedule, payload.timezone)
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     item = {
         "id": job_id,
@@ -460,6 +526,10 @@ def create_job(payload: JobInput):
         "updated_at": now(),
         "last_run_at": None,
         "next_run_at": None,
+        "schedule_preview": schedule_preview,
+        "runs": 0,
+        "history": "------------",
+        "run_history": [],
         "failure_count": 0,
         "quarantine_reason": None,
     }
@@ -476,14 +546,18 @@ def update_job(job_id: str, payload: dict[str, Any]):
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
     _validate_job_payload(payload.get("webhook_url"))
+    next_schedule = payload.get("schedule") or app.state.jobs[job_id].get("schedule")
+    next_timezone = payload.get("timezone") or app.state.jobs[job_id].get("timezone")
+    schedule_preview = _schedule_preview(next_schedule, next_timezone)
     if "agent_id" in payload or "team_id" in payload:
         actor = _permission_context(payload.get("agent_id") or app.state.jobs[job_id].get("agent_id"), payload.get("team_id") or app.state.jobs[job_id].get("team_id"))
         payload = {**payload, "agent_id": actor["agent_id"], "team_id": actor["team_id"]}
-    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "agent_id", "team_id"}})
+    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "agent_id", "team_id", "timezone"}})
     app.state.jobs[job_id]["updated_at"] = now()
     _sync_scheduler(job_id)
     scheduled = app.state.scheduler.get_job(job_id)
     app.state.jobs[job_id]["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
+    app.state.jobs[job_id]["schedule_preview"] = schedule_preview
     _save_registry_item("job", app.state.jobs[job_id])
     return app.state.jobs[job_id]
 
@@ -519,6 +593,7 @@ def resume_job(job_id: str):
     _sync_scheduler(job_id)
     scheduled = app.state.scheduler.get_job(job_id)
     app.state.jobs[job_id]["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
+    app.state.jobs[job_id]["schedule_preview"] = _schedule_preview(app.state.jobs[job_id]["schedule"], app.state.jobs[job_id].get("timezone"))
     app.state.jobs[job_id]["updated_at"] = now()
     _save_registry_item("job", app.state.jobs[job_id])
     return app.state.jobs[job_id]

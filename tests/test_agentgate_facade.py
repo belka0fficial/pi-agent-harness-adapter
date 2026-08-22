@@ -383,10 +383,33 @@ def test_automation_rejects_webhooks_and_too_frequent_cron():
                 "prompt": "too often",
             },
         )
+        acceptable_step = client.post(
+            "/api/jobs",
+            json={
+                "name": "Ten Minute Probe",
+                "schedule": "*/10 * * * *",
+                "prompt": "reasonable cadence",
+                "timezone": "UTC",
+            },
+        )
+        invalid_timezone = client.post(
+            "/api/jobs",
+            json={
+                "name": "Bad Timezone",
+                "schedule": "0 9 * * *",
+                "prompt": "bad timezone",
+                "timezone": "Mars/Olympus_Mons",
+            },
+        )
     assert webhook.status_code == 422
     assert "disabled" in webhook.text.lower()
     assert frequent.status_code == 422
     assert "5 minutes" in frequent.text
+    assert acceptable_step.status_code == 200
+    assert acceptable_step.json()["timezone"] == "UTC"
+    assert len(acceptable_step.json()["schedule_preview"]) == 3
+    assert invalid_timezone.status_code == 422
+    assert "timezone" in invalid_timezone.text.lower()
 
 
 def test_automation_run_persists_safe_result_summary_only():
@@ -406,8 +429,14 @@ def test_automation_run_persists_safe_result_summary_only():
     assert result["status"] == "ok"
     assert result["output_summary"] == "context-aware"
     assert result["output_chars"] == len("context-aware")
+    assert result["completed_at"]
     assert "output" not in result
     assert "prompt" not in result
+    assert ran["runs"] == 1
+    assert ran["history"].endswith("s")
+    assert ran["run_history"][0]["status"] == "ok"
+    assert ran["run_history"][0]["output_summary"] == "context-aware"
+    assert "prompt" not in ran["run_history"][0]
 
 
 def test_automation_pauses_after_three_failures():
