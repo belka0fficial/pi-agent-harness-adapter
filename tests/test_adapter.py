@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
+
+import httpx
 from dataclasses import dataclass, field
 
 from fastapi.testclient import TestClient
 
+from adapter import main
 from adapter.main import app
-from adapter.pi_client import PiEvent, _build_rpc_command, _pi_session_id, translate_pi_item
+from adapter.pi_client import PiEvent, _build_rpc_command, _pi_session_id, _pi_subprocess_env, translate_pi_item
 
 
 @dataclass
@@ -27,7 +31,7 @@ class ControlledPi:
         if prompt == "needs-stop":
             yield PiEvent("run.started", {"run_id": "run-stop", "session_id": session_id})
             while not self.stop_event.is_set():
-                time.sleep(0.01)
+                await asyncio.sleep(0.01)
             yield PiEvent("run.stopped", {"run_id": "run-stop", "message": "Run stopped by owner"})
             return
         if prompt == "needs-approval":
@@ -40,12 +44,13 @@ class ControlledPi:
                     "approval_id": "req-1",
                     "request_id": "req-1",
                     "id": "req-1",
+                    "tool_name": "mcp_toolgate_test",
                     "expires_at": "2026-08-14T20:30:00+00:00",
                     "summary": {"title": "Run test tool"},
                 },
             )
             while "run-approval" not in self.approved:
-                time.sleep(0.01)
+                await asyncio.sleep(0.01)
             decision = self.approved["run-approval"]
             yield PiEvent("message.delta", {"run_id": "run-approval", "delta": f"{decision}: resolved"})
             yield PiEvent("message.completed", {"run_id": "run-approval", "message_id": "msg-approval"})
@@ -83,62 +88,51 @@ def test_round_trip_chat_against_mocked_pi():
 
 
 def test_stop_endpoint_terminates_stream_and_session_remains_usable():
-    app.state.sessions = {}
-    app.state.messages = {}
-    app.state.pi = ControlledPi()
-    with TestClient(app) as client:
-        created = client.post("/api/sessions", json={"title": "Stop"}).json()
-        session_id = created["id"]
+    async def scenario():
+        app.state.sessions = {}
+        app.state.messages = {}
+        app.state.pi = ControlledPi()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = (await client.post("/api/sessions", json={"title": "Stop"})).json()
+            session_id = created["id"]
+            stream_task = asyncio.create_task(
+                client.post(f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-stop"})
+            )
+            await asyncio.sleep(0.05)
+            result = await client.post("/v1/runs/run-stop/stop")
+            assert result.status_code == 200
+            response = await asyncio.wait_for(stream_task, timeout=2)
+            assert "event: run.stopped" in response.text
+            follow_up = await client.post(f"/api/sessions/{session_id}/chat/stream", json={"input": "world"})
+            assert follow_up.status_code == 200
 
-        def stop_later():
-            time.sleep(0.05)
-            with TestClient(app) as other:
-                result = other.post("/v1/runs/run-stop/stop")
-                assert result.status_code == 200
-
-        thread = threading.Thread(target=stop_later)
-        thread.start()
-        with client.stream("POST", f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-stop"}) as response:
-            body = response.read().decode()
-        thread.join(timeout=2)
-
-        assert "event: run.stopped" in body
-        follow_up = client.post(f"/api/sessions/{session_id}/chat/stream", json={"input": "world"})
-        assert follow_up.status_code == 200
+    asyncio.run(scenario())
 
 
 def test_approval_endpoint_supports_approve_and_reject_paths():
-    app.state.sessions = {}
-    app.state.messages = {}
-    app.state.pi = ControlledPi()
-    with TestClient(app) as client:
-        created = client.post("/api/sessions", json={"title": "Approve"}).json()
-        session_id = created["id"]
-
-        def approve_later(decision: str):
-            time.sleep(0.05)
-            with TestClient(app) as other:
-                result = other.post("/v1/runs/run-approval/approval", json={"decision": decision})
-                assert result.status_code == 200
-
-        approve_thread = threading.Thread(target=approve_later, args=("approved",))
-        approve_thread.start()
-        with client.stream("POST", f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-approval"}) as response:
-            approve_body = response.read().decode()
-        approve_thread.join(timeout=2)
-
-        assert "event: approval.required" in approve_body
-        assert "approved: resolved" in approve_body
-
+    async def run_decision(client: httpx.AsyncClient, session_id: str, decision: str):
         app.state.pi = ControlledPi()
-        reject_thread = threading.Thread(target=approve_later, args=("rejected",))
-        reject_thread.start()
-        with client.stream("POST", f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-approval"}) as response:
-            reject_body = response.read().decode()
-        reject_thread.join(timeout=2)
+        stream_task = asyncio.create_task(
+            client.post(f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-approval"})
+        )
+        await asyncio.sleep(0.05)
+        result = await client.post("/v1/runs/run-approval/approval", json={"decision": decision})
+        assert result.status_code == 200
+        response = await asyncio.wait_for(stream_task, timeout=2)
+        assert "event: approval.required" in response.text
+        assert f"{decision}: resolved" in response.text
 
-        assert "event: approval.required" in reject_body
-        assert "rejected: resolved" in reject_body
+    async def scenario():
+        app.state.sessions = {}
+        app.state.messages = {}
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = (await client.post("/api/sessions", json={"title": "Approve"})).json()
+            await run_decision(client, created["id"], "approved")
+            await run_decision(client, created["id"], "rejected")
+
+    asyncio.run(scenario())
 
 
 def test_translate_real_pi_text_and_tool_events():
@@ -216,3 +210,132 @@ def test_build_rpc_command_includes_feature_flagged_soul_block(monkeypatch, tmp_
 
     assert "--append-system-prompt" in command
     assert "You are Hermes with a durable soul block." in command
+
+
+def test_model_discovery_does_not_treat_no_models_help_text_as_models(monkeypatch):
+    class Result:
+        stdout = "No models available. Use /login to log into a provider via OAuth or API key. See:\n  /docs/providers.md\n  /docs/models.md\n"
+
+    monkeypatch.setattr("adapter.main.subprocess.run", lambda *args, **kwargs: Result())
+    app.state.pi = FakePi()
+    app.state.pi.command = "pi"
+    with TestClient(app) as client:
+        payload = client.get("/api/model/options").json()
+    assert payload == {"models": [], "providers": []}
+
+
+class FailingPi:
+    async def stream(self, prompt: str, *, session_id: str, options=None):
+        if False:
+            yield None
+        raise RuntimeError("No API key found for the selected model")
+
+
+def test_chat_stream_converts_pi_startup_errors_into_run_failed_sse():
+    app.state.sessions = {}
+    app.state.messages = {}
+    app.state.pi = FailingPi()
+    with TestClient(app) as client:
+        created = client.post("/api/sessions", json={"title": "Failure"}).json()
+        response = client.post(f"/api/sessions/{created['id']}/chat/stream", json={"input": "hello"})
+    assert response.status_code == 200
+    assert "event: run.failed" in response.text
+    assert "No API key found" in response.text
+
+
+def test_pi_subprocess_environment_excludes_gate_admin_credentials(monkeypatch):
+    monkeypatch.setenv("TOOLGATE_ADMIN_KEY", "owner-secret")
+    monkeypatch.setenv("MEMORYGATE_ADMIN_KEY", "memory-owner-secret")
+    monkeypatch.setenv("SYSTEMGATE_ADMIN_KEY", "system-owner-secret")
+    monkeypatch.setenv("TOOLGATE_EXECUTION_KEY", "scoped-agent-key")
+    child_env = _pi_subprocess_env()
+    assert "TOOLGATE_ADMIN_KEY" not in child_env
+    assert "MEMORYGATE_ADMIN_KEY" not in child_env
+    assert "SYSTEMGATE_ADMIN_KEY" not in child_env
+    assert child_env["TOOLGATE_EXECUTION_KEY"] == "scoped-agent-key"
+
+
+class DecisionGates:
+    def __init__(self):
+        self.decisions = []
+
+    def decide_approval(self, request_id: str, decision: str):
+        self.decisions.append((request_id, decision))
+        return {"id": request_id, "status": decision, "decision": decision}
+
+
+def test_agentgate_approval_decision_resumes_matching_paused_run():
+    async def scenario():
+        app.state.sessions = {}
+        app.state.messages = {}
+        app.state.agents = {}
+        app.state.teams = {}
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = ["mcp_toolgate_test"]
+        pi = ControlledPi()
+        app.state.pi = pi
+        app.state.gates = DecisionGates()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = (await client.post("/api/sessions", json={"title": "Approve via facade"})).json()
+            session_id = created["id"]
+            stream_task = asyncio.create_task(
+                client.post(f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-approval"})
+            )
+            await asyncio.sleep(0.05)
+            result = await client.post("/api/approvals/req-1/decision", json={"decision": "approved"})
+            assert result.status_code == 200
+            response = await asyncio.wait_for(stream_task, timeout=2)
+            assert "event: approval.required" in response.text
+            assert "approved: resolved" in response.text
+
+    asyncio.run(scenario())
+
+
+def test_agentgate_approval_decision_rejects_disallowed_runtime_tool():
+    async def scenario():
+        app.state.sessions = {}
+        app.state.messages = {}
+        app.state.agents = {}
+        app.state.teams = {}
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = []
+        pi = ControlledPi()
+        app.state.pi = pi
+        app.state.gates = DecisionGates()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = (await client.post("/api/sessions", json={"title": "Approve via facade"})).json()
+            session_id = created["id"]
+            stream_task = asyncio.create_task(
+                client.post(f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-approval"})
+            )
+            await asyncio.sleep(0.05)
+            result = await client.post("/api/approvals/req-1/decision", json={"decision": "approved"})
+            assert result.status_code == 403
+            assert "not allowed" in result.text
+            await client.post("/api/approvals/req-1/decision", json={"decision": "rejected"})
+            await asyncio.wait_for(stream_task, timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_agentgate_session_stop_endpoint_stops_current_server_side_run():
+    async def scenario():
+        app.state.sessions = {}
+        app.state.messages = {}
+        app.state.pi = ControlledPi()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = (await client.post("/api/sessions", json={"title": "Stop facade"})).json()
+            session_id = created["id"]
+            stream_task = asyncio.create_task(
+                client.post(f"/api/sessions/{session_id}/chat/stream", json={"input": "needs-stop"})
+            )
+            await asyncio.sleep(0.05)
+            result = await client.post(f"/api/sessions/{session_id}/runs/current/stop")
+            assert result.status_code == 200
+            response = await asyncio.wait_for(stream_task, timeout=2)
+            assert "event: run.stopped" in response.text
+
+    asyncio.run(scenario())

@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS node_runtime
+FROM node:22.20-bookworm-slim AS node_runtime
 
 FROM python:3.12-slim
 
@@ -19,7 +19,8 @@ WORKDIR /app
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
-    && npm install -g --ignore-scripts @earendil-works/pi-coding-agent pi-mcp-extension
+    && npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.2 pi-mcp-extension \
+    && ln -sf /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js /usr/local/bin/pi
 
 COPY . /app
 COPY docker/entrypoint.sh /entrypoint.sh

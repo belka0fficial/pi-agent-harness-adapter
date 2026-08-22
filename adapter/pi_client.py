@@ -13,6 +13,20 @@ from typing import Any
 from .toolgate_bridge import ToolGateBridge
 
 
+_PI_BLOCKED_ENV = {
+    "TOOLGATE_ADMIN_KEY",
+    "TOOLGATE_BOOTSTRAP_EXECUTION_KEY",
+    "MEMORYGATE_ADMIN_KEY",
+    "MEMORYGATE_READ_KEY",
+    "SYSTEMGATE_ADMIN_KEY",
+}
+
+
+def _pi_subprocess_env() -> dict[str, str]:
+    """Keep owner/admin gate credentials out of the agent runtime process."""
+    return {key: value for key, value in os.environ.items() if key not in _PI_BLOCKED_ENV}
+
+
 @dataclass
 class PiEvent:
     event: str
@@ -287,6 +301,7 @@ class SessionRuntime:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_pi_subprocess_env(),
         )
         self.reader_task = asyncio.create_task(self._reader())
         state = await self.send_command({"type": "get_state"})
@@ -321,7 +336,6 @@ class SessionRuntime:
                     {
                         "run_id": run.run_id,
                         "session_id": data.get("sessionId") or self.session_id,
-                        "session_file": data.get("sessionFile"),
                     },
                 )
             )
