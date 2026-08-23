@@ -874,6 +874,91 @@ def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
     assert "Sensitive" not in str(activity)
 
 
+def test_workroom_snapshot_aggregates_safe_team_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.sessions["sess-team"] = {
+            "id": "sess-team",
+            "title": "Core workroom",
+            "agent_id": "agent_pi_operator",
+            "team_id": "team_core",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:05:00+00:00",
+        }
+        app.state.messages["sess-team"] = [
+            {
+                "id": "u-secret",
+                "role": "user",
+                "content": "secret project prompt",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        ]
+        app.state.jobs["job-team"] = {
+            "id": "job-team",
+            "name": "Team briefing",
+            "schedule": "0 8 * * *",
+            "timezone": "UTC",
+            "prompt": "secret automation prompt",
+            "agent_id": "agent_pi_operator",
+            "team_id": "team_core",
+            "paused": False,
+            "approval_status": "not_required",
+            "required_tool_ids": [],
+            "required_memory_scopes": [],
+            "runs": 0,
+            "history": "------------",
+            "run_history": [],
+        }
+        snapshot = client.get("/api/workrooms/team_core").json()
+        listing = client.get("/api/workrooms").json()["workrooms"]
+
+    assert snapshot["team"]["id"] == "team_core"
+    assert snapshot["orchestrator"]["id"] == "agent_pi_operator"
+    assert snapshot["members"][0]["id"] == "agent_pi_operator"
+    assert snapshot["sessions"][0]["id"] == "sess-team"
+    assert snapshot["sessions"][0]["message_count"] == 1
+    assert snapshot["automations"][0]["id"] == "job-team"
+    assert listing[0]["id"] == "team_core"
+    assert "secret project prompt" not in str(snapshot)
+    assert "secret automation prompt" not in str(snapshot)
+    assert "prompt" not in str(snapshot).lower()
+
+
+def test_workroom_session_creation_validates_team_membership(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        created = client.post(
+            "/api/workrooms/team_core/sessions",
+            json={"title": "Core room"},
+        )
+        outsider = client.post(
+            "/api/agents",
+            json={
+                "name": "Outside Agent",
+                "purpose": "Not a member of the core team.",
+            },
+        ).json()
+        rejected = client.post(
+            "/api/workrooms/team_core/sessions",
+            json={"agent_id": outsider["id"]},
+        )
+        activity = client.get("/api/workrooms/team_core").json()["activity"]
+
+    assert created.status_code == 200
+    assert created.json()["team_id"] == "team_core"
+    assert rejected.status_code == 403
+    assert "workroom.session_created" in [item["event_type"] for item in activity]
+
+
 def test_chat_defaults_to_no_memory_side_effects():
     reset_state()
     pi = CapturingPi()

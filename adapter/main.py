@@ -983,7 +983,7 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
         "id": item.get("id"),
         "job_id": item.get("job_id") or item.get("id"),
         "name": item.get("name"),
-        "description": item.get("description") or "Prompt stored server-side",
+        "description": item.get("description") or "Input stored server-side",
         "schedule": item.get("schedule"),
         "timezone": item.get("timezone", "UTC"),
         "schedule_preview": item.get("schedule_preview", []),
@@ -1009,6 +1009,107 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
         "quarantine_reason": item.get("quarantine_reason"),
         "required_tool_ids": item.get("required_tool_ids", []),
         "required_memory_scopes": item.get("required_memory_scopes", []),
+    }
+
+
+def _public_agent_summary(agent_id: str) -> dict[str, Any]:
+    agent = app.state.agents.get(agent_id) or {}
+    return {
+        "id": agent_id,
+        "name": agent.get("name") or agent_id,
+        "title": agent.get("title") or "Agent",
+        "mode": agent.get("mode") or "professional",
+        "status": agent.get("status") or "unknown",
+        "tool_count": len(agent.get("tool_ids") or []),
+        "skill_count": len(agent.get("skill_ids") or []),
+        "memory_scope_count": len(agent.get("memory_scopes") or []),
+        "team_ids": agent.get("team_ids") or [],
+    }
+
+
+def _team_sessions(team_id: str, *, limit: int = 8) -> list[dict[str, Any]]:
+    rows = []
+    for item in app.state.sessions.values():
+        if item.get("team_id") != team_id:
+            continue
+        session_id = item.get("id") or item.get("session_id")
+        rows.append({
+            "id": session_id,
+            "session_id": session_id,
+            "title": item.get("title") or "Team chat",
+            "agent_id": item.get("agent_id"),
+            "team_id": item.get("team_id"),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+            "message_count": len(app.state.messages.get(session_id, [])),
+        })
+    rows.sort(key=lambda row: row.get("updated_at") or row.get("created_at") or "", reverse=True)
+    return rows[:limit]
+
+
+def _team_pending_approval_count(team_id: str) -> int:
+    pending_ids = {item.get("id") for item in app.state.gates.approvals(history=False)}
+    count = 0
+    for job in app.state.jobs.values():
+        if job.get("team_id") == team_id and job.get("approval_request_id") in pending_ids:
+            count += 1
+    for approval in app.state.approval_runs.values():
+        if approval.get("team_id") == team_id:
+            count += 1
+    return count
+
+
+def _public_workroom(team_id: str) -> dict[str, Any]:
+    _ensure_registry_seeded()
+    _normalize_agent_model_defaults()
+    team = app.state.teams.get(team_id)
+    if not team:
+        raise HTTPException(404, "team not found")
+    members = [_public_agent_summary(agent_id) for agent_id in team.get("member_agent_ids", [])]
+    jobs = [
+        _public_job(item)
+        for item in app.state.jobs.values()
+        if item.get("team_id") == team_id
+    ]
+    activity = _list_activity(team_id=team_id, limit=12)
+    sessions = _team_sessions(team_id)
+    return {
+        "id": team_id,
+        "team": {
+            "id": team_id,
+            "name": team.get("name"),
+            "purpose": team.get("purpose"),
+            "status": team.get("status") or "unknown",
+            "orchestrator_agent_id": team.get("orchestrator_agent_id"),
+            "member_agent_ids": team.get("member_agent_ids", []),
+            "memory_scopes": team.get("memory_scopes", []),
+            "tool_ids": team.get("tool_ids", []),
+            "skill_ids": team.get("skill_ids", []),
+            "created_at": team.get("created_at"),
+            "updated_at": team.get("updated_at"),
+        },
+        "orchestrator": _public_agent_summary(team.get("orchestrator_agent_id") or "")
+        if team.get("orchestrator_agent_id") else None,
+        "members": members,
+        "access": {
+            "tool_count": len(team.get("tool_ids") or []),
+            "skill_count": len(team.get("skill_ids") or []),
+            "memory_scope_count": len(team.get("memory_scopes") or []),
+            "tool_ids": team.get("tool_ids", []),
+            "skill_ids": team.get("skill_ids", []),
+            "memory_scopes": team.get("memory_scopes", []),
+        },
+        "sessions": sessions,
+        "automations": jobs,
+        "activity": activity,
+        "pending_approvals": _team_pending_approval_count(team_id),
+        "readiness": {
+            "orchestrator_configured": bool(team.get("orchestrator_agent_id")),
+            "member_count": len(members),
+            "session_count": len(sessions),
+            "automation_count": len(jobs),
+            "recent_activity_count": len(activity),
+        },
     }
 
 
@@ -1878,6 +1979,71 @@ def delete_team(team_id: str):
     _delete_registry_item("team", team_id)
     _sync_toolgate_execution_scopes()
     return {"deleted": True}
+
+
+@app.get("/api/workrooms")
+def list_workrooms():
+    _ensure_registry_seeded()
+    return {
+        "workrooms": [
+            {
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "purpose": item.get("purpose"),
+                "status": item.get("status") or "unknown",
+                "orchestrator_agent_id": item.get("orchestrator_agent_id"),
+                "member_count": len(item.get("member_agent_ids") or []),
+                "tool_count": len(item.get("tool_ids") or []),
+                "skill_count": len(item.get("skill_ids") or []),
+                "memory_scope_count": len(item.get("memory_scopes") or []),
+                "recent_activity": _list_activity(team_id=item.get("id"), limit=3),
+            }
+            for item in app.state.teams.values()
+        ]
+    }
+
+
+@app.get("/api/workrooms/{team_id}")
+def get_workroom(team_id: str):
+    return _public_workroom(team_id)
+
+
+@app.post("/api/workrooms/{team_id}/sessions")
+def create_workroom_session(team_id: str, payload: dict[str, Any] | None = None):
+    _ensure_registry_seeded()
+    team = app.state.teams.get(team_id)
+    if not team:
+        raise HTTPException(404, "team not found")
+    payload = payload or {}
+    agent_id = str(
+        payload.get("agent_id")
+        or team.get("orchestrator_agent_id")
+        or (team.get("member_agent_ids") or ["agent_pi_operator"])[0]
+    )
+    actor = _permission_context(agent_id, team_id)
+    session_id = f"sess_{uuid.uuid4().hex[:12]}"
+    item = {
+        "id": session_id,
+        "session_id": session_id,
+        "title": payload.get("title") or f"{team.get('name') or 'Team'} workroom",
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    app.state.sessions[session_id] = item
+    app.state.messages[session_id] = []
+    _record_activity(
+        actor["agent_id"],
+        event_type="workroom.session_created",
+        status="ready",
+        source="AgentGate",
+        summary=f"Workroom session created: {team.get('name') or team_id}",
+        team_id=team_id,
+        ref_type="session",
+        ref_id=session_id,
+    )
+    return item
 
 
 @app.get("/v1/capabilities")
