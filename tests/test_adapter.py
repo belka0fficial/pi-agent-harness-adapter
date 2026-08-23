@@ -361,6 +361,80 @@ def test_freellmapi_provider_status_uses_health_and_redacts_urls(monkeypatch):
     assert "Invalid API key" not in str(freeapi)
 
 
+def test_gateway_candidates_report_auth_required_without_urls(monkeypatch):
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, timeout, headers=None):
+        if url.endswith("/health"):
+            return Response(200, {"status": "ok"})
+        if url.endswith("/v1/models"):
+            return Response(401, {"error": {"message": "Invalid unified key"}})
+        raise AssertionError(url)
+
+    monkeypatch.delenv("FREE_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("FREELLMAPI_API_KEY", raising=False)
+    monkeypatch.setattr("adapter.main.httpx.get", fake_get)
+    with TestClient(app) as client:
+        payload = client.get("/api/model/gateway-candidates").json()
+
+    assert payload["gateway"]["status"] == "auth_required"
+    assert payload["gateway"]["configured"] is False
+    assert payload["candidate_count"] == 0
+    assert "base_url" not in str(payload)
+    assert "Invalid unified key" not in str(payload)
+
+
+def test_gateway_candidates_are_safe_model_metadata(monkeypatch):
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, timeout, headers=None):
+        if url.endswith("/health"):
+            return Response(200, {"status": "ok"})
+        if url.endswith("/v1/models"):
+            assert headers == {"Authorization": "Bearer unified-test-key"}
+            return Response(200, {
+                "data": [
+                    {
+                        "id": "free-helper",
+                        "owned_by": "groq",
+                        "context_window": 32768,
+                        "modalities": ["text"],
+                        "capabilities": ["chat", "responses"],
+                        "available": True,
+                        "provider_url": "https://example.invalid/private",
+                    }
+                ]
+            })
+        raise AssertionError(url)
+
+    monkeypatch.setenv("FREE_LLM_API_KEY", "unified-test-key")
+    monkeypatch.setattr("adapter.main.httpx.get", fake_get)
+    with TestClient(app) as client:
+        payload = client.get("/api/model/gateway-candidates").json()
+
+    candidate = payload["candidates"][0]
+    assert payload["gateway"]["models_visible"] is True
+    assert candidate["provider"] == "freellmapi"
+    assert candidate["model"] == "free-helper"
+    assert candidate["owned_by"] == "groq"
+    assert candidate["policy"] == "low_risk_only"
+    assert "provider_url" not in candidate
+    assert "example.invalid" not in str(payload)
+    assert "unified-test-key" not in str(payload)
+
+
 class FailingPi:
     async def stream(self, prompt: str, *, session_id: str, options=None):
         if False:

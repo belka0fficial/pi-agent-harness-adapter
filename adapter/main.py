@@ -2633,6 +2633,99 @@ def _provider_risk(provider_id: str) -> dict[str, str]:
     }
 
 
+def _safe_gateway_model(row: dict[str, Any]) -> dict[str, Any] | None:
+    model_id = _safe_text(row.get("id") or row.get("name"), limit=160)
+    if not model_id:
+        return None
+    owned_by = _safe_text(row.get("owned_by") or row.get("provider") or "freellmapi", limit=80)
+    context = row.get("context_window") or row.get("context") or row.get("max_context")
+    modalities = row.get("modalities") if isinstance(row.get("modalities"), list) else []
+    capabilities = row.get("capabilities") if isinstance(row.get("capabilities"), list) else []
+    available = row.get("available")
+    return {
+        "id": model_id,
+        "provider": "freellmapi",
+        "model": model_id,
+        "name": model_id,
+        "owned_by": owned_by,
+        "context": str(context)[:40] if context is not None else None,
+        "available": True if available is True else False if available is False else None,
+        "modalities": [_safe_text(item, limit=40) for item in modalities[:6]],
+        "capabilities": [_safe_text(item, limit=40) for item in capabilities[:8]],
+        "risk": "external",
+        "policy": "low_risk_only",
+        "note": "Candidate FreeLLMAPI helper route. Use for low-risk work only until provider and Pi routing are owner-reviewed.",
+    }
+
+
+def _freellmapi_headers() -> dict[str, str]:
+    api_key = os.environ.get("FREE_LLM_API_KEY") or os.environ.get("FREELLMAPI_API_KEY") or ""
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+@app.get("/api/model/gateway-candidates")
+def model_gateway_candidates():
+    freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
+    headers = _freellmapi_headers()
+    result: dict[str, Any] = {
+        "gateway": {
+            "id": "freellmapi",
+            "name": "FreeLLMAPI",
+            "status": "unavailable",
+            "configured": bool(headers),
+            "models_visible": False,
+            "risk": "external",
+            "policy": "low_risk_only",
+            "setup_hint": "Set FREE_LLM_API_KEY server-side after configuring FreeLLMAPI, then restart the adapter.",
+        },
+        "candidates": [],
+        "candidate_count": 0,
+        "runtime_note": "Candidates are metadata only until Pi can see the same provider/model route.",
+    }
+    try:
+        ping = httpx.get(f"{freeapi_url}/health", timeout=3)
+        if ping.status_code == 200:
+            result["gateway"]["status"] = "ok"
+    except httpx.HTTPError:
+        return result
+    try:
+        response = httpx.get(f"{freeapi_url}/v1/models", headers=headers, timeout=5)
+    except httpx.HTTPError:
+        return result
+    if response.status_code in {401, 403}:
+        result["gateway"]["status"] = "auth_required"
+        result["gateway"]["configured"] = False
+        result["gateway"]["models_status"] = "auth_required"
+        return result
+    if response.status_code != 200:
+        result["gateway"]["status"] = "unavailable"
+        result["gateway"]["models_status"] = "unavailable"
+        return result
+    try:
+        payload = response.json()
+    except ValueError:
+        result["gateway"]["models_status"] = "invalid_response"
+        return result
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    candidates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe = _safe_gateway_model(row)
+        if safe:
+            candidates.append(safe)
+        if len(candidates) >= 60:
+            break
+    result["gateway"]["configured"] = True
+    result["gateway"]["models_visible"] = bool(candidates)
+    result["gateway"]["model_count"] = len(candidates)
+    result["candidate_count"] = len(candidates)
+    result["candidates"] = candidates
+    return result
+
+
 @app.get("/api/model/providers")
 def model_providers():
     freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
