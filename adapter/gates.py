@@ -51,6 +51,50 @@ class GateClients:
         text = text.replace("key", "credential").replace("Key", "Credential")
         return text[:140]
 
+    @staticmethod
+    def _safe_service_listener(value: Any) -> str | None:
+        text = str(value or "").strip()
+        if ":" not in text:
+            return None
+        scope, port_text = text.rsplit(":", 1)
+        allowed_scopes = {
+            "loopback",
+            "tailscale",
+            "private-lan",
+            "container-internal",
+            "all-interfaces",
+            "public-or-host",
+        }
+        if scope not in allowed_scopes:
+            return None
+        if not port_text.isdigit():
+            return None
+        port = int(port_text)
+        if port < 1 or port > 65535:
+            return None
+        return f"{scope}:{port}"
+
+    @classmethod
+    def _safe_service_row(cls, row: dict[str, Any], index: int) -> dict[str, Any]:
+        listeners = []
+        if isinstance(row.get("listeners"), list):
+            for item in row["listeners"][:12]:
+                listener = cls._safe_service_listener(item)
+                if listener and listener not in listeners:
+                    listeners.append(listener)
+        status = str(row.get("status") or "unknown").strip().lower()
+        if status not in {"listening", "running", "healthy", "ok", "unknown", "unavailable"}:
+            status = "unknown"
+        return {
+            "id": f"service-{index:03d}",
+            "name": cls._safe_label(row.get("name") or "service")[:80] or "service",
+            "image": cls._safe_label(row.get("image") or row.get("kind") or "service-listener")[:80],
+            "status": status,
+            "created": None,
+            "listeners": listeners,
+            "source": "systemgate-services",
+        }
+
     @classmethod
     def _redacted_event(cls, event: dict[str, Any]) -> dict[str, Any]:
         event_type = str(event.get("event_type") or "event")
@@ -408,15 +452,13 @@ class GateClients:
                 })
         return {
             "vitals": vitals,
-            "containers": [{
-                "id": str(row.get("id") or ""),
-                "name": str(row.get("name") or ""),
-                "image": str(row.get("image") or row.get("kind") or "service-listener"),
-                "status": str(row.get("status") or "unknown"),
-                "created": row.get("created"),
-                "listeners": [str(item)[:80] for item in row.get("listeners", [])[:12]] if isinstance(row.get("listeners"), list) else [],
-                "source": "systemgate-services",
-            } for row in service_rows if isinstance(row, dict)] or [{
+            "containers": [
+                self._safe_service_row(row, index)
+                for index, row in enumerate(
+                    [item for item in service_rows if isinstance(item, dict)],
+                    start=1,
+                )
+            ] or [{
                 "id": str(row.get("id") or ""),
                 "name": str(row.get("name") or ""),
                 "image": str(row.get("image") or ""),

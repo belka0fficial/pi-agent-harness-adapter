@@ -703,7 +703,17 @@ def test_gate_clients_normalize_upstream_contracts(monkeypatch):
         ],
         ("GET", "memorygate", "/memory"): {"results": [{"id": "m1", "text": "Remember this", "memory_type": "fact", "confidence": "high", "updated_at": "2026-01-01T00:00:00+00:00"}]},
         ("GET", "systemgate", "/vitals"): {"cpu_percent": 5, "memory": {"percent": 10}, "disk": {"percent": 20}, "cpu_count": 4},
-        ("GET", "systemgate", "/services"): {"results": [{"id": "pid-1-agentgate", "name": "agentgate", "kind": "process-listener", "status": "listening", "listeners": ["loopback:8080"], "cmdline": "hidden"}]},
+        ("GET", "systemgate", "/services"): {"results": [{
+            "id": "pid-1-agentgate",
+            "pid": 1,
+            "name": "agentgate",
+            "kind": "process-listener",
+            "status": "listening",
+            "listeners": ["loopback:8080", "127.0.0.1:9999", "/var/run/docker.sock", "0.0.0.0:80"],
+            "cmdline": "hidden",
+            "env": {"TOKEN": "hidden"},
+            "path": "/home/alexeybe1kin/private",
+        }]},
         ("GET", "systemgate", "/logs/errors"): {"text": ""},
         ("GET", "systemgate", "/packages"): {"apt": {"ok": True, "output": ""}, "pip": {"ok": True, "output": "[]"}, "npm": {"ok": True, "output": '{}'}},
         ("GET", "systemgate", "/backups"): {"results": [{"name": "backup-1.tar.zst", "path": "hidden-upstream-path", "created_at": 1770000000.0}]},
@@ -723,10 +733,17 @@ def test_gate_clients_normalize_upstream_contracts(monkeypatch):
     overview = gates.system_overview()
     assert overview["vitals"]["cpu_percent"] == 5
     assert overview["containers"][0]["name"] == "agentgate"
+    assert overview["containers"][0]["id"] == "service-001"
     assert overview["containers"][0]["listeners"] == ["loopback:8080"]
     assert overview["containers"][0]["source"] == "systemgate-services"
     assert "stats" not in overview["containers"][0]
+    assert "pid" not in overview["containers"][0]
     assert "cmdline" not in overview["containers"][0]
+    assert "env" not in overview["containers"][0]
+    assert "/home/" not in str(overview["containers"])
+    assert "/var/run/docker.sock" not in str(overview["containers"])
+    assert "127.0.0.1" not in str(overview["containers"])
+    assert "0.0.0.0" not in str(overview["containers"])
     assert overview["backups"]["latest"]["name"] == "backup-1.tar.zst"
     assert "path" not in overview["backups"]["latest"]
     assert overview["packages"][0]["name"] == "apt"
