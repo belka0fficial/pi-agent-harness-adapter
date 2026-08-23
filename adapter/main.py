@@ -152,6 +152,22 @@ def _registry_conn() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity_events (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            team_id TEXT,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            ref_type TEXT,
+            ref_id TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     return conn
 
 
@@ -216,6 +232,96 @@ def _delete_registry_item(kind: str, item_id: str) -> None:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry_conn() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
+
+
+def _safe_summary(value: str, *, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _record_activity(
+    agent_id: str | None,
+    *,
+    event_type: str,
+    status: str,
+    source: str,
+    summary: str,
+    team_id: str | None = None,
+    ref_type: str | None = None,
+    ref_id: str | None = None,
+) -> dict[str, Any] | None:
+    if not agent_id:
+        return None
+    item = {
+        "id": f"act_{uuid.uuid4().hex[:12]}",
+        "agent_id": agent_id,
+        "team_id": team_id,
+        "event_type": _safe_summary(event_type, limit=80),
+        "status": _safe_summary(status, limit=40),
+        "source": _safe_summary(source, limit=80),
+        "summary": _safe_summary(summary),
+        "ref_type": _safe_summary(ref_type or "", limit=60) or None,
+        "ref_id": _safe_summary(ref_id or "", limit=120) or None,
+        "created_at": now(),
+    }
+    with _registry_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO activity_events (
+                id, agent_id, team_id, event_type, status, source, summary,
+                ref_type, ref_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item["id"],
+                item["agent_id"],
+                item["team_id"],
+                item["event_type"],
+                item["status"],
+                item["source"],
+                item["summary"],
+                item["ref_type"],
+                item["ref_id"],
+                item["created_at"],
+            ),
+        )
+        conn.execute(
+            """
+            DELETE FROM activity_events
+            WHERE id NOT IN (
+                SELECT id FROM activity_events
+                ORDER BY created_at DESC
+                LIMIT 500
+            )
+            """
+        )
+    return item
+
+
+def _list_activity(agent_id: str | None = None, *, limit: int = 20) -> list[dict[str, Any]]:
+    limit = min(max(limit, 1), 100)
+    with _registry_conn() as conn:
+        if agent_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM activity_events
+                WHERE agent_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (agent_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM activity_events
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _ensure_registry_seeded() -> None:
@@ -503,6 +609,16 @@ async def run_job(job_id: str):
     if not item:
         return
     item["last_run_at"] = now()
+    _record_activity(
+        item.get("agent_id"),
+        event_type="job.started",
+        status="running",
+        source="Pi adapter",
+        summary=f"Automation job started: {item.get('name') or job_id}",
+        team_id=item.get("team_id"),
+        ref_type="job",
+        ref_id=job_id,
+    )
     chunks = []
     status = "ok"
     error = None
@@ -534,6 +650,16 @@ async def run_job(job_id: str):
         item["failure_count"] = 0
         item.pop("quarantine_reason", None)
     _save_registry_item("job", item)
+    _record_activity(
+        item.get("agent_id"),
+        event_type="job.completed",
+        status=status,
+        source="Pi adapter",
+        summary=f"Automation job {status}: {item.get('name') or job_id}",
+        team_id=item.get("team_id"),
+        ref_type="job",
+        ref_id=job_id,
+    )
     if item.get("webhook_url") and _webhooks_enabled():
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(item["webhook_url"], json=result)
@@ -573,6 +699,16 @@ def create_job(payload: JobInput):
     scheduled = app.state.scheduler.get_job(job_id)
     item["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
     _save_registry_item("job", item)
+    _record_activity(
+        actor["agent_id"],
+        event_type="job.created",
+        status="scheduled",
+        source="AgentGate",
+        summary=f"Automation job created: {item['name']}",
+        team_id=actor["team_id"],
+        ref_type="job",
+        ref_id=job_id,
+    )
     return item
 
 
@@ -594,6 +730,16 @@ def update_job(job_id: str, payload: dict[str, Any]):
     app.state.jobs[job_id]["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
     app.state.jobs[job_id]["schedule_preview"] = schedule_preview
     _save_registry_item("job", app.state.jobs[job_id])
+    _record_activity(
+        app.state.jobs[job_id].get("agent_id"),
+        event_type="job.updated",
+        status="updated",
+        source="AgentGate",
+        summary=f"Automation job updated: {app.state.jobs[job_id].get('name') or job_id}",
+        team_id=app.state.jobs[job_id].get("team_id"),
+        ref_type="job",
+        ref_id=job_id,
+    )
     return app.state.jobs[job_id]
 
 
@@ -670,11 +816,25 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
     if session_id not in app.state.sessions:
         app.state.sessions[session_id] = {"id": session_id, "session_id": session_id, "title": "Imported chat", "created_at": now(), "updated_at": now()}
         app.state.messages[session_id] = []
+    app.state.sessions[session_id]["agent_id"] = actor["agent_id"]
+    app.state.sessions[session_id]["team_id"] = actor["team_id"]
+    app.state.sessions[session_id]["updated_at"] = now()
     user_message = {"id": f"msg_{uuid.uuid4().hex[:12]}", "role": "user", "content": payload.input, "created_at": now()}
     app.state.messages[session_id].append(user_message)
+    _record_activity(
+        actor["agent_id"],
+        event_type="chat.started",
+        status="running",
+        source="AgentGate",
+        summary="Chat turn started",
+        team_id=actor["team_id"],
+        ref_type="session",
+        ref_id=session_id,
+    )
 
     async def events() -> AsyncIterator[bytes]:
         collected = []
+        run_status = "ok"
         instructions = payload.instructions or ""
         if payload.memory_enabled:
             try:
@@ -711,12 +871,25 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
                             "tool_id": tool_id,
                             "tool_ids": actor["tool_ids"],
                         }
+                        _record_activity(
+                            actor["agent_id"],
+                            event_type="approval.required",
+                            status="waiting",
+                            source="ToolGate",
+                            summary=f"Approval required for {tool_id or 'tool action'}",
+                            team_id=actor["team_id"],
+                            ref_type="approval",
+                            ref_id=request_id,
+                        )
                 if event.event == "message.delta":
                     collected.append(str(event_data.get("delta") or event_data.get("text") or event_data.get("content") or ""))
+                if event.event in {"run.failed", "run.stopped"}:
+                    run_status = "failed" if event.event == "run.failed" else "stopped"
                 if event.event in {"run.stopped", "run.failed", "message.completed"} and request.app.state.active_runs.get(session_id) == run_id:
                     request.app.state.active_runs.pop(session_id, None)
                 yield event_to_sse(event)
         except Exception as exc:
+            run_status = "failed"
             yield event_to_sse(PiEvent("run.failed", {"message": str(exc)[:1000]}))
         if collected:
             request.app.state.messages[session_id].append({"id": f"msg_{uuid.uuid4().hex[:12]}", "role": "assistant", "content": "".join(collected), "created_at": now()})
@@ -725,6 +898,16 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
                     request.app.state.gates.record_transcript(session_id, request.app.state.messages[session_id], agent_id=actor["agent_id"])
                 except (RuntimeError, AttributeError):
                     pass
+        _record_activity(
+            actor["agent_id"],
+            event_type="chat.completed",
+            status=run_status,
+            source="Pi adapter",
+            summary=f"Chat turn {run_status}",
+            team_id=actor["team_id"],
+            ref_type="session",
+            ref_id=session_id,
+        )
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -740,6 +923,17 @@ async def stop_current_session_run(session_id: str):
         await app.state.pi.stop_run(run_id)
     except ValueError:
         raise HTTPException(404, "run not found")
+    session = app.state.sessions.get(session_id, {})
+    _record_activity(
+        session.get("agent_id") or "agent_pi_operator",
+        event_type="chat.stop_requested",
+        status="stopping",
+        source="AgentGate",
+        summary="Stop requested for active chat run",
+        team_id=session.get("team_id"),
+        ref_type="session",
+        ref_id=session_id,
+    )
     return {"run_id": run_id, "session_id": session_id, "status": "stopping"}
 
 @app.get("/api/model/options")
@@ -830,7 +1024,10 @@ def model_providers():
 def list_agents():
     _ensure_registry_seeded()
     _normalize_agent_model_defaults()
-    return {"agents": list(app.state.agents.values())}
+    agents = []
+    for item in app.state.agents.values():
+        agents.append({**item, "recent_activity": _list_activity(item.get("id"), limit=3)})
+    return {"agents": agents}
 
 
 @app.get("/api/agents/{agent_id}")
@@ -840,7 +1037,15 @@ def get_agent(agent_id: str):
     item = app.state.agents.get(agent_id)
     if not item:
         raise HTTPException(404, "agent not found")
-    return item
+    return {**item, "recent_activity": _list_activity(agent_id, limit=10)}
+
+
+@app.get("/api/agents/{agent_id}/activity")
+def get_agent_activity(agent_id: str, limit: int = 20):
+    _ensure_registry_seeded()
+    if agent_id not in app.state.agents:
+        raise HTTPException(404, "agent not found")
+    return {"activity": _list_activity(agent_id, limit=limit)}
 
 
 @app.post("/api/agents")
@@ -858,6 +1063,15 @@ def create_agent(payload: AgentInput):
     }
     app.state.agents[agent_id] = item
     _save_registry_item("agent", item)
+    _record_activity(
+        agent_id,
+        event_type="agent.created",
+        status="draft",
+        source="AgentGate",
+        summary=f"Agent created: {item['name']}",
+        ref_type="agent",
+        ref_id=agent_id,
+    )
     return item
 
 
@@ -871,6 +1085,16 @@ def update_agent(agent_id: str, payload: dict[str, Any]):
     item.update({key: value for key, value in payload.items() if key in allowed})
     item["updated_at"] = now()
     _save_registry_item("agent", item)
+    _record_activity(
+        agent_id,
+        event_type="agent.updated",
+        status="updated",
+        source="AgentGate",
+        summary=f"Agent profile updated: {item.get('name') or agent_id}",
+        team_id=(item.get("team_ids") or [None])[0],
+        ref_type="agent",
+        ref_id=agent_id,
+    )
     return item
 
 
@@ -1087,8 +1311,28 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
         except ValueError as exc:
             raise HTTPException(404 if "run not found" in str(exc) else 409, str(exc))
         app.state.approval_runs.pop(request_id, None)
+        _record_activity(
+            binding.get("agent_id"),
+            event_type="approval.decided",
+            status=decision,
+            source="ToolGate",
+            summary=f"Approval {decision} for {binding.get('tool_id') or 'tool action'}",
+            team_id=binding.get("team_id"),
+            ref_type="approval",
+            ref_id=request_id,
+        )
         return {"run_id": binding["run_id"], "session_id": binding["session_id"], "decision": decision, "request_id": record.get("id", request_id), "status": record.get("status", decision)}
-    return app.state.gates.decide_approval(request_id, decision)
+    result = app.state.gates.decide_approval(request_id, decision)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="approval.decided",
+        status=decision,
+        source="ToolGate",
+        summary=f"Owner {decision} a ToolGate request",
+        ref_type="approval",
+        ref_id=request_id,
+    )
+    return result
 
 
 @app.get("/api/gates/memorygate")

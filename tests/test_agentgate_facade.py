@@ -68,6 +68,7 @@ def reset_state():
     app.state.gates = FakeGates()
     app.state.agents = {}
     app.state.teams = {}
+    app.state.approval_runs = {}
 
 
 def test_agentgate_facade_exposes_real_sessions_messages_and_jobs():
@@ -385,6 +386,37 @@ def test_chat_uses_selected_agent_model_defaults_when_payload_omits_model():
     assert response.status_code == 200
     assert pi.options["provider"] == "openai-codex"
     assert pi.options["model"] == "gpt-5.6-luna"
+
+
+def test_agent_activity_records_safe_chat_and_job_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    pi = CapturingPi()
+    app.state.pi = pi
+
+    with TestClient(app) as client:
+        chat = client.post(
+            "/api/sessions/sess-activity/chat/stream",
+            json={"input": "Sensitive prompt must not be stored in activity"},
+        )
+        assert chat.status_code == 200
+        created = client.post(
+            "/api/jobs",
+            json={"name": "Activity Probe", "schedule": "0 8 * * *", "prompt": "Sensitive job prompt"},
+        )
+        assert created.status_code == 200
+        ran = client.post(f"/api/jobs/{created.json()['id']}/run")
+        assert ran.status_code == 200
+        activity = client.get("/api/agents/agent_pi_operator/activity").json()["activity"]
+
+    event_types = [item["event_type"] for item in activity]
+    assert "chat.started" in event_types
+    assert "chat.completed" in event_types
+    assert "job.created" in event_types
+    assert "job.completed" in event_types
+    assert "Sensitive" not in str(activity)
+    assert all("summary" in item and "created_at" in item for item in activity)
 
 
 def test_chat_defaults_to_no_memory_side_effects():
