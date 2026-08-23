@@ -2186,11 +2186,57 @@ def _sanitize_risk(value: Any) -> str:
 
 
 def _job_requires_owner_approval(payload: JobInput | dict[str, Any]) -> bool:
+    return bool(_job_approval_reasons(payload))
+
+
+def _job_approval_reasons(payload: JobInput | dict[str, Any]) -> list[str]:
     policy = _sanitize_job_approval_policy(
         payload.approval_policy if isinstance(payload, JobInput) else payload.get("approval_policy")
     )
     deliver = payload.deliver if isinstance(payload, JobInput) else payload.get("deliver", "local")
-    return policy == "owner_confirmation" or str(deliver or "local") != "local"
+    delivery_policy = (
+        payload.delivery_policy if isinstance(payload, JobInput) else payload.get("delivery_policy", "disabled")
+    )
+    delivery_targets = (
+        payload.delivery_targets if isinstance(payload, JobInput) else payload.get("delivery_targets", [])
+    )
+    required_tool_ids = (
+        payload.required_tool_ids if isinstance(payload, JobInput) else payload.get("required_tool_ids", [])
+    )
+    required_memory_scopes = (
+        payload.required_memory_scopes if isinstance(payload, JobInput) else payload.get("required_memory_scopes", [])
+    )
+    reasons = []
+    if policy == "owner_confirmation":
+        reasons.append("owner_confirmation_policy")
+    if str(deliver or "local") != "local":
+        reasons.append("non_local_delivery")
+    if _sanitize_delivery_policy(delivery_policy) != "disabled":
+        reasons.append("delivery_policy")
+    if delivery_targets:
+        reasons.append("delivery_targets")
+    if required_tool_ids:
+        reasons.append("tool_access")
+    if required_memory_scopes:
+        reasons.append("memory_access")
+    return reasons
+
+
+def _job_approval_fingerprint(item: dict[str, Any]) -> str:
+    payload = {
+        "agent_id": item.get("agent_id"),
+        "team_id": item.get("team_id"),
+        "schedule": item.get("schedule"),
+        "timezone": item.get("timezone"),
+        "deliver": item.get("deliver", "local"),
+        "delivery_policy": item.get("delivery_policy", "disabled"),
+        "delivery_targets": sorted(item.get("delivery_targets") or []),
+        "required_tool_ids": sorted(item.get("required_tool_ids") or []),
+        "required_memory_scopes": sorted(item.get("required_memory_scopes") or []),
+        "prompt_digest": _job_prompt_digest(item.get("prompt") or ""),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _create_job_approval_request(item: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
@@ -2203,8 +2249,11 @@ def _create_job_approval_request(item: dict[str, Any], actor: dict[str, Any]) ->
         "schedule": item.get("schedule"),
         "timezone": item.get("timezone"),
         "deliver": item.get("deliver", "local"),
+        "delivery_policy": item.get("delivery_policy", "disabled"),
+        "delivery_target_count": len(item.get("delivery_targets") or []),
         "required_tool_count": len(item.get("required_tool_ids") or []),
         "required_memory_scope_count": len(item.get("required_memory_scopes") or []),
+        "approval_reasons": _job_approval_reasons(item),
         "prompt_digest": _job_prompt_digest(item.get("prompt") or ""),
     }
     return app.state.gates.create_admin_request(
@@ -2238,6 +2287,8 @@ def _activate_approved_job(job_id: str, request: dict[str, Any] | None = None) -
                 raise HTTPException(409, "automation approval was rejected")
             raise HTTPException(409, "automation is still awaiting owner approval")
     item["approval_status"] = "approved"
+    item["approval_reasons"] = _job_approval_reasons(item)
+    item["approval_fingerprint"] = _job_approval_fingerprint(item)
     item["paused"] = False
     item["quarantine_reason"] = None
     _sync_scheduler(job_id)
@@ -2330,6 +2381,7 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
         "updated_at": item.get("updated_at"),
         "approval_policy": item.get("approval_policy", "auto"),
         "approval_status": item.get("approval_status", "not_required"),
+        "approval_reasons": item.get("approval_reasons", []),
         "approval_request_id": item.get("approval_request_id"),
         "failure_count": item.get("failure_count", 0),
         "quarantine_reason": item.get("quarantine_reason"),
@@ -2639,7 +2691,6 @@ def create_job(payload: JobInput):
     )
     schedule_preview = _schedule_preview(payload.schedule, payload.timezone)
     job_id = f"job_{uuid.uuid4().hex[:12]}"
-    pending_approval = _job_requires_owner_approval(payload)
     item = {
         "id": job_id,
         "job_id": job_id,
@@ -2651,9 +2702,11 @@ def create_job(payload: JobInput):
         "approval_policy": approval_policy,
         "delivery_policy": delivery_policy,
         "delivery_targets": delivery_targets,
-        "approval_status": "pending" if pending_approval else "not_required",
+        "approval_status": "not_required",
+        "approval_reasons": [],
+        "approval_fingerprint": None,
         "approval_request_id": None,
-        "paused": pending_approval,
+        "paused": False,
         "created_at": now(),
         "updated_at": now(),
         "last_run_at": None,
@@ -2663,8 +2716,15 @@ def create_job(payload: JobInput):
         "history": "------------",
         "run_history": [],
         "failure_count": 0,
-        "quarantine_reason": "waiting for owner approval" if pending_approval else None,
+        "quarantine_reason": None,
     }
+    approval_reasons = _job_approval_reasons(item)
+    pending_approval = bool(approval_reasons)
+    item["approval_reasons"] = approval_reasons
+    item["approval_fingerprint"] = _job_approval_fingerprint(item) if pending_approval else None
+    item["approval_status"] = "pending" if pending_approval else "not_required"
+    item["paused"] = pending_approval
+    item["quarantine_reason"] = "waiting for owner approval" if pending_approval else None
     app.state.jobs[job_id] = item
     if pending_approval:
         request = _create_job_approval_request(item, actor)
@@ -2691,6 +2751,7 @@ def create_job(payload: JobInput):
 def update_job(job_id: str, payload: dict[str, Any]):
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
+    previous = dict(app.state.jobs[job_id])
     _validate_job_payload(payload.get("webhook_url"))
     next_schedule = payload.get("schedule") or app.state.jobs[job_id].get("schedule")
     next_timezone = payload.get("timezone") or app.state.jobs[job_id].get("timezone")
@@ -2719,16 +2780,32 @@ def update_job(job_id: str, payload: dict[str, Any]):
     app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "delivery_policy", "delivery_targets", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes", "approval_policy"}})
     app.state.jobs[job_id]["updated_at"] = now()
     app.state.jobs[job_id]["schedule_preview"] = schedule_preview
-    if _job_requires_owner_approval(app.state.jobs[job_id]) and app.state.jobs[job_id].get("approval_status") != "approved":
+    approval_reasons = _job_approval_reasons(app.state.jobs[job_id])
+    approval_fingerprint = _job_approval_fingerprint(app.state.jobs[job_id]) if approval_reasons else None
+    previous_fingerprint = previous.get("approval_fingerprint") or _job_approval_fingerprint(previous)
+    needs_fresh_approval = bool(approval_reasons) and (
+        app.state.jobs[job_id].get("approval_status") != "approved"
+        or approval_fingerprint != previous_fingerprint
+    )
+    app.state.jobs[job_id]["approval_reasons"] = approval_reasons
+    app.state.jobs[job_id]["approval_fingerprint"] = approval_fingerprint
+    if needs_fresh_approval:
         app.state.jobs[job_id]["paused"] = True
         app.state.jobs[job_id]["next_run_at"] = None
         app.state.jobs[job_id]["approval_status"] = "pending"
         app.state.jobs[job_id]["quarantine_reason"] = "waiting for owner approval"
         if app.state.scheduler.get_job(job_id):
             app.state.scheduler.remove_job(job_id)
-        if not app.state.jobs[job_id].get("approval_request_id"):
-            request = _create_job_approval_request(app.state.jobs[job_id], actor)
-            app.state.jobs[job_id]["approval_request_id"] = request.get("id")
+        request = _create_job_approval_request(app.state.jobs[job_id], actor)
+        app.state.jobs[job_id]["approval_request_id"] = request.get("id")
+    elif not approval_reasons:
+        app.state.jobs[job_id]["approval_status"] = "not_required"
+        app.state.jobs[job_id]["approval_request_id"] = None
+        app.state.jobs[job_id]["quarantine_reason"] = None
+        app.state.jobs[job_id]["paused"] = False
+        _sync_scheduler(job_id)
+        scheduled = app.state.scheduler.get_job(job_id)
+        app.state.jobs[job_id]["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
     else:
         _sync_scheduler(job_id)
         scheduled = app.state.scheduler.get_job(job_id)

@@ -2440,10 +2440,90 @@ def test_automation_delivery_policy_stores_safe_metadata_only():
     assert created["delivery_policy"] == "allowlisted"
     assert created["delivery_targets"] == ["desktop-main", "phone personal"]
     assert created["delivery_target_count"] == 2
+    assert created["approval_status"] == "pending"
+    assert created["paused"] is True
+    assert "delivery_policy" in created["approval_reasons"]
+    assert "delivery_targets" in created["approval_reasons"]
     assert listed["delivery_targets"] == ["desktop-main", "phone personal"]
     assert "private delivery prompt" not in str(listed)
     assert unsafe_url.status_code == 422
     assert unsafe_secret.status_code == 422
+
+
+def test_automation_auto_policy_requires_toolgate_for_tools_memory_and_delivery(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    with TestClient(app) as client:
+        client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["echo"], "memory_scopes": ["briefing"]},
+        )
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Scoped Risky Auto",
+                "schedule": "0 9 * * *",
+                "prompt": "private risky automation prompt",
+                "required_tool_ids": ["echo"],
+                "required_memory_scopes": ["briefing"],
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["desktop-main"],
+            },
+        ).json()
+        request = app.state.gates.requests[created["approval_request_id"]]
+
+    assert created["approval_policy"] == "auto"
+    assert created["approval_status"] == "pending"
+    assert created["paused"] is True
+    assert created["next"] == "—"
+    assert set(created["approval_reasons"]) == {"tool_access", "memory_access", "delivery_policy", "delivery_targets"}
+    assert request["payload"]["approval_reasons"] == created["approval_reasons"]
+    assert request["payload"]["required_tool_count"] == 1
+    assert request["payload"]["required_memory_scope_count"] == 1
+    assert request["payload"]["delivery_target_count"] == 1
+    assert "private risky automation prompt" not in str(request)
+    assert request["payload"]["prompt_digest"]
+
+
+def test_automation_risky_update_requires_fresh_toolgate_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Approved Delivery",
+                "schedule": "0 9 * * *",
+                "prompt": "first private prompt",
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["desktop-main"],
+            },
+        ).json()
+        first_request_id = created["approval_request_id"]
+        approved = client.post(
+            f"/api/approvals/{first_request_id}/decision",
+            json={"decision": "approved"},
+        )
+        updated = client.patch(
+            f"/api/jobs/{created['id']}",
+            json={
+                "schedule": "15 9 * * *",
+                "prompt": "second private prompt",
+            },
+        ).json()
+        second_request = app.state.gates.requests[updated["approval_request_id"]]
+
+    assert approved.status_code == 200
+    assert updated["approval_status"] == "pending"
+    assert updated["paused"] is True
+    assert updated["approval_request_id"] != first_request_id
+    assert updated["next"] == "—"
+    assert "delivery_policy" in updated["approval_reasons"]
+    assert second_request["payload"]["prompt_digest"]
+    assert "first private prompt" not in str(second_request)
+    assert "second private prompt" not in str(second_request)
 
 
 def test_automation_owner_confirmation_uses_toolgate_request_without_raw_prompt():
@@ -2562,6 +2642,10 @@ def test_automation_run_blocks_cleanly_when_requirements_are_revoked(monkeypatch
                 "required_memory_scopes": ["briefing"],
             },
         ).json()
+        client.post(
+            f"/api/approvals/{created['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        )
         client.patch(
             "/api/agents/agent_pi_operator",
             json={"tool_ids": [], "memory_scopes": []},
