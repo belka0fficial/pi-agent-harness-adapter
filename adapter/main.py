@@ -8,7 +8,9 @@ import json
 import os
 import re
 import sqlite3
+from collections import deque
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -255,10 +257,14 @@ async def require_owner_token(request: Request, call_next):
     return await call_next(request)
 
 
+SQLITE_TIMEOUT_SECONDS = 30.0
+
+
 def _registry_conn() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(REGISTRY_DB)
+    conn = sqlite3.connect(REGISTRY_DB, timeout=SQLITE_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {int(SQLITE_TIMEOUT_SECONDS * 1000)}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS registry_items (
@@ -289,8 +295,21 @@ def _registry_conn() -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _registry():
+    conn = _registry_conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _load_registry() -> None:
-    with _registry_conn() as conn:
+    with _registry() as conn:
         rows = conn.execute("SELECT kind, id, data FROM registry_items").fetchall()
     app.state.agents = {}
     app.state.teams = {}
@@ -341,7 +360,7 @@ def _normalize_agent_model_defaults() -> None:
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
     if kind not in {"agent", "team", "job", "task", "tool_draft", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
-    with _registry_conn() as conn:
+    with _registry() as conn:
         conn.execute(
             """
             INSERT INTO registry_items (kind, id, data, updated_at)
@@ -357,7 +376,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 def _delete_registry_item(kind: str, item_id: str) -> None:
     if kind not in {"agent", "team", "job", "task", "tool_draft", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
-    with _registry_conn() as conn:
+    with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
 
 
@@ -822,7 +841,7 @@ def _record_activity(
         "ref_id": _safe_summary(ref_id or "", limit=120) or None,
         "created_at": now(),
     }
-    with _registry_conn() as conn:
+    with _registry() as conn:
         conn.execute(
             """
             INSERT INTO activity_events (
@@ -857,6 +876,45 @@ def _record_activity(
     return item
 
 
+def _note_persistence_failure(job_id: str, reason: str) -> None:
+    """Record a bounded in-memory note that registry persistence failed."""
+    failures = getattr(app.state, "persistence_failures", None)
+    if failures is None:
+        failures = app.state.persistence_failures = deque(maxlen=50)
+    failures.append({"job_id": job_id, "reason": reason, "at": now()})
+    item = app.state.jobs.get(job_id)
+    if item is not None:
+        count = int(item.get("persistence_failure_count") or 0) + 1
+        item["persistence_failure_count"] = count
+        item["persistence_error"] = reason
+        if count >= 3:
+            item["paused"] = True
+            item["next_run_at"] = None
+            item["quarantine_reason"] = "paused after registry persistence failures"
+            if getattr(app.state, "scheduler", None) and app.state.scheduler.get_job(job_id):
+                app.state.scheduler.remove_job(job_id)
+
+
+def _persist_job_run(item: dict[str, Any], activity_kwargs: dict[str, Any]) -> None:
+    """Persist a job item plus its activity event, tolerating registry outages."""
+    job_id = str(item.get("id") or "")
+    try:
+        _save_registry_item("job", item)
+        if item.get("persistence_error") or item.get("persistence_failure_count"):
+            item.pop("persistence_error", None)
+            item["persistence_failure_count"] = 0
+            _save_registry_item("job", item)
+    except sqlite3.OperationalError:
+        reason = "registry unavailable: job state not persisted"
+        item["persistence_error"] = reason
+        _note_persistence_failure(job_id, reason)
+    try:
+        agent_id = activity_kwargs.pop("agent_id", None)
+        _record_activity(agent_id, **activity_kwargs)
+    except sqlite3.OperationalError:
+        _note_persistence_failure(job_id, "registry unavailable: activity event not persisted")
+
+
 def _list_activity(
     agent_id: str | None = None,
     *,
@@ -864,7 +922,7 @@ def _list_activity(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     limit = min(max(limit, 1), 100)
-    with _registry_conn() as conn:
+    with _registry() as conn:
         if agent_id and team_id:
             rows = conn.execute(
                 """
@@ -2566,17 +2624,16 @@ async def run_job(job_id: str):
         }
         item["last_result"] = result
         _append_job_run_history(item, result)
-        _save_registry_item("job", item)
-        _record_activity(
-            item.get("agent_id"),
-            event_type="job.blocked",
-            status="blocked",
-            source="ToolGate",
-            summary=f"Automation job blocked pending approval: {item.get('name') or job_id}",
-            team_id=item.get("team_id"),
-            ref_type="job",
-            ref_id=job_id,
-        )
+        _persist_job_run(item, {
+            "agent_id": item.get("agent_id"),
+            "event_type": "job.blocked",
+            "status": "blocked",
+            "source": "ToolGate",
+            "summary": f"Automation job blocked pending approval: {item.get('name') or job_id}",
+            "team_id": item.get("team_id"),
+            "ref_type": "job",
+            "ref_id": job_id,
+        })
         return
     try:
         actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
@@ -2597,17 +2654,16 @@ async def run_job(job_id: str):
         item["quarantine_reason"] = "paused after missing required grants"
         _append_job_run_history(item, result)
         _sync_scheduler(job_id)
-        _save_registry_item("job", item)
-        _record_activity(
-            item.get("agent_id"),
-            event_type="job.blocked",
-            status="blocked",
-            source="Pi adapter",
-            summary=f"Automation job blocked before execution: {item.get('name') or job_id}",
-            team_id=item.get("team_id"),
-            ref_type="job",
-            ref_id=job_id,
-        )
+        _persist_job_run(item, {
+            "agent_id": item.get("agent_id"),
+            "event_type": "job.blocked",
+            "status": "blocked",
+            "source": "Pi adapter",
+            "summary": f"Automation job blocked before execution: {item.get('name') or job_id}",
+            "team_id": item.get("team_id"),
+            "ref_type": "job",
+            "ref_id": job_id,
+        })
         return
     item["last_run_at"] = now()
     toolgate_execution_key = _ensure_toolgate_execution_key_for_actor(
@@ -2615,16 +2671,19 @@ async def run_job(job_id: str):
         actor.get("team_id"),
         actor["tool_ids"],
     )
-    _record_activity(
-        item.get("agent_id"),
-        event_type="job.started",
-        status="running",
-        source="Pi adapter",
-        summary=f"Automation job started: {item.get('name') or job_id}",
-        team_id=item.get("team_id"),
-        ref_type="job",
-        ref_id=job_id,
-    )
+    try:
+        _record_activity(
+            item.get("agent_id"),
+            event_type="job.started",
+            status="running",
+            source="Pi adapter",
+            summary=f"Automation job started: {item.get('name') or job_id}",
+            team_id=item.get("team_id"),
+            ref_type="job",
+            ref_id=job_id,
+        )
+    except sqlite3.OperationalError:
+        _note_persistence_failure(job_id, "registry unavailable: activity event not persisted")
     chunks = []
     status = "ok"
     error = None
@@ -2663,17 +2722,16 @@ async def run_job(job_id: str):
     else:
         item["failure_count"] = 0
         item.pop("quarantine_reason", None)
-    _save_registry_item("job", item)
-    _record_activity(
-        item.get("agent_id"),
-        event_type="job.completed",
-        status=status,
-        source="Pi adapter",
-        summary=f"Automation job {status}: {item.get('name') or job_id}",
-        team_id=item.get("team_id"),
-        ref_type="job",
-        ref_id=job_id,
-    )
+    _persist_job_run(item, {
+        "agent_id": item.get("agent_id"),
+        "event_type": "job.completed",
+        "status": status,
+        "source": "Pi adapter",
+        "summary": f"Automation job {status}: {item.get('name') or job_id}",
+        "team_id": item.get("team_id"),
+        "ref_type": "job",
+        "ref_id": job_id,
+    })
     if item.get("webhook_url") and _webhooks_enabled():
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(item["webhook_url"], json=result)

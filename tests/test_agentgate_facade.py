@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
 
 from fastapi.testclient import TestClient
 
@@ -1201,6 +1203,42 @@ def test_automation_jobs_persist_to_sqlite(monkeypatch, tmp_path):
     main._load_registry()
 
     assert job_id not in app.state.jobs
+
+
+def test_automation_job_registry_outage_quarantines_without_raising(monkeypatch):
+    reset_state()
+    main._ensure_registry_seeded()
+    app.state.pi = BlockedJobPi()
+    job_id = "job-registry-outage"
+    app.state.jobs[job_id] = {
+        "id": job_id,
+        "job_id": job_id,
+        "name": "Registry Outage",
+        "schedule": "0 9 * * *",
+        "timezone": "UTC",
+        "prompt": "should block before pi",
+        "agent_id": "agent_pi_operator",
+        "team_id": "team_core",
+        "required_tool_ids": ["missing.tool"],
+        "required_memory_scopes": [],
+        "paused": False,
+    }
+
+    def fail_save(kind, item):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(main, "_save_registry_item", fail_save)
+
+    for _ in range(3):
+        asyncio.run(main.run_job(job_id))
+
+    item = app.state.jobs[job_id]
+    assert item["last_result"]["status"] == "blocked"
+    assert item["persistence_failure_count"] >= 3
+    assert item["paused"] is True
+    assert item["next_run_at"] is None
+    assert "registry persistence" in item["quarantine_reason"]
+    assert getattr(app.state, "persistence_failures")
 
 
 def test_automation_jobs_validate_agent_team_assignment():
