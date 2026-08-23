@@ -120,11 +120,35 @@ class FakeGates:
         self.synced_toolgate_scope_history = [*getattr(self, "synced_toolgate_scope_history", []), scopes]
         return {"id": "agent-key", "scopes": scopes}
 
-    def toolgate_execution_status(self):
+    def toolgate_execution_status(self, agent_id: str | None = None):
+        self.status_agent_id = agent_id
         return {"id": "agent-key", "scopes": getattr(self, "synced_toolgate_scopes", [])}
 
     def toolgate_agent_keys(self):
         return getattr(self, "toolgate_keys", [])
+
+    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str]):
+        self.ensured_toolgate = {"agent_id": agent_id, "scopes": scopes}
+        self.toolgate_private_keys = {
+            **getattr(self, "toolgate_private_keys", {}),
+            agent_id: "tgx_fake_private_key_1234567890",
+        }
+        self.toolgate_keys = [
+            row for row in getattr(self, "toolgate_keys", []) if row.get("name") != f"AgentGate:{agent_id}"
+        ] + [{"id": f"tg-{agent_id}", "name": f"AgentGate:{agent_id}", "status": "active", "scopes": scopes}]
+        return {"status": "cached", "agent_id": agent_id}
+
+    def toolgate_agent_execution_key(self, agent_id: str | None):
+        return getattr(self, "toolgate_private_keys", {}).get(agent_id or "", "")
+
+    def has_toolgate_agent_execution_key(self, agent_id: str):
+        return agent_id in getattr(self, "toolgate_private_keys", {"agent_pi_operator": "tgx_fake"})
+
+    def forget_toolgate_agent_execution_key(self, agent_id: str):
+        self.forgot_toolgate_agent_id = agent_id
+        self.toolgate_private_keys = {
+            key: value for key, value in getattr(self, "toolgate_private_keys", {}).items() if key != agent_id
+        }
 
     def memorygate_agent_keys(self):
         return getattr(self, "memorygate_keys", [])
@@ -437,7 +461,8 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
     assert ready["expected_tool_scope_count"] == 1
     assert ready["expected_memory_scope_count"] == 3
     assert missing["status"] == "drift"
-    assert missing["toolgate_key_status"] == "missing"
+    assert missing["toolgate_key_status"] == "ready"
+    assert missing["toolgate_adapter_credential_status"] == "ready"
     assert missing["memorygate_key_status"] == "missing"
     assert missing["memorygate_adapter_credential_status"] == "missing"
     assert "raw" not in str(boundaries).lower()
@@ -513,6 +538,45 @@ def test_gate_client_bootstraps_agent_memory_key_privately(monkeypatch, tmp_path
     assert gates.memorygate_agent_read_key("agent_alpha").startswith("mg_" + "read_")
     assert gates.agent_memory_key_path.exists()
     assert oct(gates.agent_memory_key_path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_gate_client_bootstraps_agent_toolgate_key_privately(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADAPTER_DATA_DIR", str(tmp_path))
+
+    class RecordingGateClients(GateClients):
+        def __init__(self):
+            super().__init__()
+            self.created_payloads = []
+
+        def _request(self, service: str, path: str, *, method: str = "GET", payload=None, timeout: float = 8):
+            if service == "toolgate" and path == "/v2/agent-keys" and method == "GET":
+                return {"results": []}
+            if service == "toolgate" and path == "/v2/agent-keys" and method == "POST":
+                self.created_payloads.append(payload)
+                return {
+                    "key": "tgx_test_private_key_1234567890",
+                    "record": {
+                        "id": "tg-agent-a",
+                        "name": payload["name"],
+                        "status": "active",
+                        "scopes": payload["scopes"],
+                    },
+                }
+            if service == "toolgate" and path == "/v2/agent-keys/tg-agent-a/scopes" and method == "PATCH":
+                return {"id": "tg-agent-a", "scopes": payload["scopes"]}
+            raise AssertionError(f"unexpected request {service} {method} {path}")
+
+    gates = RecordingGateClients()
+    result = gates.ensure_toolgate_agent_execution_key("agent_alpha", ["tool:echo"])
+    cached = gates.ensure_toolgate_agent_execution_key("agent_alpha", ["tool:echo", "tool:notes.*"])
+
+    assert result == {"status": "created", "agent_id": "agent_alpha", "toolgate_key_id": "tg-agent-a"}
+    assert cached == {"status": "cached", "agent_id": "agent_alpha", "toolgate_key_id": "tg-agent-a"}
+    assert gates.created_payloads == [{"name": "AgentGate:agent_alpha", "scopes": ["tool:echo"]}]
+    assert gates.has_toolgate_agent_execution_key("agent_alpha")
+    assert gates.toolgate_agent_execution_key("agent_alpha").startswith("tgx_")
+    assert gates.agent_toolgate_key_path.exists()
+    assert oct(gates.agent_toolgate_key_path.stat().st_mode & 0o777) == "0o600"
 
 
 def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_path):
@@ -2007,6 +2071,20 @@ def test_chat_memory_disabled_skips_context_and_transcript_ingest():
     assert response.status_code == 200
     assert app.state.gates.context_called is False
     assert "MemoryGate reference context" not in str(pi.options.get("instructions"))
+
+
+def test_chat_passes_per_agent_toolgate_execution_key_to_pi():
+    reset_state()
+    pi = CapturingPi()
+    app.state.pi = pi
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        response = client.post("/api/sessions/sess-1/chat/stream", json={"input": "use scoped key"})
+
+    assert response.status_code == 200
+    assert pi.options["toolgate_execution_key"] == "tgx_fake_private_key_1234567890"
+    assert app.state.gates.ensured_toolgate == {"agent_id": "agent_pi_operator", "scopes": []}
 
 
 

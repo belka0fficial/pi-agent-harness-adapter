@@ -392,13 +392,29 @@ def test_pi_subprocess_environment_excludes_gate_admin_credentials(monkeypatch):
     assert child_env["TOOLGATE_EXECUTION_KEY"] == "scoped-agent-key"
 
 
+def test_pi_subprocess_environment_uses_per_run_toolgate_key(monkeypatch):
+    monkeypatch.setenv("TOOLGATE_EXECUTION_KEY", "global-shared-key")
+    scoped_env = _pi_subprocess_env({"TOOLGATE_EXECUTION_KEY": "actor-scoped-key"})
+    empty_env = _pi_subprocess_env({"TOOLGATE_EXECUTION_KEY": None})
+    assert scoped_env["TOOLGATE_EXECUTION_KEY"] == "actor-scoped-key"
+    assert "TOOLGATE_EXECUTION_KEY" not in empty_env
+
+
 class DecisionGates:
     def __init__(self):
         self.decisions = []
+        self.toolgate_private_keys = {}
 
     def decide_approval(self, request_id: str, decision: str):
         self.decisions.append((request_id, decision))
         return {"id": request_id, "status": decision, "decision": decision}
+
+    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str]):
+        self.toolgate_private_keys[agent_id] = "tgx_fake_private_key_1234567890"
+        return {"status": "cached", "agent_id": agent_id}
+
+    def toolgate_agent_execution_key(self, agent_id: str | None):
+        return self.toolgate_private_keys.get(agent_id or "", "")
 
 
 def test_agentgate_approval_decision_resumes_matching_paused_run():
@@ -412,6 +428,7 @@ def test_agentgate_approval_decision_resumes_matching_paused_run():
         pi = ControlledPi()
         app.state.pi = pi
         app.state.gates = DecisionGates()
+        app.state.approval_runs = {}
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             created = (await client.post("/api/sessions", json={"title": "Approve via facade"})).json()
@@ -440,6 +457,7 @@ def test_agentgate_approval_decision_rejects_disallowed_runtime_tool():
         pi = ControlledPi()
         app.state.pi = pi
         app.state.gates = DecisionGates()
+        app.state.approval_runs = {}
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             created = (await client.post("/api/sessions", json={"title": "Approve via facade"})).json()

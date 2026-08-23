@@ -22,9 +22,15 @@ _PI_BLOCKED_ENV = {
 }
 
 
-def _pi_subprocess_env() -> dict[str, str]:
+def _pi_subprocess_env(overrides: dict[str, str | None] | None = None) -> dict[str, str]:
     """Keep owner/admin gate credentials out of the agent runtime process."""
-    return {key: value for key, value in os.environ.items() if key not in _PI_BLOCKED_ENV}
+    env = {key: value for key, value in os.environ.items() if key not in _PI_BLOCKED_ENV}
+    for key, value in (overrides or {}).items():
+        if value is None or value == "":
+            env.pop(key, None)
+        else:
+            env[key] = value
+    return env
 
 
 @dataclass
@@ -104,6 +110,7 @@ def _runtime_config(options: dict[str, Any] | None) -> dict[str, Any]:
         "model": model or os.environ.get("PI_MODEL"),
         "thinking": thinking or os.environ.get("PI_THINKING"),
         "soul": _soul_block(),
+        "toolgate_execution_key": str((options or {}).get("toolgate_execution_key") or ""),
     }
 
 
@@ -301,7 +308,7 @@ class SessionRuntime:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_pi_subprocess_env(),
+            env=_pi_subprocess_env({"TOOLGATE_EXECUTION_KEY": config.get("toolgate_execution_key") or None}),
         )
         self.reader_task = asyncio.create_task(self._reader())
         state = await self.send_command({"type": "get_state"})

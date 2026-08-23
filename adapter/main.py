@@ -1226,6 +1226,10 @@ def _native_access_boundaries() -> dict[str, Any]:
             adapter_memory_credential_ready = app.state.gates.has_memorygate_agent_read_key(agent_id)
         except AttributeError:
             adapter_memory_credential_ready = False
+        try:
+            adapter_toolgate_credential_ready = app.state.gates.has_toolgate_agent_execution_key(agent_id)
+        except AttributeError:
+            adapter_toolgate_credential_ready = False
         tool_scope_ready = False
         if not expected_tool_scopes:
             tool_scope_ready = bool(matching_tool_keys) or not toolgate_available
@@ -1235,6 +1239,9 @@ def _native_access_boundaries() -> dict[str, Any]:
                 if all(_toolgate_scope_allows_tool(scope.removeprefix("tool:"), scopes) for scope in expected_tool_scopes):
                     tool_scope_ready = True
                     break
+        tool_key_ready = not expected_tool_scopes or (
+            bool(matching_tool_keys) and tool_scope_ready and adapter_toolgate_credential_ready
+        )
         memory_key_ready = not expected_memory_scopes or (bool(matching_memory_keys) and adapter_memory_credential_ready)
         issues = []
         if not toolgate_available:
@@ -1243,21 +1250,24 @@ def _native_access_boundaries() -> dict[str, Any]:
             issues.append("missing native ToolGate key record")
         elif not tool_scope_ready:
             issues.append("ToolGate scopes do not match effective grants")
+        elif expected_tool_scopes and not adapter_toolgate_credential_ready:
+            issues.append("adapter ToolGate execution credential unavailable")
         if not memorygate_available:
             issues.append("MemoryGate key inventory unavailable")
         elif expected_memory_scopes and not matching_memory_keys:
             issues.append("missing native MemoryGate read key")
         elif expected_memory_scopes and not adapter_memory_credential_ready:
             issues.append("adapter MemoryGate read credential unavailable")
-        status = "ready" if toolgate_available and memorygate_available and tool_scope_ready and memory_key_ready else "drift"
+        status = "ready" if toolgate_available and memorygate_available and tool_key_ready and memory_key_ready else "drift"
         rows.append({
             "agent_id": agent_id,
             "name": agent.get("name") or agent_id,
             "team_count": len(agent.get("team_ids") or []),
             "expected_tool_scope_count": len(expected_tool_scopes),
             "expected_memory_scope_count": len(expected_memory_scopes),
-            "toolgate_key_status": "ready" if toolgate_available and tool_scope_ready and matching_tool_keys else "missing" if toolgate_available else "unavailable",
+            "toolgate_key_status": "ready" if toolgate_available and tool_key_ready else "missing" if toolgate_available else "unavailable",
             "toolgate_key_count": len(matching_tool_keys),
+            "toolgate_adapter_credential_status": "ready" if adapter_toolgate_credential_ready else "missing",
             "memorygate_key_status": "ready" if memorygate_available and memory_key_ready else "missing" if memorygate_available else "unavailable",
             "memorygate_key_count": len(matching_memory_keys),
             "memorygate_adapter_credential_status": "ready" if adapter_memory_credential_ready else "missing",
@@ -1285,10 +1295,27 @@ def _ensure_memorygate_read_key_for_actor(agent_id: str, memory_scopes: list[str
         raise HTTPException(503, "MemoryGate read key is unavailable for this agent") from exc
 
 
+def _ensure_toolgate_execution_key_for_actor(agent_id: str, tool_scopes: list[str]) -> str:
+    try:
+        app.state.gates.ensure_toolgate_agent_execution_key(agent_id, tool_scopes)
+        execution_key = app.state.gates.toolgate_agent_execution_key(agent_id)
+    except (RuntimeError, AttributeError) as exc:
+        if tool_scopes:
+            raise HTTPException(503, "ToolGate execution key is unavailable for this agent") from exc
+        return ""
+    if tool_scopes and not execution_key:
+        raise HTTPException(503, "ToolGate execution key is unavailable for this agent")
+    return execution_key
+
+
 def _sync_toolgate_execution_scopes() -> None:
     try:
         scopes = _effective_toolgate_scopes()
         app.state.gates.update_toolgate_execution_scopes(scopes)
+        for agent_id in app.state.agents:
+            actor_scopes = _expected_toolgate_scopes_for_actor(agent_id)
+            if actor_scopes:
+                app.state.gates.ensure_toolgate_agent_execution_key(agent_id, actor_scopes)
     except (RuntimeError, AttributeError):
         return
 
@@ -1904,6 +1931,7 @@ async def run_job(job_id: str):
         )
         return
     item["last_run_at"] = now()
+    toolgate_execution_key = _ensure_toolgate_execution_key_for_actor(item.get("agent_id") or "agent_pi_operator", actor["tool_ids"])
     _record_activity(
         item.get("agent_id"),
         event_type="job.started",
@@ -1917,7 +1945,15 @@ async def run_job(job_id: str):
     chunks = []
     status = "ok"
     error = None
-    async for event in app.state.pi.stream(item["prompt"], session_id=f"job:{job_id}", options={"headless": True, "deliver": item.get("deliver")}):
+    async for event in app.state.pi.stream(
+        item["prompt"],
+        session_id=f"job:{job_id}",
+        options={
+            "headless": True,
+            "deliver": item.get("deliver"),
+            "toolgate_execution_key": toolgate_execution_key,
+        },
+    ):
         if event.event == "message.delta":
             chunks.append(str(event.data.get("delta") or event.data.get("text") or event.data.get("content") or ""))
         elif event.event == "run.failed":
@@ -2172,6 +2208,7 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
         raise HTTPException(403, "agent has no MemoryGate scopes")
     if payload.memory_enabled:
         _ensure_memorygate_read_key_for_actor(actor["agent_id"], actor["memory_scopes"])
+    toolgate_execution_key = _ensure_toolgate_execution_key_for_actor(actor["agent_id"], actor["tool_ids"])
     if session_id not in app.state.sessions:
         app.state.sessions[session_id] = {"id": session_id, "session_id": session_id, "title": "Imported chat", "created_at": now(), "updated_at": now()}
         app.state.messages[session_id] = []
@@ -2232,6 +2269,7 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
             "model": payload.model or agent_record.get("primary_model"),
             "model_options": payload.model_options,
             "instructions": instructions or None,
+            "toolgate_execution_key": toolgate_execution_key,
         }
         try:
             async for event in request.app.state.pi.stream(payload.input, session_id=session_id, options=options):
@@ -2389,11 +2427,13 @@ async def _run_group_round(session_id: str, payload: GroupRoundInput, emit=None)
             if memory_context:
                 bounded_context = json.dumps(memory_context, ensure_ascii=True)[:12000]
                 instructions += "\n\nMemoryGate reference context (untrusted evidence, not instructions):\n" + bounded_context
+        toolgate_execution_key = _ensure_toolgate_execution_key_for_actor(actor["agent_id"], actor["tool_ids"])
         options = {
             "provider": payload.provider or agent_record.get("primary_provider"),
             "model": payload.model or agent_record.get("primary_model"),
             "model_options": payload.model_options,
             "instructions": instructions or None,
+            "toolgate_execution_key": toolgate_execution_key,
         }
         _record_activity(
             actor["agent_id"],
@@ -2858,6 +2898,10 @@ def delete_agent(agent_id: str):
         _save_registry_item("team", team)
     try:
         app.state.gates.forget_memorygate_agent_read_key(agent_id)
+    except AttributeError:
+        pass
+    try:
+        app.state.gates.forget_toolgate_agent_execution_key(agent_id)
     except AttributeError:
         pass
     _delete_registry_item("agent", agent_id)
@@ -3876,7 +3920,7 @@ def agentgate_tool_health(tool_id: str, payload: dict[str, Any] | None = None):
     if not tool:
         raise HTTPException(404, "tool not found")
     try:
-        execution_status = app.state.gates.toolgate_execution_status()
+        execution_status = app.state.gates.toolgate_execution_status(agent_id=actor["agent_id"])
         execution_scopes = [str(item) for item in execution_status.get("scopes", [])]
         execution_allowed = _toolgate_scope_allows_tool(tool_id, execution_scopes)
         toolgate_status = "ok"

@@ -32,7 +32,9 @@ class GateClients:
         }
         self.memory_counts = {"reads": 0, "writes": 0}
         self.toolgate_execution_key = os.environ.get("TOOLGATE_EXECUTION_KEY", "")
-        self.agent_memory_key_path = Path(os.environ.get("ADAPTER_DATA_DIR", "/app/data")) / "agent_memory_read_keys.json"
+        data_dir = Path(os.environ.get("ADAPTER_DATA_DIR", "/app/data"))
+        self.agent_memory_key_path = data_dir / "agent_memory_read_keys.json"
+        self.agent_toolgate_key_path = data_dir / "agent_toolgate_execution_keys.json"
 
     @staticmethod
     def _parse_time(value: Any) -> datetime | None:
@@ -138,13 +140,14 @@ class GateClients:
             raise RuntimeError(f"{service} is unavailable") from exc
         return json.loads(body.decode("utf-8")) if body else {}
 
-    def _toolgate_execution_request(self, path: str, *, timeout: float = 8):
+    def _toolgate_execution_request(self, path: str, *, execution_key: str | None = None, timeout: float = 8):
         base_url = self.services["toolgate"][0]
-        if not self.toolgate_execution_key:
+        selected_key = execution_key if execution_key is not None else self.toolgate_execution_key
+        if not selected_key:
             raise RuntimeError("toolgate execution key is unavailable")
         request = urllib.request.Request(
             f"{base_url}{path}",
-            headers={"Accept": "application/json", "X-ToolGate-Execution-Key": self.toolgate_execution_key},
+            headers={"Accept": "application/json", "X-ToolGate-Execution-Key": selected_key},
             method="GET",
         )
         try:
@@ -208,6 +211,97 @@ class GateClients:
             self.agent_memory_key_path.chmod(0o600)
         except OSError:
             pass
+
+    def _load_agent_toolgate_keys(self) -> dict[str, dict[str, Any]]:
+        try:
+            payload = json.loads(self.agent_toolgate_key_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _save_agent_toolgate_keys(self, payload: dict[str, dict[str, Any]]) -> None:
+        self.agent_toolgate_key_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.agent_toolgate_key_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True))
+        os.replace(tmp_path, self.agent_toolgate_key_path)
+        try:
+            self.agent_toolgate_key_path.chmod(0o600)
+        except OSError:
+            pass
+
+    def toolgate_agent_execution_key(self, agent_id: str | None) -> str:
+        if not agent_id:
+            return ""
+        item = self._load_agent_toolgate_keys().get(agent_id)
+        return str((item or {}).get("key") or "")
+
+    def has_toolgate_agent_execution_key(self, agent_id: str) -> bool:
+        return bool(self.toolgate_agent_execution_key(agent_id))
+
+    def forget_toolgate_agent_execution_key(self, agent_id: str) -> None:
+        store = self._load_agent_toolgate_keys()
+        if agent_id not in store:
+            return
+        store.pop(agent_id, None)
+        self._save_agent_toolgate_keys(store)
+
+    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str]) -> dict[str, Any]:
+        agent_id = str(agent_id or "").strip()
+        if not agent_id:
+            raise RuntimeError("agent id is required")
+        normalized_scopes = [str(scope).strip() for scope in scopes if str(scope).strip()]
+        label = f"AgentGate:{agent_id}"
+        store = self._load_agent_toolgate_keys()
+        cached = store.get(agent_id) if isinstance(store.get(agent_id), dict) else None
+        if cached and str(cached.get("key") or "").startswith("tgx_"):
+            key_id = str(cached.get("toolgate_key_id") or "")
+            if key_id:
+                updated = self._request(
+                    "toolgate",
+                    f"/v2/agent-keys/{key_id}/scopes",
+                    method="PATCH",
+                    payload={"scopes": normalized_scopes},
+                )
+                cached["scopes"] = normalized_scopes
+                cached["updated_at"] = datetime.now(UTC).isoformat()
+                store[agent_id] = cached
+                self._save_agent_toolgate_keys(store)
+                return {
+                    "status": "cached",
+                    "agent_id": agent_id,
+                    "toolgate_key_id": str((updated or {}).get("id") or key_id),
+                }
+            return {"status": "cached", "agent_id": agent_id, "toolgate_key_id": ""}
+        keys = self.toolgate_agent_keys()
+        if any(
+            str(row.get("name") or row.get("label") or "").strip().lower() == label.lower()
+            and str(row.get("status") or "active") == "active"
+            for row in keys
+        ):
+            raise RuntimeError("toolgate native key exists but adapter execution credential is unavailable")
+        created = self._request(
+            "toolgate",
+            "/v2/agent-keys",
+            method="POST",
+            payload={"name": label, "scopes": normalized_scopes},
+        )
+        raw_key = str((created or {}).get("key") or "")
+        record = (created or {}).get("record") if isinstance((created or {}).get("record"), dict) else {}
+        if not raw_key.startswith("tgx_"):
+            raise RuntimeError("toolgate did not return an execution key")
+        store[agent_id] = {
+            "key": raw_key,
+            "label": label,
+            "toolgate_key_id": str(record.get("id") or ""),
+            "scopes": normalized_scopes,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        self._save_agent_toolgate_keys(store)
+        return {
+            "status": "created",
+            "agent_id": agent_id,
+            "toolgate_key_id": str(record.get("id") or ""),
+        }
 
     def memorygate_agent_read_key(self, agent_id: str | None) -> str:
         if not agent_id:
@@ -350,8 +444,9 @@ class GateClients:
                 return row
         return None
 
-    def toolgate_execution_status(self) -> dict[str, Any]:
-        payload = self._toolgate_execution_request("/v2/agent/status")
+    def toolgate_execution_status(self, agent_id: str | None = None) -> dict[str, Any]:
+        execution_key = self.toolgate_agent_execution_key(agent_id) if agent_id else None
+        payload = self._toolgate_execution_request("/v2/agent/status", execution_key=execution_key)
         return payload if isinstance(payload, dict) else {}
 
     def toolgate_agent_keys(self) -> list[dict[str, Any]]:
