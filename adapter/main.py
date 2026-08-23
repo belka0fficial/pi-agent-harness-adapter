@@ -1225,6 +1225,7 @@ def _public_task(item: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_status": _task_checkpoint_status(item),
         "checkpoint_note": item.get("checkpoint_note") or "",
         "execution_summary": item.get("execution_summary") or "",
+        "execution_history": item.get("execution_history") or [],
         "source": item.get("source") or "AgentGate",
         "source_session_id": item.get("source_session_id"),
         "source_message_id": item.get("source_message_id"),
@@ -1790,6 +1791,24 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
         )
         if linked_task:
             linked_task["status"] = "blocked" if run_status == "failed" else "in_progress"
+            output_chars = len("".join(collected))
+            execution_record = {
+                "status": run_status,
+                "completed_at": now(),
+                "agent_id": actor["agent_id"],
+                "team_id": actor["team_id"],
+                "session_id": session_id,
+                "output_chars": output_chars,
+                "message_count": len(request.app.state.messages.get(session_id, [])),
+            }
+            linked_task["execution_history"] = [
+                execution_record,
+                *list(linked_task.get("execution_history") or []),
+            ][:8]
+            linked_task["execution_summary"] = (
+                f"Last task turn {run_status}: {output_chars} output chars, "
+                f"{execution_record['message_count']} messages, speaker {actor['agent_id']}"
+            )
             linked_task["updated_at"] = now()
             _save_registry_item("task", linked_task)
             _record_activity(
@@ -2497,7 +2516,7 @@ def update_task(task_id: str, payload: dict[str, Any]):
     if "checkpoint_note" in payload:
         item["checkpoint_note"] = _safe_text(payload.get("checkpoint_note"), limit=600)
     if "execution_summary" in payload:
-        item["execution_summary"] = _safe_text(payload.get("execution_summary"), limit=1000)
+        item["execution_summary"] = _redact_tool_draft_text(payload.get("execution_summary"), limit=1000)
     item["updated_at"] = now()
     _save_registry_item("task", item)
     _record_activity(

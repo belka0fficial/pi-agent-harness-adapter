@@ -1067,18 +1067,31 @@ def test_delegated_task_activity_tracks_task_session_chat(monkeypatch, tmp_path)
             json={"input": "Sensitive task prompt must not appear in history"},
         )
         task_after_chat = client.get(f"/api/tasks/{task['id']}").json()
+        redacted = client.patch(
+            f"/api/tasks/{task['id']}",
+            json={"execution_summary": "Manual summary token=abc123 https://example.com/private raw command arguments"},
+        ).json()
         activity = client.get(f"/api/tasks/{task['id']}/activity").json()["activity"]
 
     assert response.status_code == 200
     assert opened["session"]["task_id"] == task["id"]
     assert task_after_chat["status"] == "in_progress"
     assert task_after_chat["history"]
+    assert task_after_chat["execution_summary"].startswith("Last task turn ok:")
+    assert task_after_chat["execution_history"][0]["status"] == "ok"
+    assert task_after_chat["execution_history"][0]["agent_id"] == "agent_pi_operator"
+    assert task_after_chat["execution_history"][0]["output_chars"] > 0
+    assert "token=abc123" not in redacted["execution_summary"]
+    assert "https://" not in redacted["execution_summary"]
+    assert "raw command" not in redacted["execution_summary"]
     event_types = [item["event_type"] for item in activity]
     assert "task.session_created" in event_types
     assert "task.chat_started" in event_types
     assert "task.chat_completed" in event_types
     assert "Sensitive task prompt" not in str(activity)
+    assert "Sensitive task prompt" not in str(task_after_chat)
     assert "context-aware" not in str(activity)
+    assert "context-aware" not in str(task_after_chat)
 
 
 def test_delegated_task_dependencies_and_owner_checkpoint_gate_sessions(monkeypatch, tmp_path):
