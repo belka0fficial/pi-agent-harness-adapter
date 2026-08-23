@@ -111,6 +111,9 @@ class TaskInput(BaseModel):
     risk: str = "low"
     required_tool_ids: list[str] = Field(default_factory=list)
     required_memory_scopes: list[str] = Field(default_factory=list)
+    depends_on_task_ids: list[str] = Field(default_factory=list)
+    owner_checkpoint: bool = False
+    checkpoint_note: str = Field(default="", max_length=600)
     source_session_id: str | None = None
     source_message_id: str | None = None
 
@@ -642,6 +645,42 @@ def _validate_job_requirements(actor: dict[str, Any], required_tool_ids: list[An
     return tools, memory_scopes
 
 
+def _validate_task_dependencies(task_ids: list[Any] | None, *, current_task_id: str | None = None) -> list[str]:
+    dependencies = _clean_list(task_ids)[:12]
+    missing = []
+    for dependency_id in dependencies:
+        if dependency_id == current_task_id:
+            raise HTTPException(422, "task cannot depend on itself")
+        if dependency_id not in app.state.tasks:
+            missing.append(dependency_id)
+    if missing:
+        raise HTTPException(404, f"missing dependency tasks: {', '.join(missing)}")
+    return dependencies
+
+
+def _task_dependency_rows(task_ids: list[str]) -> list[dict[str, Any]]:
+    rows = []
+    for dependency_id in task_ids:
+        dependency = app.state.tasks.get(dependency_id) or {}
+        rows.append({
+            "id": dependency_id,
+            "title": dependency.get("title") or dependency_id,
+            "status": dependency.get("status") or "missing",
+            "ready": dependency.get("status") == "done",
+        })
+    return rows
+
+
+def _blocked_task_dependencies(item: dict[str, Any]) -> list[dict[str, Any]]:
+    return [row for row in _task_dependency_rows(item.get("depends_on_task_ids") or []) if not row["ready"]]
+
+
+def _task_checkpoint_status(item: dict[str, Any]) -> str:
+    if not item.get("owner_checkpoint"):
+        return "not_required"
+    return item.get("checkpoint_status") or "pending"
+
+
 def _sanitize_tool_policy(payload: ToolPolicyInput) -> tuple[str, dict[str, int]]:
     authorization = payload.authorization.strip()
     if authorization not in {"auto", "ai_review", "owner_confirmation", "blocked"}:
@@ -1071,6 +1110,13 @@ def _public_task(item: dict[str, Any]) -> dict[str, Any]:
         "team_id": item.get("team_id"),
         "required_tool_ids": item.get("required_tool_ids", []),
         "required_memory_scopes": item.get("required_memory_scopes", []),
+        "depends_on_task_ids": item.get("depends_on_task_ids", []),
+        "dependencies": _task_dependency_rows(item.get("depends_on_task_ids") or []),
+        "blocked_dependencies": _blocked_task_dependencies(item),
+        "owner_checkpoint": bool(item.get("owner_checkpoint")),
+        "checkpoint_status": _task_checkpoint_status(item),
+        "checkpoint_note": item.get("checkpoint_note") or "",
+        "execution_summary": item.get("execution_summary") or "",
         "source": item.get("source") or "AgentGate",
         "source_session_id": item.get("source_session_id"),
         "source_message_id": item.get("source_message_id"),
@@ -2189,6 +2235,7 @@ def create_task(payload: TaskInput):
         payload.required_tool_ids,
         payload.required_memory_scopes,
     )
+    depends_on_task_ids = _validate_task_dependencies(payload.depends_on_task_ids)
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     item = {
         "id": task_id,
@@ -2201,6 +2248,11 @@ def create_task(payload: TaskInput):
         "risk": _sanitize_risk(payload.risk),
         "required_tool_ids": required_tool_ids,
         "required_memory_scopes": required_memory_scopes,
+        "depends_on_task_ids": depends_on_task_ids,
+        "owner_checkpoint": bool(payload.owner_checkpoint),
+        "checkpoint_status": "pending" if payload.owner_checkpoint else "not_required",
+        "checkpoint_note": _safe_text(payload.checkpoint_note, limit=600),
+        "execution_summary": "",
         "source": "AgentGate",
         "source_session_id": _safe_text(payload.source_session_id, limit=120),
         "source_message_id": _safe_text(payload.source_message_id, limit=120),
@@ -2221,6 +2273,17 @@ def create_task(payload: TaskInput):
         ref_type="task",
         ref_id=task_id,
     )
+    if item["owner_checkpoint"]:
+        _record_activity(
+            actor["agent_id"],
+            event_type="task.checkpoint_requested",
+            status="waiting_approval",
+            source="AgentGate",
+            summary=f"Owner checkpoint requested: {item['title']}",
+            team_id=actor["team_id"],
+            ref_type="task",
+            ref_id=task_id,
+        )
     return _public_task(item)
 
 
@@ -2257,6 +2320,48 @@ def update_task(task_id: str, payload: dict[str, Any]):
         )
         item["required_tool_ids"] = required_tool_ids
         item["required_memory_scopes"] = required_memory_scopes
+    if "depends_on_task_ids" in payload:
+        item["depends_on_task_ids"] = _validate_task_dependencies(payload.get("depends_on_task_ids"), current_task_id=task_id)
+    if "owner_checkpoint" in payload:
+        item["owner_checkpoint"] = bool(payload.get("owner_checkpoint"))
+        if item["owner_checkpoint"] and item.get("checkpoint_status") == "not_required":
+            item["checkpoint_status"] = "pending"
+        if not item["owner_checkpoint"]:
+            item["checkpoint_status"] = "not_required"
+    if "checkpoint_status" in payload:
+        checkpoint_status = str(payload.get("checkpoint_status") or "").strip()
+        if checkpoint_status not in {"pending", "approved", "rejected", "not_required"}:
+            raise HTTPException(422, "checkpoint_status must be pending, approved, rejected, or not_required")
+        if checkpoint_status != "not_required" and not item.get("owner_checkpoint"):
+            raise HTTPException(422, "owner_checkpoint must be enabled before setting checkpoint status")
+        item["checkpoint_status"] = checkpoint_status
+        if checkpoint_status == "approved":
+            _record_activity(
+                item.get("agent_id"),
+                event_type="task.checkpoint_approved",
+                status="ready",
+                source="AgentGate",
+                summary=f"Owner checkpoint approved: {item.get('title') or task_id}",
+                team_id=item.get("team_id"),
+                ref_type="task",
+                ref_id=task_id,
+            )
+        elif checkpoint_status == "rejected":
+            item["status"] = "blocked"
+            _record_activity(
+                item.get("agent_id"),
+                event_type="task.checkpoint_rejected",
+                status="blocked",
+                source="AgentGate",
+                summary=f"Owner checkpoint rejected: {item.get('title') or task_id}",
+                team_id=item.get("team_id"),
+                ref_type="task",
+                ref_id=task_id,
+            )
+    if "checkpoint_note" in payload:
+        item["checkpoint_note"] = _safe_text(payload.get("checkpoint_note"), limit=600)
+    if "execution_summary" in payload:
+        item["execution_summary"] = _safe_text(payload.get("execution_summary"), limit=1000)
     item["updated_at"] = now()
     _save_registry_item("task", item)
     _record_activity(
@@ -2278,6 +2383,15 @@ def create_task_session(task_id: str):
     if not item:
         raise HTTPException(404, "task not found")
     actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
+    blocked_dependencies = _blocked_task_dependencies(item)
+    if blocked_dependencies:
+        names = ", ".join(row["id"] for row in blocked_dependencies[:5])
+        raise HTTPException(409, f"task dependencies are not done: {names}")
+    checkpoint_status = _task_checkpoint_status(item)
+    if checkpoint_status == "pending":
+        raise HTTPException(409, "owner checkpoint is pending")
+    if checkpoint_status == "rejected":
+        raise HTTPException(409, "owner checkpoint was rejected")
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
     session = {
         "id": session_id,

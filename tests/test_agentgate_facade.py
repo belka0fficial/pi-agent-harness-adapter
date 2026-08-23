@@ -1080,6 +1080,74 @@ def test_delegated_task_activity_tracks_task_session_chat(monkeypatch, tmp_path)
     assert "context-aware" not in str(activity)
 
 
+def test_delegated_task_dependencies_and_owner_checkpoint_gate_sessions(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        dependency = client.post(
+            "/api/tasks",
+            json={
+                "title": "Dependency task",
+                "summary": "Must finish first.",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+            },
+        ).json()
+        task = client.post(
+            "/api/tasks",
+            json={
+                "title": "Checkpoint task",
+                "summary": "Waits for dependency and owner review.",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "depends_on_task_ids": [dependency["id"]],
+                "owner_checkpoint": True,
+                "checkpoint_note": "Review safe plan only.",
+            },
+        ).json()
+        missing_dependency = client.post(
+            "/api/tasks",
+            json={
+                "title": "Missing dependency",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "depends_on_task_ids": ["task_missing"],
+            },
+        )
+        self_dependency = client.patch(
+            f"/api/tasks/{task['id']}",
+            json={"depends_on_task_ids": [task["id"]]},
+        )
+        blocked_by_dependency = client.post(f"/api/tasks/{task['id']}/session")
+        client.patch(f"/api/tasks/{dependency['id']}", json={"status": "done"})
+        blocked_by_checkpoint = client.post(f"/api/tasks/{task['id']}/session")
+        approved = client.patch(f"/api/tasks/{task['id']}", json={"checkpoint_status": "approved"}).json()
+        opened = client.post(f"/api/tasks/{task['id']}/session")
+        activity = client.get(f"/api/tasks/{task['id']}/activity").json()["activity"]
+
+    assert task["owner_checkpoint"] is True
+    assert task["checkpoint_status"] == "pending"
+    assert task["blocked_dependencies"][0]["id"] == dependency["id"]
+    assert missing_dependency.status_code == 404
+    assert self_dependency.status_code == 422
+    assert blocked_by_dependency.status_code == 409
+    assert "dependencies" in blocked_by_dependency.json()["detail"]
+    assert blocked_by_checkpoint.status_code == 409
+    assert "checkpoint" in blocked_by_checkpoint.json()["detail"]
+    assert approved["checkpoint_status"] == "approved"
+    assert opened.status_code == 200
+    assert opened.json()["session"]["task_id"] == task["id"]
+    event_types = [item["event_type"] for item in activity]
+    assert "task.checkpoint_requested" in event_types
+    assert "task.checkpoint_approved" in event_types
+    assert "password" not in str(opened.json()).lower()
+    assert "api_key" not in str(opened.json()).lower()
+    assert "token" not in str(opened.json()).lower()
+
+
 def test_chat_defaults_to_no_memory_side_effects():
     reset_state()
     pi = CapturingPi()
