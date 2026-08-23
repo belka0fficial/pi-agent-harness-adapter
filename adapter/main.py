@@ -44,6 +44,8 @@ class JobInput(BaseModel):
     agent_id: str = "agent_pi_operator"
     team_id: str | None = None
     timezone: str = "UTC"
+    required_tool_ids: list[str] = Field(default_factory=list)
+    required_memory_scopes: list[str] = Field(default_factory=list)
 
 
 class MemoryCandidateInput(BaseModel):
@@ -462,6 +464,32 @@ def _capability_allowed(capability_id: str | None, allowed: list[str]) -> bool:
     return any(capability_id == item or (item.endswith("*") and capability_id.startswith(item[:-1])) for item in allowed)
 
 
+def _clean_list(values: list[Any] | None) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in values or []:
+        value = str(item or "").strip()
+        if value and value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
+
+
+def _validate_job_requirements(actor: dict[str, Any], required_tool_ids: list[Any] | None, required_memory_scopes: list[Any] | None) -> tuple[list[str], list[str]]:
+    tools = _clean_list(required_tool_ids)
+    memory_scopes = _clean_list(required_memory_scopes)
+    missing_tools = [tool_id for tool_id in tools if not _tool_allowed(tool_id, actor["tool_ids"])]
+    missing_memory = [scope for scope in memory_scopes if not _capability_allowed(scope, actor["memory_scopes"])]
+    if missing_tools or missing_memory:
+        detail = []
+        if missing_tools:
+            detail.append(f"missing tool grants: {', '.join(missing_tools)}")
+        if missing_memory:
+            detail.append(f"missing memory scopes: {', '.join(missing_memory)}")
+        raise HTTPException(403, "; ".join(detail))
+    return tools, memory_scopes
+
+
 def _toolgate_scope_for_tool_id(tool_id: str) -> str:
     value = str(tool_id or "").strip()
     if not value:
@@ -710,6 +738,8 @@ async def run_job(job_id: str):
     item = app.state.jobs.get(job_id)
     if not item:
         return
+    actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
+    _validate_job_requirements(actor, item.get("required_tool_ids"), item.get("required_memory_scopes"))
     item["last_run_at"] = now()
     _record_activity(
         item.get("agent_id"),
@@ -776,6 +806,11 @@ def list_jobs():
 def create_job(payload: JobInput):
     _validate_job_payload(payload.webhook_url)
     actor = _permission_context(payload.agent_id, payload.team_id)
+    required_tool_ids, required_memory_scopes = _validate_job_requirements(
+        actor,
+        payload.required_tool_ids,
+        payload.required_memory_scopes,
+    )
     schedule_preview = _schedule_preview(payload.schedule, payload.timezone)
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     item = {
@@ -784,6 +819,8 @@ def create_job(payload: JobInput):
         **payload.model_dump(),
         "agent_id": actor["agent_id"],
         "team_id": actor["team_id"],
+        "required_tool_ids": required_tool_ids,
+        "required_memory_scopes": required_memory_scopes,
         "paused": False,
         "created_at": now(),
         "updated_at": now(),
@@ -825,7 +862,19 @@ def update_job(job_id: str, payload: dict[str, Any]):
     if "agent_id" in payload or "team_id" in payload:
         actor = _permission_context(payload.get("agent_id") or app.state.jobs[job_id].get("agent_id"), payload.get("team_id") or app.state.jobs[job_id].get("team_id"))
         payload = {**payload, "agent_id": actor["agent_id"], "team_id": actor["team_id"]}
-    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "agent_id", "team_id", "timezone"}})
+    else:
+        actor = _permission_context(app.state.jobs[job_id].get("agent_id") or "agent_pi_operator", app.state.jobs[job_id].get("team_id"))
+    next_required_tools, next_required_memory = _validate_job_requirements(
+        actor,
+        payload.get("required_tool_ids", app.state.jobs[job_id].get("required_tool_ids")),
+        payload.get("required_memory_scopes", app.state.jobs[job_id].get("required_memory_scopes")),
+    )
+    payload = {
+        **payload,
+        "required_tool_ids": next_required_tools,
+        "required_memory_scopes": next_required_memory,
+    }
+    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes"}})
     app.state.jobs[job_id]["updated_at"] = now()
     _sync_scheduler(job_id)
     scheduled = app.state.scheduler.get_job(job_id)
@@ -1456,6 +1505,8 @@ def agentgate_automations():
             "output": result.get("output_summary") or "No runs yet",
             "history": item.get("history", "------------"),
             "description": item.get("description") or item.get("prompt", ""),
+            "required_tool_ids": item.get("required_tool_ids", []),
+            "required_memory_scopes": item.get("required_memory_scopes", []),
         })
     return {"automations": rows}
 

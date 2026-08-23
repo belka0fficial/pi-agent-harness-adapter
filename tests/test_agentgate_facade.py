@@ -348,6 +348,51 @@ def test_automation_jobs_validate_agent_team_assignment():
     assert missing_agent.status_code == 404
 
 
+def test_automation_jobs_validate_required_capabilities(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        grant = client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["echo"], "memory_scopes": ["briefing"]},
+        )
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Scoped Job",
+                "schedule": "0 9 * * *",
+                "prompt": "assigned safely",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "required_tool_ids": ["echo"],
+                "required_memory_scopes": ["briefing"],
+            },
+        )
+        missing_tool = client.post(
+            "/api/jobs",
+            json={
+                "name": "Missing Tool Job",
+                "schedule": "0 9 * * *",
+                "prompt": "bad tool",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "required_tool_ids": ["danger.write"],
+            },
+        )
+        missing_memory = client.patch(
+            f"/api/jobs/{created.json()['id']}",
+            json={"required_memory_scopes": ["private-journal"]},
+        )
+    assert grant.status_code == 200
+    assert created.status_code == 200
+    assert created.json()["required_tool_ids"] == ["echo"]
+    assert created.json()["required_memory_scopes"] == ["briefing"]
+    assert missing_tool.status_code == 403
+    assert missing_memory.status_code == 403
+
+
 
 def test_gate_clients_normalize_upstream_contracts(monkeypatch):
     from adapter.gates import GateClients
