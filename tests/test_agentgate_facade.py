@@ -515,6 +515,34 @@ def test_agentgate_filters_tools_and_skills_by_agent_team_grants():
     assert "skill-secret" not in [skill["id"] for skill in skills.json()["skills"]]
 
 
+def test_agentgate_skills_report_missing_linked_tool_grants():
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = []
+        app.state.agents["agent_pi_operator"]["skill_ids"] = ["skill-1"]
+        app.state.teams["team_core"]["tool_ids"] = []
+        app.state.teams["team_core"]["skill_ids"] = []
+        missing = client.get(
+            "/api/skills?agent_id=agent_pi_operator&team_id=team_core"
+        )
+        app.state.teams["team_core"]["tool_ids"] = ["echo"]
+        ready = client.get(
+            "/api/skills?agent_id=agent_pi_operator&team_id=team_core"
+        )
+
+    assert missing.status_code == 200
+    assert ready.status_code == 200
+    assert missing.json()["allowed_tool_ids"] == []
+    assert missing.json()["skills"][0]["linked_tools"] == ["echo"]
+    assert missing.json()["skills"][0]["missing_linked_tools"] == ["echo"]
+    assert missing.json()["skills"][0]["linked_tools_ready"] is False
+    assert ready.json()["allowed_tool_ids"] == ["echo"]
+    assert ready.json()["skills"][0]["missing_linked_tools"] == []
+    assert ready.json()["skills"][0]["linked_tools_ready"] is True
+
+
 def test_pi_discovery_exposes_memorygate_skills_and_toolgate_capabilities():
     reset_state()
     with TestClient(app) as client:

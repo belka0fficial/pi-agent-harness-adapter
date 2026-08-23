@@ -1573,6 +1573,22 @@ def discovered_toolsets(agent_id: str | None = None, team_id: str | None = None)
     ]
 
 
+def _skill_permission_summary(
+    row: dict[str, Any], allowed_tool_ids: list[str]
+) -> dict[str, Any]:
+    linked_tools = _clean_list(row.get("linked_tools"))
+    missing_tools = [
+        tool_id for tool_id in linked_tools
+        if not _capability_allowed(tool_id, allowed_tool_ids)
+    ]
+    return {
+        **row,
+        "linked_tools": linked_tools,
+        "missing_linked_tools": missing_tools,
+        "linked_tools_ready": not missing_tools,
+    }
+
+
 @app.post("/v1/runs/{run_id}/stop")
 async def stop_run(run_id: str):
     try:
@@ -1837,16 +1853,26 @@ def agentgate_tool_health(tool_id: str, payload: dict[str, Any] | None = None):
 def agentgate_skills(agent_id: str | None = None, team_id: str | None = None):
     rows = app.state.gates.skills()
     if not agent_id and not team_id:
-        return {"skills": rows, "scope": "owner-catalog", "total": len(rows), "visible": len(rows)}
+        return {
+            "skills": [_skill_permission_summary(row, []) for row in rows],
+            "scope": "owner-catalog",
+            "total": len(rows),
+            "visible": len(rows),
+        }
     actor = _permission_context(agent_id, team_id)
     allowed = actor["skill_ids"]
-    visible = [row for row in rows if _capability_allowed(str(row.get("id") or ""), allowed)]
+    visible = [
+        _skill_permission_summary(row, actor["tool_ids"])
+        for row in rows
+        if _capability_allowed(str(row.get("id") or ""), allowed)
+    ]
     return {
         "skills": visible,
         "scope": "agent-effective",
         "agent_id": actor["agent_id"],
         "team_id": actor["team_id"],
         "allowed_ids": allowed,
+        "allowed_tool_ids": actor["tool_ids"],
         "total": len(rows),
         "visible": len(visible),
     }
