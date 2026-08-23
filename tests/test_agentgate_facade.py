@@ -31,7 +31,14 @@ class FakeGates:
         return [{"id": "mem-1", "title": "Owner prefers concise updates", "kind": "preference", "confidence": "high", "updated_at": "2026-01-03T00:00:00+00:00"}]
 
     def system_overview(self):
-        return {"vitals": {"cpu_percent": 12, "memory": {"percent": 34}, "disk": {"percent": 56}, "cpu_count": 8}, "containers": [], "errors": [], "packages": [], "backups": {"latest": None}}
+        return {
+            "vitals": {"cpu_percent": 12, "memory": {"percent": 34}, "disk": {"percent": 56}, "cpu_count": 8},
+            "containers": [],
+            "errors": [],
+            "packages": [],
+            "backups": {"latest": {"name": "backup-probe", "created_at": 1760000000.0}},
+            "sources": {"backups": {"status": "ok"}},
+        }
 
     def tools(self):
         return [
@@ -106,6 +113,13 @@ def test_agentgate_facade_aggregates_gates_without_exposing_credentials():
     assert home["operations"]["pending_approvals"] == 1
     assert home["operations"]["toolgate_counts"] == {"success": 2, "failure": 0}
     assert home["operations"]["memorygate_counts"] == {"reads": 3, "writes": 1}
+    assert home["model_summary"]["runtime"]["status"] == "ok"
+    assert home["model_summary"]["default_route"]["agent_id"] == "agent_pi_operator"
+    assert home["model_summary"]["providers"][0]["id"] == "pi"
+    assert home["backup_summary"]["status"] == "ok"
+    assert "base_url" not in str(home["model_summary"])
+    assert "token" not in str(home).lower()
+    assert "secret" not in str(home).lower()
     assert home["pending_verifications"][0]["id"] == "req-pending"
     assert system["vitals"]["cpu_percent"] == 12
     assert pending[0]["id"] == "req-pending"

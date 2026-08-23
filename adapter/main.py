@@ -1120,6 +1120,54 @@ def model_providers():
     return {"providers": providers}
 
 
+def _safe_model_summary() -> dict[str, Any]:
+    _ensure_registry_seeded()
+    _normalize_agent_model_defaults()
+    default_agent = app.state.agents.get("agent_pi_operator", {})
+    providers = model_providers().get("providers", [])
+    safe_providers = []
+    for provider in providers:
+        safe_providers.append({
+            "id": provider.get("id"),
+            "name": provider.get("name"),
+            "kind": provider.get("kind"),
+            "status": provider.get("status"),
+            "configured": bool(provider.get("configured")),
+            "models_visible": bool(provider.get("models_visible")),
+            "model_count": provider.get("model_count", 0),
+            "models_status": provider.get("models_status"),
+        })
+    return {
+        "runtime": {
+            "id": "pi",
+            "status": "ok",
+            "provider_count": len(safe_providers),
+        },
+        "default_route": {
+            "agent_id": default_agent.get("id") or "agent_pi_operator",
+            "agent_name": default_agent.get("name") or "Pi Operator",
+            "primary_provider": default_agent.get("primary_provider") or "pi",
+            "primary_model": default_agent.get("primary_model") or "",
+            "fallback_provider": default_agent.get("fallback_provider") or "",
+            "fallback_model": default_agent.get("fallback_model") or "",
+        },
+        "providers": safe_providers,
+    }
+
+
+def _safe_backup_summary(system: dict[str, Any]) -> dict[str, Any]:
+    backups = system.get("backups", {}) if isinstance(system, dict) else {}
+    latest = backups.get("latest") if isinstance(backups, dict) else None
+    backup_source = (system.get("sources") or {}).get("backups", {}) if isinstance(system, dict) else {}
+    return {
+        "status": backup_source.get("status") or ("ok" if latest else "unknown"),
+        "latest": {
+            "name": latest.get("name"),
+            "created_at": latest.get("created_at"),
+        } if isinstance(latest, dict) else None,
+    }
+
+
 @app.get("/api/agents")
 def list_agents():
     _ensure_registry_seeded()
@@ -1412,9 +1460,12 @@ def agentgate_home():
     health = {"pi": {"status": "ok"}, **gates.health()}
     operations = gates.operations_summary(pending=pending)
     operations["service_health"] = health
+    system = gates.system_overview()
     return {
         "health": health,
         "operations": operations,
+        "model_summary": _safe_model_summary(),
+        "backup_summary": _safe_backup_summary(system),
         "pending_verifications": pending,
         "suggestions": [],
         "anomalies": [],
