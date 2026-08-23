@@ -187,6 +187,45 @@ def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path)
     assert app.state.gates.synced_toolgate_scope_history[-1] == []
 
 
+def test_team_membership_updates_agent_team_ids(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        created_agent = client.post(
+            "/api/agents",
+            json={
+                "name": "Research Scout",
+                "purpose": "Find safe public evidence for the owner.",
+            },
+        )
+        agent_id = created_agent.json()["id"]
+        created_team = client.post(
+            "/api/teams",
+            json={
+                "name": "Research Cell",
+                "purpose": "Coordinate bounded research tasks.",
+                "orchestrator_agent_id": agent_id,
+                "member_agent_ids": [],
+            },
+        )
+        team_id = created_team.json()["id"]
+        team_ids_after_create = list(app.state.agents[agent_id]["team_ids"])
+        cleared = client.patch(
+            f"/api/teams/{team_id}",
+            json={"orchestrator_agent_id": "", "member_agent_ids": []},
+        )
+
+    assert created_agent.status_code == 200
+    assert created_team.status_code == 200
+    assert created_team.json()["member_agent_ids"] == [agent_id]
+    assert team_id in team_ids_after_create
+    assert cleared.status_code == 200
+    assert app.state.agents[agent_id]["team_ids"] == []
+
+
 def test_automation_jobs_persist_to_sqlite(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

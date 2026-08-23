@@ -393,6 +393,34 @@ def _permission_context(agent_id: str | None, team_id: str | None = None) -> dic
     }
 
 
+def _normalized_team_member_ids(member_agent_ids: list[str], orchestrator_agent_id: str = "") -> list[str]:
+    _ensure_registry_seeded()
+    values = [str(item).strip() for item in member_agent_ids if str(item).strip()]
+    orchestrator = str(orchestrator_agent_id or "").strip()
+    if orchestrator:
+        values.append(orchestrator)
+    unique = list(dict.fromkeys(values))
+    missing = [agent_id for agent_id in unique if agent_id not in app.state.agents]
+    if missing:
+        raise HTTPException(422, f"unknown team agent ids: {', '.join(missing)}")
+    return unique
+
+
+def _sync_agent_team_memberships(team_id: str, member_agent_ids: list[str], previous_member_agent_ids: list[str] | None = None) -> None:
+    previous = set(previous_member_agent_ids or [])
+    current = set(member_agent_ids)
+    for agent_id in previous | current:
+        agent = app.state.agents.get(agent_id)
+        if not agent:
+            continue
+        team_ids = [item for item in agent.get("team_ids", []) if item != team_id]
+        if agent_id in current:
+            team_ids.append(team_id)
+        agent["team_ids"] = list(dict.fromkeys(team_ids))
+        agent["updated_at"] = now()
+        _save_registry_item("agent", agent)
+
+
 def _tool_allowed(tool_id: str | None, allowed: list[str]) -> bool:
     if not tool_id:
         return False
@@ -1171,15 +1199,18 @@ def create_team(payload: TeamInput):
     team_id = f"team_{_slug(payload.name)}"
     if team_id in app.state.teams:
         team_id = f"{team_id}_{uuid.uuid4().hex[:6]}"
+    member_agent_ids = _normalized_team_member_ids(payload.member_agent_ids, payload.orchestrator_agent_id)
     item = {
         "id": team_id,
         **payload.model_dump(),
+        "member_agent_ids": member_agent_ids,
         "status": "draft",
         "created_at": now(),
         "updated_at": now(),
     }
     app.state.teams[team_id] = item
     _save_registry_item("team", item)
+    _sync_agent_team_memberships(team_id, member_agent_ids)
     if item.get("tool_ids"):
         _sync_toolgate_execution_scopes()
     return item
@@ -1191,10 +1222,17 @@ def update_team(team_id: str, payload: dict[str, Any]):
     item = app.state.teams.get(team_id)
     if not item:
         raise HTTPException(404, "team not found")
+    previous_member_agent_ids = list(item.get("member_agent_ids", []))
     allowed = set(TeamInput.model_fields) | {"status"}
+    if "member_agent_ids" in payload or "orchestrator_agent_id" in payload:
+        next_member_ids = payload.get("member_agent_ids", item.get("member_agent_ids", []))
+        next_orchestrator = payload.get("orchestrator_agent_id", item.get("orchestrator_agent_id", ""))
+        payload = {**payload, "member_agent_ids": _normalized_team_member_ids(next_member_ids, next_orchestrator)}
     item.update({key: value for key, value in payload.items() if key in allowed})
     item["updated_at"] = now()
     _save_registry_item("team", item)
+    if "member_agent_ids" in payload:
+        _sync_agent_team_memberships(team_id, item.get("member_agent_ids", []), previous_member_agent_ids)
     if "tool_ids" in payload:
         _sync_toolgate_execution_scopes()
     return item
