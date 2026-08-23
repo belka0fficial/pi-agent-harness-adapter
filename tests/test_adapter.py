@@ -333,6 +333,108 @@ def test_model_route_check_reports_visibility_and_external_policy(monkeypatch):
     assert missing.json()["policy"] == "low_risk_only"
 
 
+def test_model_route_plan_blocks_unready_or_external_fallback(monkeypatch, tmp_path):
+    class Result:
+        stdout = (
+            "provider      model                context  max-out  thinking  images\n"
+            "openai-codex  gpt-5.6-luna         272K     128K     yes       yes\n"
+            "openrouter    stealth/ox-alpha     128K     16K      yes       no\n"
+        )
+
+    monkeypatch.setattr("adapter.main.subprocess.run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr("adapter.main.model_providers", lambda: {"providers": [
+        {"id": "openai-codex", "name": "Pi adapter", "status": "ok", "configured": True, "models_visible": True},
+        {"id": "openrouter", "name": "OpenRouter", "status": "ok", "configured": True, "models_visible": True},
+    ]})
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    app.state.pi = FakePi()
+    app.state.pi.command = "pi"
+    with TestClient(app) as client:
+        response = client.post("/api/model/route-plan", json={
+            "agent_id": "agent_pi_operator",
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-luna",
+            "fallback_provider": "openrouter",
+            "fallback_model": "stealth/ox-alpha",
+        })
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema"] == "model.route_plan.v1"
+    assert payload["safe_metadata_only"] is True
+    assert payload["secrets_included"] is False
+    assert payload["raw_prompts_included"] is False
+    assert payload["automatic_fallback_enabled"] is False
+    assert payload["routes"][0]["status"] == "ready"
+    assert payload["routes"][1]["status"] == "ready"
+    assert payload["fallback_policy"]["status"] == "blocked"
+    assert "fallback route is external" in " ".join(payload["fallback_policy"]["blocked_reasons"])
+    assert "base_url" not in response.text
+
+
+def test_model_route_plan_ready_metadata_for_reviewed_fallback(monkeypatch, tmp_path):
+    class Result:
+        stdout = (
+            "provider      model                context  max-out  thinking  images\n"
+            "openai-codex  gpt-5.6-luna         272K     128K     yes       yes\n"
+            "openai-codex  gpt-5.6-sol          272K     128K     yes       yes\n"
+        )
+
+    monkeypatch.setattr("adapter.main.subprocess.run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr("adapter.main.model_providers", lambda: {"providers": [
+        {"id": "openai-codex", "name": "Pi adapter", "status": "ok", "configured": True, "models_visible": True},
+    ]})
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    app.state.pi = FakePi()
+    app.state.pi.command = "pi"
+    with TestClient(app) as client:
+        response = client.post("/api/model/route-plan", json={
+            "agent_id": "agent_pi_operator",
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-luna",
+            "fallback_provider": "openai-codex",
+            "fallback_model": "gpt-5.6-sol",
+        })
+
+    assert response.status_code == 200
+    policy = response.json()["fallback_policy"]
+    assert policy["status"] == "ready_for_owner_review"
+    assert policy["automatic_fallback"] is False
+    assert policy["trigger_classes"] == ["timeout", "rate_limit", "server_error"]
+    assert policy["max_hops"] == 2
+
+
+def test_model_route_plan_disables_empty_fallback(monkeypatch, tmp_path):
+    class Result:
+        stdout = (
+            "provider      model                context  max-out  thinking  images\n"
+            "openai-codex  gpt-5.6-luna         272K     128K     yes       yes\n"
+        )
+
+    monkeypatch.setattr("adapter.main.subprocess.run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr("adapter.main.model_providers", lambda: {"providers": [
+        {"id": "openai-codex", "name": "Pi adapter", "status": "ok", "configured": True, "models_visible": True},
+    ]})
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    app.state.pi = FakePi()
+    app.state.pi.command = "pi"
+    with TestClient(app) as client:
+        response = client.post("/api/model/route-plan", json={
+            "agent_id": "agent_pi_operator",
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-luna",
+        })
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["routes"][1]["status"] == "disabled"
+    assert payload["fallback_policy"]["status"] == "disabled"
+    assert payload["fallback_policy"]["automatic_fallback"] is False
+
+
 def test_freellmapi_provider_status_uses_health_and_redacts_urls(monkeypatch):
     class Response:
         def __init__(self, status_code, payload):

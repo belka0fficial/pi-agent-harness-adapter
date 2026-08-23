@@ -99,6 +99,14 @@ class ModelRouteProbeInput(BaseModel):
     model: str = Field(default="", max_length=160)
 
 
+class ModelRoutePlanInput(BaseModel):
+    agent_id: str = "agent_pi_operator"
+    primary_provider: str = Field(default="", max_length=120)
+    primary_model: str = Field(default="", max_length=160)
+    fallback_provider: str = Field(default="", max_length=120)
+    fallback_model: str = Field(default="", max_length=160)
+
+
 class AgentInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     title: str = Field(default="Agent", max_length=120)
@@ -3567,8 +3575,12 @@ def model_providers():
 
 @app.post("/api/model/route-check")
 def model_route_check(payload: ModelRouteProbeInput):
-    provider = _safe_text(payload.provider, limit=120)
-    model = _safe_text(payload.model, limit=160)
+    return _model_route_probe(payload.provider, payload.model)
+
+
+def _model_route_probe(provider_value: str, model_value: str) -> dict[str, Any]:
+    provider = _safe_text(provider_value, limit=120)
+    model = _safe_text(model_value, limit=160)
     if not provider or not model:
         raise HTTPException(422, "provider and model are required")
     options = _model_options_payload()
@@ -3595,6 +3607,110 @@ def model_route_check(payload: ModelRouteProbeInput):
         "risk": risk["risk"],
         "policy": risk["policy"],
         "note": risk["note"] if visible else "Route is saved as metadata, but the model is not currently visible to Pi.",
+    }
+
+
+def _empty_route_probe(label: str, *, optional: bool = False) -> dict[str, Any]:
+    status = "disabled" if optional else "incomplete"
+    note = "No fallback route is set; no provider hop will occur." if optional else "Primary provider and model are required."
+    return {
+        "label": label,
+        "provider": "",
+        "model": "",
+        "status": status,
+        "model_visible": False,
+        "provider_status": "unknown",
+        "configured": False,
+        "risk": "none" if optional else "unknown",
+        "policy": "disabled" if optional else "required",
+        "note": note,
+    }
+
+
+def _safe_route_probe(label: str, provider: str, model: str, *, optional: bool = False) -> dict[str, Any]:
+    if not provider and not model:
+        return _empty_route_probe(label, optional=optional)
+    if not provider or not model:
+        item = _empty_route_probe(label, optional=False)
+        item.update({
+            "provider": _safe_text(provider, limit=120),
+            "model": _safe_text(model, limit=160),
+            "status": "incomplete",
+            "policy": "required" if not optional else "blocked",
+            "note": "Set both provider and model before relying on this route.",
+        })
+        return item
+    try:
+        item = _model_route_probe(provider, model)
+    except HTTPException:
+        item = _empty_route_probe(label, optional=optional)
+        item.update({
+            "provider": _safe_text(provider, limit=120),
+            "model": _safe_text(model, limit=160),
+            "status": "incomplete",
+            "policy": "blocked",
+            "note": "Route could not be checked with safe metadata.",
+        })
+    item["label"] = label
+    return item
+
+
+def _fallback_policy(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    if fallback.get("status") == "disabled":
+        return {
+            "status": "disabled",
+            "automatic_fallback": False,
+            "max_hops": 1,
+            "trigger_classes": [],
+            "blocked_reasons": [],
+            "event_schema": "model.route_plan.v1",
+            "note": "Fallback is disabled because no fallback route is configured.",
+        }
+    blocked: list[str] = []
+    if primary.get("status") != "ready":
+        blocked.append("primary route is not ready")
+    if fallback.get("status") != "ready":
+        blocked.append("fallback route is not ready")
+    if fallback.get("risk") == "external":
+        blocked.append("fallback route is external and must be owner-reviewed before prompt replay")
+    if primary.get("provider") == fallback.get("provider") and primary.get("model") == fallback.get("model"):
+        blocked.append("fallback route matches primary route")
+    ready = not blocked
+    return {
+        "status": "ready_for_owner_review" if ready else "blocked",
+        "automatic_fallback": False,
+        "max_hops": 2 if ready else 1,
+        "trigger_classes": ["timeout", "rate_limit", "server_error"] if ready else [],
+        "blocked_reasons": blocked[:6],
+        "event_schema": "model.route_plan.v1",
+        "note": (
+            "Fallback route is visible and can be considered for a future owner-approved retry path; no silent fallback is enabled."
+            if ready
+            else "Fallback will not run until the blocked reasons are resolved."
+        ),
+    }
+
+
+@app.post("/api/model/route-plan")
+def model_route_plan(payload: ModelRoutePlanInput):
+    _ensure_registry_seeded()
+    agent = app.state.agents.get(payload.agent_id) or {}
+    primary_provider = payload.primary_provider or agent.get("primary_provider") or ""
+    primary_model = payload.primary_model or agent.get("primary_model") or ""
+    fallback_provider = payload.fallback_provider or agent.get("fallback_provider") or ""
+    fallback_model = payload.fallback_model or agent.get("fallback_model") or ""
+    primary = _safe_route_probe("primary", primary_provider, primary_model)
+    fallback = _safe_route_probe("fallback", fallback_provider, fallback_model, optional=True)
+    policy = _fallback_policy(primary, fallback)
+    return {
+        "agent_id": _safe_text(payload.agent_id, limit=120) or "agent_pi_operator",
+        "schema": "model.route_plan.v1",
+        "routes": [primary, fallback],
+        "fallback_policy": policy,
+        "safe_metadata_only": True,
+        "secrets_included": False,
+        "raw_prompts_included": False,
+        "automatic_fallback_enabled": False,
     }
 
 
