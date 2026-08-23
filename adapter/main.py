@@ -1052,6 +1052,14 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_task(item: dict[str, Any]) -> dict[str, Any]:
+    task_id = item.get("id")
+    history = []
+    if task_id:
+        history = [
+            event
+            for event in _list_activity(limit=20)
+            if event.get("ref_type") == "task" and event.get("ref_id") == task_id
+        ]
     return {
         "id": item.get("id"),
         "title": item.get("title"),
@@ -1070,6 +1078,7 @@ def _public_task(item: dict[str, Any]) -> dict[str, Any]:
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
         "completed_at": item.get("completed_at"),
+        "history": history[:8],
     }
 
 
@@ -1499,6 +1508,12 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
     app.state.sessions[session_id]["agent_id"] = actor["agent_id"]
     app.state.sessions[session_id]["team_id"] = actor["team_id"]
     app.state.sessions[session_id]["updated_at"] = now()
+    linked_task_id = app.state.sessions[session_id].get("task_id")
+    linked_task = app.state.tasks.get(linked_task_id) if linked_task_id else None
+    if linked_task and linked_task.get("status") == "queued":
+        linked_task["status"] = "in_progress"
+        linked_task["updated_at"] = now()
+        _save_registry_item("task", linked_task)
     user_message = {"id": f"msg_{uuid.uuid4().hex[:12]}", "role": "user", "content": payload.input, "created_at": now()}
     app.state.messages[session_id].append(user_message)
     _record_activity(
@@ -1511,6 +1526,17 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
         ref_type="session",
         ref_id=session_id,
     )
+    if linked_task:
+        _record_activity(
+            actor["agent_id"],
+            event_type="task.chat_started",
+            status="in_progress",
+            source="AgentGate",
+            summary=f"Task chat turn started: {linked_task.get('title') or linked_task_id}",
+            team_id=actor["team_id"],
+            ref_type="task",
+            ref_id=linked_task_id,
+        )
 
     async def events() -> AsyncIterator[bytes]:
         collected = []
@@ -1588,6 +1614,20 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
             ref_type="session",
             ref_id=session_id,
         )
+        if linked_task:
+            linked_task["status"] = "blocked" if run_status == "failed" else "in_progress"
+            linked_task["updated_at"] = now()
+            _save_registry_item("task", linked_task)
+            _record_activity(
+                actor["agent_id"],
+                event_type="task.chat_completed",
+                status=linked_task["status"],
+                source="Pi adapter",
+                summary=f"Task chat turn {run_status}: {linked_task.get('title') or linked_task_id}",
+                team_id=actor["team_id"],
+                ref_type="task",
+                ref_id=linked_task_id,
+            )
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -2245,6 +2285,7 @@ def create_task_session(task_id: str):
         "title": f"Task: {item.get('title') or task_id}",
         "agent_id": actor["agent_id"],
         "team_id": actor["team_id"],
+        "task_id": task_id,
         "created_at": now(),
         "updated_at": now(),
     }
@@ -2274,6 +2315,18 @@ def delete_task(task_id: str):
     app.state.tasks.pop(task_id, None)
     _delete_registry_item("task", task_id)
     return {"deleted": True}
+
+
+@app.get("/api/tasks/{task_id}/activity")
+def get_task_activity(task_id: str, limit: int = 20):
+    if task_id not in app.state.tasks:
+        raise HTTPException(404, "task not found")
+    rows = [
+        item
+        for item in _list_activity(limit=max(limit, 20))
+        if item.get("ref_type") == "task" and item.get("ref_id") == task_id
+    ]
+    return {"activity": rows[:limit]}
 
 
 @app.get("/v1/capabilities")
