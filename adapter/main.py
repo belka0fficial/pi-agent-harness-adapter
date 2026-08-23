@@ -299,10 +299,25 @@ def _record_activity(
     return item
 
 
-def _list_activity(agent_id: str | None = None, *, limit: int = 20) -> list[dict[str, Any]]:
+def _list_activity(
+    agent_id: str | None = None,
+    *,
+    team_id: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
     limit = min(max(limit, 1), 100)
     with _registry_conn() as conn:
-        if agent_id:
+        if agent_id and team_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM activity_events
+                WHERE agent_id = ? AND team_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (agent_id, team_id, limit),
+            ).fetchall()
+        elif agent_id:
             rows = conn.execute(
                 """
                 SELECT * FROM activity_events
@@ -311,6 +326,16 @@ def _list_activity(agent_id: str | None = None, *, limit: int = 20) -> list[dict
                 LIMIT ?
                 """,
                 (agent_id, limit),
+            ).fetchall()
+        elif team_id:
+            rows = conn.execute(
+                """
+                SELECT * FROM activity_events
+                WHERE team_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (team_id, limit),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -1199,7 +1224,10 @@ def delete_agent(agent_id: str):
 @app.get("/api/teams")
 def list_teams():
     _ensure_registry_seeded()
-    return {"teams": list(app.state.teams.values())}
+    teams = []
+    for item in app.state.teams.values():
+        teams.append({**item, "recent_activity": _list_activity(team_id=item.get("id"), limit=3)})
+    return {"teams": teams}
 
 
 @app.get("/api/teams/{team_id}")
@@ -1208,7 +1236,15 @@ def get_team(team_id: str):
     item = app.state.teams.get(team_id)
     if not item:
         raise HTTPException(404, "team not found")
-    return item
+    return {**item, "recent_activity": _list_activity(team_id=team_id, limit=10)}
+
+
+@app.get("/api/teams/{team_id}/activity")
+def get_team_activity(team_id: str, limit: int = 20):
+    _ensure_registry_seeded()
+    if team_id not in app.state.teams:
+        raise HTTPException(404, "team not found")
+    return {"activity": _list_activity(team_id=team_id, limit=limit)}
 
 
 @app.post("/api/teams")

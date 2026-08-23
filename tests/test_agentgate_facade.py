@@ -508,6 +508,41 @@ def test_agent_activity_records_safe_chat_and_job_metadata(monkeypatch, tmp_path
     assert all("summary" in item and "created_at" in item for item in activity)
 
 
+def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/sessions",
+            json={
+                "title": "Team activity probe",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+            },
+        )
+        assert created.status_code == 200
+        chat = client.post(
+            f"/api/sessions/{created.json()['id']}/chat/stream",
+            json={"input": "Sensitive team prompt must not be stored in activity"},
+        )
+        assert chat.status_code == 200
+        teams = client.get("/api/teams").json()["teams"]
+        team = client.get("/api/teams/team_core").json()
+        activity = client.get("/api/teams/team_core/activity").json()["activity"]
+
+    core_rollup = next(item for item in teams if item["id"] == "team_core")
+    assert core_rollup["recent_activity"]
+    assert team["recent_activity"]
+    assert [item["team_id"] for item in activity]
+    assert all(item["team_id"] == "team_core" for item in activity)
+    assert "chat.started" in [item["event_type"] for item in activity]
+    assert "chat.completed" in [item["event_type"] for item in activity]
+    assert "Sensitive" not in str(activity)
+
+
 def test_chat_defaults_to_no_memory_side_effects():
     reset_state()
     pi = CapturingPi()
