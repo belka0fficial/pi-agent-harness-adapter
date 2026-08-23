@@ -307,6 +307,60 @@ def test_model_discovery_parses_pi_table_output(monkeypatch):
     }
 
 
+def test_model_route_check_reports_visibility_and_external_policy(monkeypatch):
+    class Result:
+        stdout = (
+            "provider      model                context  max-out  thinking  images\n"
+            "openai-codex  gpt-5.6-luna         272K     128K     yes       yes\n"
+        )
+
+    monkeypatch.setattr("adapter.main.subprocess.run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr("adapter.main.model_providers", lambda: {"providers": [
+        {"id": "openai-codex", "name": "Pi adapter", "status": "ok", "configured": True, "models_visible": True}
+    ]})
+    app.state.pi = FakePi()
+    app.state.pi.command = "pi"
+    with TestClient(app) as client:
+        ready = client.post("/api/model/route-check", json={"provider": "openai-codex", "model": "gpt-5.6-luna"})
+        missing = client.post("/api/model/route-check", json={"provider": "freellmapi", "model": "helper-model"})
+
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+    assert ready.json()["risk"] == "reviewed"
+    assert "base_url" not in ready.text
+    assert missing.status_code == 200
+    assert missing.json()["status"] == "not_visible"
+    assert missing.json()["policy"] == "low_risk_only"
+
+
+def test_freellmapi_provider_status_uses_health_and_redacts_urls(monkeypatch):
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, timeout):
+        if url.endswith("/health"):
+            return Response(200, {"status": "ok"})
+        if url.endswith("/v1/models"):
+            return Response(401, {"error": {"message": "Invalid API key"}})
+        raise AssertionError(url)
+
+    monkeypatch.setattr("adapter.main.httpx.get", fake_get)
+    with TestClient(app) as client:
+        payload = client.get("/api/model/providers").json()
+
+    freeapi = next(item for item in payload["providers"] if item["id"] == "freellmapi")
+    assert freeapi["status"] == "auth_required"
+    assert freeapi["models_status"] == "auth_required"
+    assert freeapi["configured"] is False
+    assert "base_url" not in freeapi
+    assert "Invalid API key" not in str(freeapi)
+
+
 class FailingPi:
     async def stream(self, prompt: str, *, session_id: str, options=None):
         if False:

@@ -67,6 +67,11 @@ class ToolPolicyInput(BaseModel):
     usage_limits: dict[str, int] = Field(default_factory=dict)
 
 
+class ModelRouteProbeInput(BaseModel):
+    provider: str = Field(default="", max_length=120)
+    model: str = Field(default="", max_length=160)
+
+
 class AgentInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     title: str = Field(default="Agent", max_length=120)
@@ -1442,8 +1447,7 @@ async def stop_current_session_run(session_id: str):
     )
     return {"run_id": run_id, "session_id": session_id, "status": "stopping"}
 
-@app.get("/api/model/options")
-def models():
+def _model_options_payload() -> dict[str, Any]:
     command = app.state.pi.command
     try:
         result = subprocess.run([command, "--list-models"], check=True, capture_output=True, text=True, timeout=30)
@@ -1479,6 +1483,26 @@ def models():
     return {"models": models, "providers": sorted({str(item.get("provider")) for item in models if item.get("provider")})}
 
 
+@app.get("/api/model/options")
+def models():
+    return _model_options_payload()
+
+
+def _provider_risk(provider_id: str) -> dict[str, str]:
+    value = str(provider_id or "").lower()
+    if any(marker in value for marker in ("free", "openrouter", "groq", "gemini", "cerebras", "cloudflare")):
+        return {
+            "risk": "external",
+            "policy": "low_risk_only",
+            "note": "Use only for low-risk helper work until owner-approved for private context or tool planning.",
+        }
+    return {
+        "risk": "reviewed",
+        "policy": "normal",
+        "note": "Reviewed local runtime route metadata. Provider credentials stay server-side.",
+    }
+
+
 @app.get("/api/model/providers")
 def model_providers():
     freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
@@ -1487,24 +1511,28 @@ def model_providers():
             "id": "pi",
             "name": "Pi adapter",
             "kind": "runtime",
-            "base_url": "server-side",
             "status": "ok",
             "privacy": "model runtime bridge; provider auth stays server-side",
             "configured": True,
+            "models_visible": True,
+            "risk": "reviewed",
+            "policy": "normal",
         }
     ]
     freeapi = {
         "id": "freellmapi",
         "name": "FreeLLMAPI",
         "kind": "free-model-gateway",
-        "base_url": "server-side",
         "status": "unavailable",
         "privacy": "external free providers; use only for low-risk helper tasks until reviewed",
         "configured": False,
         "models_visible": False,
+        "risk": "external",
+        "policy": "low_risk_only",
+        "setup_hint": "Configure FreeLLMAPI provider credentials server-side before using it.",
     }
     try:
-        ping = httpx.get(f"{freeapi_url}/api/ping", timeout=3)
+        ping = httpx.get(f"{freeapi_url}/health", timeout=3)
         if ping.status_code == 200:
             freeapi["status"] = "ok"
     except httpx.HTTPError:
@@ -1520,10 +1548,44 @@ def model_providers():
         elif models_response.status_code in {401, 403}:
             freeapi["configured"] = False
             freeapi["models_status"] = "auth_required"
+            freeapi["status"] = "auth_required" if freeapi["status"] == "ok" else freeapi["status"]
     except (httpx.HTTPError, ValueError):
         pass
     providers.append(freeapi)
     return {"providers": providers}
+
+
+@app.post("/api/model/route-check")
+def model_route_check(payload: ModelRouteProbeInput):
+    provider = _safe_text(payload.provider, limit=120)
+    model = _safe_text(payload.model, limit=160)
+    if not provider or not model:
+        raise HTTPException(422, "provider and model are required")
+    options = _model_options_payload()
+    providers = model_providers().get("providers", [])
+    provider_meta = next(
+        (item for item in providers if item.get("id") == provider or item.get("name") == provider),
+        None,
+    )
+    visible = any(
+        item.get("provider") == provider and (item.get("model") == model or item.get("name") == model)
+        for item in options.get("models", [])
+    )
+    risk = _provider_risk(provider)
+    status = "ready" if visible else "not_visible"
+    if provider_meta and provider_meta.get("models_status") == "auth_required":
+        status = "auth_required"
+    return {
+        "provider": provider,
+        "model": model,
+        "status": status,
+        "model_visible": visible,
+        "provider_status": (provider_meta or {}).get("status", "unknown"),
+        "configured": bool((provider_meta or {}).get("configured", False)),
+        "risk": risk["risk"],
+        "policy": risk["policy"],
+        "note": risk["note"] if visible else "Route is saved as metadata, but the model is not currently visible to Pi.",
+    }
 
 
 def _safe_model_summary() -> dict[str, Any]:
