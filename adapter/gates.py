@@ -255,6 +255,17 @@ class GateClients:
         rows = payload if isinstance(payload, list) else payload.get("results", payload.get("keys", []))
         return [row for row in rows if isinstance(row, dict)]
 
+    def memorygate_audit_metrics(self, *, hours: int = 24) -> dict[str, Any]:
+        payload = self._request("memorygate", f"/audit/metrics?hours={max(1, min(int(hours or 24), 168))}")
+        if not isinstance(payload, dict):
+            return {"reads": self.memory_counts["reads"], "writes": self.memory_counts["writes"], "source": "adapter-observed"}
+        return {
+            "reads": int(payload.get("reads") or 0),
+            "writes": int(payload.get("writes") or 0),
+            "source": "memorygate-audit",
+            "window_hours": int(payload.get("window_hours") or hours),
+        }
+
     def memory_context(self, query: str, *, agent_id: str | None = None) -> dict[str, Any]:
         self.memory_counts["reads"] += 1
         payload = self._memory_read_request(
@@ -472,11 +483,16 @@ class GateClients:
             if event_type.startswith("verification") or event_type.startswith("request_") or subject_type in {"request", "verification_method"}:
                 recent_events.append(self._redacted_event(event))
 
+        try:
+            memory_counts = self.memorygate_audit_metrics(hours=24)
+        except RuntimeError:
+            memory_counts = {**dict(self.memory_counts), "source": "adapter-observed"}
+
         return {
             "service_health": {},
             "pending_approvals": len(pending or []),
             "action_counts_24h": action_counts,
             "recent_verification_events": recent_events[:8],
             "toolgate_counts": {"success": tool_success, "failure": tool_failure},
-            "memorygate_counts": dict(self.memory_counts),
+            "memorygate_counts": memory_counts,
         }
