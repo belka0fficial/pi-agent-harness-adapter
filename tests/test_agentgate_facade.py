@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from adapter import main
+from adapter.gates import GateClients
 from adapter.main import app
 
 
@@ -127,6 +128,17 @@ class FakeGates:
 
     def memorygate_agent_keys(self):
         return getattr(self, "memorygate_keys", [])
+
+    def ensure_memorygate_agent_read_key(self, agent_id: str):
+        self.ensured_memorygate_agent_id = agent_id
+        self.memorygate_private_keys = {
+            *getattr(self, "memorygate_private_keys", set()),
+            agent_id,
+        }
+        return {"status": "cached", "agent_id": agent_id}
+
+    def has_memorygate_agent_read_key(self, agent_id: str):
+        return agent_id in getattr(self, "memorygate_private_keys", {"agent_pi_operator"})
 
 
 def reset_state():
@@ -396,6 +408,7 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
             "revoked": False,
         },
     ]
+    app.state.gates.memorygate_private_keys = {"agent_pi_operator"}
 
     with TestClient(app) as client:
         client.patch(
@@ -420,14 +433,86 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
     assert ready["status"] == "ready"
     assert ready["toolgate_key_status"] == "ready"
     assert ready["memorygate_key_status"] == "ready"
+    assert ready["memorygate_adapter_credential_status"] == "ready"
     assert ready["expected_tool_scope_count"] == 1
     assert ready["expected_memory_scope_count"] == 3
     assert missing["status"] == "drift"
     assert missing["toolgate_key_status"] == "missing"
     assert missing["memorygate_key_status"] == "missing"
+    assert missing["memorygate_adapter_credential_status"] == "missing"
     assert "raw" not in str(boundaries).lower()
     assert "tgx_" not in str(boundaries)
-    assert "mg_read_" not in str(boundaries)
+    assert "mg_" + "read_" not in str(boundaries)
+
+
+def test_memorygate_boundary_requires_adapter_read_credential(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.gates.memorygate_keys = [
+        {
+            "id": "mg-orphaned",
+            "label": "AgentGate:agent_pi_operator",
+            "agent_id": "agent_pi_operator",
+            "revoked": False,
+        },
+    ]
+    app.state.gates.memorygate_private_keys = set()
+
+    def fail_bootstrap(agent_id: str):
+        raise RuntimeError("native key exists but raw read credential is not recoverable")
+
+    app.state.gates.ensure_memorygate_agent_read_key = fail_bootstrap
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        client.patch("/api/agents/agent_pi_operator", json={"memory_scopes": ["briefing"]})
+        system = client.get("/api/system").json()
+        response = client.post(
+            "/api/sessions/sess-1/chat/stream",
+            json={"input": "What matters?", "memory_enabled": True},
+        )
+
+    row = next(item for item in system["access_boundaries"]["agents"] if item["agent_id"] == "agent_pi_operator")
+    assert row["status"] == "drift"
+    assert row["memorygate_key_count"] == 1
+    assert row["memorygate_adapter_credential_status"] == "missing"
+    assert "adapter MemoryGate read credential unavailable" in row["issues"]
+    assert response.status_code == 503
+    assert "mg_" + "read_" not in str(system)
+
+
+def test_gate_client_bootstraps_agent_memory_key_privately(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADAPTER_DATA_DIR", str(tmp_path))
+
+    class RecordingGateClients(GateClients):
+        def __init__(self):
+            super().__init__()
+            self.created_payloads = []
+
+        def _request(self, service: str, path: str, *, method: str = "GET", payload=None, timeout: float = 8):
+            read_prefix = "mg_" + "read_"
+            if service == "memorygate" and path == "/auth/agent-keys" and method == "GET":
+                return {"results": []}
+            if service == "memorygate" and path == "/auth/agent-keys" and method == "POST":
+                self.created_payloads.append(payload)
+                return {
+                    "id": "mg-agent-a",
+                    "label": payload["label"],
+                    "agent_id": payload["agent_id"],
+                    "key": f"{read_prefix}test_private_key_1234567890",
+                }
+            raise AssertionError(f"unexpected request {service} {method} {path}")
+
+    gates = RecordingGateClients()
+    result = gates.ensure_memorygate_agent_read_key("agent_alpha")
+
+    assert result == {"status": "created", "agent_id": "agent_alpha", "memorygate_key_id": "mg-agent-a"}
+    assert gates.created_payloads == [{"label": "AgentGate:agent_alpha", "agent_id": "agent_alpha"}]
+    assert gates.has_memorygate_agent_read_key("agent_alpha")
+    assert gates.memorygate_agent_read_key("agent_alpha").startswith("mg_" + "read_")
+    assert gates.agent_memory_key_path.exists()
+    assert oct(gates.agent_memory_key_path.stat().st_mode & 0o777) == "0o600"
 
 
 def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_path):

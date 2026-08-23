@@ -5,6 +5,7 @@ import os
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 
@@ -31,6 +32,7 @@ class GateClients:
         }
         self.memory_counts = {"reads": 0, "writes": 0}
         self.toolgate_execution_key = os.environ.get("TOOLGATE_EXECUTION_KEY", "")
+        self.agent_memory_key_path = Path(os.environ.get("ADAPTER_DATA_DIR", "/app/data")) / "agent_memory_read_keys.json"
 
     @staticmethod
     def _parse_time(value: Any) -> datetime | None:
@@ -165,7 +167,11 @@ class GateClients:
         timeout: float = 8,
     ):
         base_url = self.services["memorygate"][0]
-        read_key = os.environ.get("MEMORYGATE_READ_KEY", "")
+        read_key = self.memorygate_agent_read_key(agent_id) if agent_id else ""
+        if not read_key and agent_id == "agent_pi_operator":
+            read_key = os.environ.get("MEMORYGATE_READ_KEY", "")
+        if agent_id and not read_key:
+            raise RuntimeError("memorygate read key is unavailable for agent")
         if not read_key:
             return self._request("memorygate", path, method=method, payload=payload, timeout=timeout)
         headers = {"Accept": "application/json", "X-MemoryGate-Key": read_key}
@@ -185,6 +191,78 @@ class GateClients:
         except (TimeoutError, urllib.error.URLError) as exc:
             raise RuntimeError("memorygate is unavailable") from exc
         return json.loads(body.decode("utf-8")) if body else {}
+
+    def _load_agent_memory_keys(self) -> dict[str, dict[str, str]]:
+        try:
+            payload = json.loads(self.agent_memory_key_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _save_agent_memory_keys(self, payload: dict[str, dict[str, str]]) -> None:
+        self.agent_memory_key_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.agent_memory_key_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True))
+        os.replace(tmp_path, self.agent_memory_key_path)
+        try:
+            self.agent_memory_key_path.chmod(0o600)
+        except OSError:
+            pass
+
+    def memorygate_agent_read_key(self, agent_id: str | None) -> str:
+        if not agent_id:
+            return ""
+        item = self._load_agent_memory_keys().get(agent_id)
+        return str((item or {}).get("key") or "")
+
+    def has_memorygate_agent_read_key(self, agent_id: str) -> bool:
+        return bool(self.memorygate_agent_read_key(agent_id))
+
+    def forget_memorygate_agent_read_key(self, agent_id: str) -> None:
+        store = self._load_agent_memory_keys()
+        if agent_id not in store:
+            return
+        store.pop(agent_id, None)
+        self._save_agent_memory_keys(store)
+
+    def ensure_memorygate_agent_read_key(self, agent_id: str) -> dict[str, Any]:
+        agent_id = str(agent_id or "").strip()
+        if not agent_id:
+            raise RuntimeError("agent id is required")
+        cached = self.memorygate_agent_read_key(agent_id)
+        if cached:
+            return {"status": "cached", "agent_id": agent_id}
+        label = f"AgentGate:{agent_id}"
+        keys = self.memorygate_agent_keys()
+        if any(
+            str(row.get("agent_id") or "") == agent_id
+            and str(row.get("label") or "").strip().lower() == label.lower()
+            and not bool(row.get("revoked"))
+            for row in keys
+        ):
+            raise RuntimeError("memorygate native key exists but adapter read credential is unavailable")
+        created = self._request(
+            "memorygate",
+            "/auth/agent-keys",
+            method="POST",
+            payload={"label": label, "agent_id": agent_id},
+        )
+        raw_key = str((created or {}).get("key") or "")
+        if not raw_key.startswith("mg_read_"):
+            raise RuntimeError("memorygate did not return a read key")
+        store = self._load_agent_memory_keys()
+        store[agent_id] = {
+            "key": raw_key,
+            "label": label,
+            "memorygate_key_id": str(created.get("id") or ""),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        self._save_agent_memory_keys(store)
+        return {
+            "status": "created",
+            "agent_id": agent_id,
+            "memorygate_key_id": str(created.get("id") or ""),
+        }
 
     def health(self) -> dict[str, dict[str, str]]:
         result: dict[str, dict[str, str]] = {}
