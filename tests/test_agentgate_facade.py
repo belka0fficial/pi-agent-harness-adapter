@@ -236,6 +236,66 @@ def test_agent_registry_persists_to_sqlite(monkeypatch, tmp_path):
     assert agent_id not in app.state.agents
 
 
+def test_registry_export_import_is_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/agents",
+            json={
+                "name": "Portable Worker",
+                "purpose": "Safe metadata export probe.",
+                "soul": "Never reveal token=abc123 or https://private.example/path.",
+                "tool_ids": ["echo"],
+                "memory_scopes": ["project-context"],
+            },
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Portable Team",
+                "purpose": "Safe team export probe.",
+                "orchestrator_agent_id": created["id"],
+                "member_agent_ids": [created["id"]],
+                "tool_ids": ["echo"],
+                "memory_scopes": ["project-context"],
+            },
+        ).json()
+        exported = client.get("/api/registry/export").json()
+        preview = client.post("/api/registry/import", json={**exported, "apply": False}).json()
+
+    assert exported["contents"]["agents"] == 2
+    assert exported["contents"]["teams"] == 2
+    assert "raw gate keys" in exported["excluded"]
+    assert "automation prompts" in exported["excluded"]
+    assert "chat transcripts" in exported["excluded"]
+    assert preview["summary"]["updates"] == 4
+    assert "_agent_profiles" not in preview
+    assert "_team_profiles" not in preview
+    assert "token=abc123" not in str(exported)
+    assert "https://private.example" not in str(exported)
+    assert "tgx_" not in str(exported)
+    assert "mg_read_" not in str(exported)
+    assert "api_key" not in str(exported).lower()
+
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "restore.sqlite3")
+    reset_state()
+    with TestClient(app) as client:
+        applied = client.post("/api/registry/import", json={**exported, "apply": True}).json()
+        agents = client.get("/api/agents").json()["agents"]
+        teams = client.get("/api/teams").json()["teams"]
+
+    assert applied["summary"]["creates"] == 2
+    assert applied["summary"]["updates"] == 2
+    assert any(agent["id"] == created["id"] for agent in agents)
+    assert any(row["id"] == team["id"] for row in teams)
+    restored = next(agent for agent in agents if agent["id"] == created["id"])
+    assert restored["tool_ids"] == ["echo"]
+    assert team["id"] in restored["team_ids"]
+
+
 def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

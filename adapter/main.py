@@ -119,6 +119,13 @@ class TeamInput(BaseModel):
     skill_ids: list[str] = Field(default_factory=list)
 
 
+class RegistryImportInput(BaseModel):
+    schema_version: int = 1
+    agents: list[dict[str, Any]] = Field(default_factory=list)
+    teams: list[dict[str, Any]] = Field(default_factory=list)
+    apply: bool = False
+
+
 class TaskInput(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     summary: str = Field(default="", max_length=1200)
@@ -415,6 +422,178 @@ def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
         if field in cleaned:
             cleaned[field] = _clean_list(cleaned.get(field))
     return cleaned
+
+
+def _sanitize_registry_id(value: Any, *, prefix: str) -> str:
+    text = str(value or "").strip()
+    if not re.fullmatch(rf"{re.escape(prefix)}[a-z0-9][a-z0-9_-]{{0,79}}", text):
+        raise HTTPException(422, f"{prefix.rstrip('_')} id must start with {prefix} and contain lowercase letters, numbers, underscores, or hyphens")
+    return text
+
+
+def _redact_portable_registry_value(value: Any) -> Any:
+    if isinstance(value, str):
+        text = re.sub(r"(?i)\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+", r"\1=[redacted]", value)
+        text = re.sub(r"https?://\S+", "[redacted-url]", text)
+        return text
+    if isinstance(value, list):
+        return [_redact_portable_registry_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _redact_portable_registry_value(item) for key, item in value.items()}
+    return value
+
+
+def _portable_agent(item: dict[str, Any]) -> dict[str, Any]:
+    fields = [
+        "id",
+        "name",
+        "title",
+        "purpose",
+        "mode",
+        "soul",
+        "voice",
+        "personality",
+        "appearance",
+        "story",
+        "primary_provider",
+        "primary_model",
+        "fallback_provider",
+        "fallback_model",
+        "tool_ids",
+        "skill_ids",
+        "memory_scopes",
+        "team_ids",
+        "status",
+    ]
+    return _redact_portable_registry_value({field: item.get(field) for field in fields if field in item})
+
+
+def _portable_team(item: dict[str, Any]) -> dict[str, Any]:
+    fields = [
+        "id",
+        "name",
+        "purpose",
+        "orchestrator_agent_id",
+        "member_agent_ids",
+        "memory_scopes",
+        "tool_ids",
+        "skill_ids",
+        "status",
+    ]
+    return _redact_portable_registry_value({field: item.get(field) for field in fields if field in item})
+
+
+def _registry_import_preview(payload: RegistryImportInput) -> dict[str, Any]:
+    if payload.schema_version != 1:
+        raise HTTPException(422, "registry import schema_version must be 1")
+    if len(payload.agents) > 100 or len(payload.teams) > 50:
+        raise HTTPException(422, "registry import bundle is too large")
+    _ensure_registry_seeded()
+    agent_rows = []
+    imported_agent_ids: set[str] = set()
+    for row in payload.agents:
+        agent_id = _sanitize_registry_id(row.get("id"), prefix="agent_")
+        profile = _sanitize_agent_profile({key: value for key, value in row.items() if key in set(AgentInput.model_fields) | {"status"}})
+        profile = _redact_portable_registry_value(profile)
+        profile["team_ids"] = []
+        imported_agent_ids.add(agent_id)
+        agent_rows.append({
+            "id": agent_id,
+            "name": profile.get("name") or agent_id,
+            "action": "update" if agent_id in app.state.agents else "create",
+            "tool_count": len(profile.get("tool_ids") or []),
+            "skill_count": len(profile.get("skill_ids") or []),
+            "memory_scope_count": len(profile.get("memory_scopes") or []),
+            "profile": profile,
+        })
+    available_agent_ids = set(app.state.agents) | imported_agent_ids
+    team_rows = []
+    for row in payload.teams:
+        team_id = _sanitize_registry_id(row.get("id"), prefix="team_")
+        team_payload = {key: value for key, value in row.items() if key in set(TeamInput.model_fields) | {"status"}}
+        team_payload = _redact_portable_registry_value(team_payload)
+        team_payload["member_agent_ids"] = _clean_list(team_payload.get("member_agent_ids"))
+        team_payload["orchestrator_agent_id"] = str(team_payload.get("orchestrator_agent_id") or "").strip()
+        missing_members = [
+            agent_id
+            for agent_id in _clean_list([*team_payload["member_agent_ids"], team_payload["orchestrator_agent_id"]])
+            if agent_id not in available_agent_ids
+        ]
+        if missing_members:
+            raise HTTPException(422, f"team {team_id} references unknown agent ids: {', '.join(missing_members)}")
+        team_rows.append({
+            "id": team_id,
+            "name": _safe_text(team_payload.get("name"), limit=80) or team_id,
+            "action": "update" if team_id in app.state.teams else "create",
+            "member_count": len(set(team_payload["member_agent_ids"])),
+            "tool_count": len(_clean_list(team_payload.get("tool_ids"))),
+            "skill_count": len(_clean_list(team_payload.get("skill_ids"))),
+            "memory_scope_count": len(_clean_list(team_payload.get("memory_scopes"))),
+            "profile": team_payload,
+        })
+    return {
+        "schema_version": 1,
+        "apply": payload.apply,
+        "summary": {
+            "agents": len(agent_rows),
+            "teams": len(team_rows),
+            "creates": sum(1 for row in [*agent_rows, *team_rows] if row["action"] == "create"),
+            "updates": sum(1 for row in [*agent_rows, *team_rows] if row["action"] == "update"),
+        },
+        "agents": [{key: value for key, value in row.items() if key != "profile"} for row in agent_rows],
+        "teams": [{key: value for key, value in row.items() if key != "profile"} for row in team_rows],
+        "_agent_profiles": {row["id"]: row["profile"] for row in agent_rows},
+        "_team_profiles": {row["id"]: row["profile"] for row in team_rows},
+    }
+
+
+def _apply_registry_import(preview: dict[str, Any]) -> None:
+    timestamp = now()
+    for agent_id, profile in preview.get("_agent_profiles", {}).items():
+        existing = app.state.agents.get(agent_id, {})
+        item = {
+            **existing,
+            "id": agent_id,
+            **profile,
+            "status": profile.get("status") or existing.get("status") or "draft",
+            "created_at": existing.get("created_at") or timestamp,
+            "updated_at": timestamp,
+        }
+        app.state.agents[agent_id] = item
+        _save_registry_item("agent", item)
+    for team_id, profile in preview.get("_team_profiles", {}).items():
+        existing = app.state.teams.get(team_id, {})
+        previous_members = list(existing.get("member_agent_ids", []))
+        member_ids = _normalized_team_member_ids(
+            _clean_list(profile.get("member_agent_ids")),
+            str(profile.get("orchestrator_agent_id") or ""),
+        )
+        item = {
+            **existing,
+            "id": team_id,
+            **profile,
+            "member_agent_ids": member_ids,
+            "status": profile.get("status") or existing.get("status") or "draft",
+            "created_at": existing.get("created_at") or timestamp,
+            "updated_at": timestamp,
+        }
+        app.state.teams[team_id] = item
+        _save_registry_item("team", item)
+        _sync_agent_team_memberships(team_id, member_ids, previous_members)
+    if preview.get("summary", {}).get("agents") or preview.get("summary", {}).get("teams"):
+        _sync_toolgate_execution_scopes()
+        _record_activity(
+            "agent_pi_operator",
+            event_type="registry.imported",
+            status="applied",
+            source="AgentGate",
+            summary=(
+                f"Registry import applied: {preview['summary']['agents']} agents, "
+                f"{preview['summary']['teams']} teams"
+            ),
+            ref_type="registry",
+            ref_id="portable-bundle",
+        )
 
 
 def _record_activity(
@@ -2414,6 +2593,39 @@ def list_agents():
     for item in app.state.agents.values():
         agents.append({**item, "recent_activity": _list_activity(item.get("id"), limit=3)})
     return {"agents": agents}
+
+
+@app.get("/api/registry/export")
+def export_registry():
+    _ensure_registry_seeded()
+    _normalize_agent_model_defaults()
+    return {
+        "schema_version": 1,
+        "exported_at": now(),
+        "contents": {
+            "agents": len(app.state.agents),
+            "teams": len(app.state.teams),
+        },
+        "agents": [_portable_agent(item) for item in sorted(app.state.agents.values(), key=lambda row: row.get("id", ""))],
+        "teams": [_portable_team(item) for item in sorted(app.state.teams.values(), key=lambda row: row.get("id", ""))],
+        "excluded": [
+            "raw gate keys",
+            "memory contents",
+            "chat transcripts",
+            "automation prompts",
+            "tool arguments",
+            "provider credentials",
+            "host paths",
+        ],
+    }
+
+
+@app.post("/api/registry/import")
+def import_registry(payload: RegistryImportInput):
+    preview = _registry_import_preview(payload)
+    if payload.apply:
+        _apply_registry_import(preview)
+    return {key: value for key, value in preview.items() if not key.startswith("_")}
 
 
 @app.get("/api/agents/{agent_id}")
