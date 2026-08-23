@@ -703,7 +703,7 @@ def test_gate_clients_normalize_upstream_contracts(monkeypatch):
         ],
         ("GET", "memorygate", "/memory"): {"results": [{"id": "m1", "text": "Remember this", "memory_type": "fact", "confidence": "high", "updated_at": "2026-01-01T00:00:00+00:00"}]},
         ("GET", "systemgate", "/vitals"): {"cpu_percent": 5, "memory": {"percent": 10}, "disk": {"percent": 20}, "cpu_count": 4},
-        ("GET", "systemgate", "/containers"): {"results": [{"id": "abc123", "name": "agentgate", "image": "agentgate:test", "status": "running", "created": "2026-01-01T00:00:00Z", "stats": {"raw": "hidden"}}]},
+        ("GET", "systemgate", "/services"): {"results": [{"id": "pid-1-agentgate", "name": "agentgate", "kind": "process-listener", "status": "listening", "listeners": ["loopback:8080"], "cmdline": "hidden"}]},
         ("GET", "systemgate", "/logs/errors"): {"text": ""},
         ("GET", "systemgate", "/packages"): {"apt": {"ok": True, "output": ""}, "pip": {"ok": True, "output": "[]"}, "npm": {"ok": True, "output": '{}'}},
         ("GET", "systemgate", "/backups"): {"results": [{"name": "backup-1.tar.zst", "path": "hidden-upstream-path", "created_at": 1770000000.0}]},
@@ -723,7 +723,10 @@ def test_gate_clients_normalize_upstream_contracts(monkeypatch):
     overview = gates.system_overview()
     assert overview["vitals"]["cpu_percent"] == 5
     assert overview["containers"][0]["name"] == "agentgate"
+    assert overview["containers"][0]["listeners"] == ["loopback:8080"]
+    assert overview["containers"][0]["source"] == "systemgate-services"
     assert "stats" not in overview["containers"][0]
+    assert "cmdline" not in overview["containers"][0]
     assert overview["backups"]["latest"]["name"] == "backup-1.tar.zst"
     assert "path" not in overview["backups"]["latest"]
     assert overview["packages"][0]["name"] == "apt"
@@ -739,8 +742,10 @@ def test_system_overview_degrades_when_one_systemgate_endpoint_times_out(monkeyp
         assert service == "systemgate"
         if path == "/vitals":
             return {"cpu_percent": 5, "memory": {"percent": 10}, "disk": {"percent": 20}, "cpu_count": 4}
+        if path == "/services":
+            raise RuntimeError("systemgate services unavailable: timeout")
         if path == "/containers":
-            raise RuntimeError("systemgate is unavailable: timeout")
+            return {"results": [{"id": "abc123", "name": "fallback", "image": "fallback:test", "status": "running"}]}
         return {}
 
     monkeypatch.setattr(gates, "_request", fake_request)
@@ -748,11 +753,13 @@ def test_system_overview_degrades_when_one_systemgate_endpoint_times_out(monkeyp
     overview = gates.system_overview()
 
     assert overview["vitals"]["cpu_percent"] == 5
-    assert overview["containers"] == []
+    assert overview["containers"][0]["name"] == "fallback"
+    assert overview["containers"][0]["source"] == "systemgate-containers"
     assert [pkg["name"] for pkg in overview["packages"]] == ["apt", "pip", "npm"]
     assert overview["backups"] == {"latest": None, "count": 0, "results": []}
-    assert overview["sources"]["containers"]["status"] == "unavailable"
-    assert "containers" in overview["errors"][0]["service"]
+    assert overview["sources"]["services"]["status"] == "unavailable"
+    assert overview["sources"]["containers"]["status"] == "ok"
+    assert "services" in overview["errors"][0]["service"]
 
 
 def test_agentgate_facade_exposes_toolgate_tools_and_memorygate_skills():

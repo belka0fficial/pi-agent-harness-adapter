@@ -364,7 +364,10 @@ class GateClients:
                 return default
 
         vitals = read_system("vitals", "/vitals", {})
-        containers = read_system("containers", "/containers", {"containers": []})
+        services = read_system("services", "/services", {"results": []})
+        containers = {"results": []}
+        if not services.get("results"):
+            containers = read_system("containers", "/containers", {"containers": []})
         errors = read_system("errors", "/logs/errors", {"errors": []})
         packages = read_system("packages", "/packages", {"packages": []})
         backups = read_system("backups", "/backups", {"backups": []})
@@ -375,6 +378,7 @@ class GateClients:
             if source.get("status") == "unavailable":
                 error_rows.append({"at": "", "service": f"systemgate/{source_name}", "level": "warning", "message": source.get("message", "unavailable")})
         container_rows = containers.get("containers", containers.get("results", containers if isinstance(containers, list) else []))
+        service_rows = services.get("services", services.get("results", services if isinstance(services, list) else []))
         backup_rows = backups.get("backups", backups.get("results", backups if isinstance(backups, list) else []))
         safe_backups = []
         for row in backup_rows:
@@ -407,9 +411,19 @@ class GateClients:
             "containers": [{
                 "id": str(row.get("id") or ""),
                 "name": str(row.get("name") or ""),
+                "image": str(row.get("image") or row.get("kind") or "service-listener"),
+                "status": str(row.get("status") or "unknown"),
+                "created": row.get("created"),
+                "listeners": [str(item)[:80] for item in row.get("listeners", [])[:12]] if isinstance(row.get("listeners"), list) else [],
+                "source": "systemgate-services",
+            } for row in service_rows if isinstance(row, dict)] or [{
+                "id": str(row.get("id") or ""),
+                "name": str(row.get("name") or ""),
                 "image": str(row.get("image") or ""),
                 "status": str(row.get("status") or "unknown"),
                 "created": row.get("created"),
+                "listeners": [],
+                "source": "systemgate-containers",
             } for row in container_rows if isinstance(row, dict)],
             "errors": [{
                 "at": str(row.get("at") or ""),
