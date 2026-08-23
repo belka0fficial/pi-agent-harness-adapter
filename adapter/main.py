@@ -75,6 +75,13 @@ class ToolPolicyInput(BaseModel):
     usage_limits: dict[str, int] = Field(default_factory=dict)
 
 
+class ToolEchoDrillInput(BaseModel):
+    agent_id: str = "agent_pi_operator"
+    team_id: str | None = None
+    value: str = Field(default="agentgate-safe-drill", max_length=120)
+    approval_request_id: str | None = None
+
+
 class ToolDraftInput(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     purpose: str = Field(default="", max_length=1200)
@@ -4804,6 +4811,100 @@ def agentgate_tool_health(tool_id: str, payload: dict[str, Any] | None = None):
         "execution_scope_allowed": execution_allowed,
         "required_scope": _toolgate_scope_for_tool_id(tool_id),
         "authorization": tool.get("authorization") or "auto",
+    }
+
+
+@app.post("/api/tools/approval.test-echo/drill")
+def agentgate_toolgate_echo_drill(payload: ToolEchoDrillInput):
+    tool_id = "approval.test-echo"
+    actor = _permission_context(payload.agent_id, payload.team_id)
+    if not _tool_allowed(tool_id, actor["tool_ids"]):
+        raise HTTPException(403, "approval.test-echo is not granted to the selected agent/team")
+    tool = next((row for row in app.state.gates.tools() if str(row.get("id") or "") == tool_id), None)
+    if not tool:
+        raise HTTPException(404, "approval.test-echo is not present in ToolGate")
+    value = _safe_text(payload.value, limit=120) or "agentgate-safe-drill"
+    execution_key = _ensure_toolgate_execution_key_for_actor(
+        actor["agent_id"],
+        actor.get("team_id"),
+        actor["tool_ids"],
+    )
+    try:
+        result = app.state.gates.invoke_tool(
+            tool_id,
+            args={"value": value},
+            execution_key=execution_key,
+            approval_request_id=_safe_text(payload.approval_request_id, limit=120) or None,
+        )
+    except (RuntimeError, AttributeError) as exc:
+        _record_activity(
+            actor["agent_id"],
+            event_type="tool.drill_failed",
+            status="failed",
+            source="ToolGate",
+            summary=f"Safe ToolGate drill failed: {_safe_error_summary(exc)}",
+            team_id=actor["team_id"],
+            ref_type="tool",
+            ref_id=tool_id,
+        )
+        raise HTTPException(409, "ToolGate drill could not complete; check approval state and exact action binding")
+    code = str(result.get("code") or "UNKNOWN")
+    if code == "CONFIRMATION_REQUIRED":
+        _record_activity(
+            actor["agent_id"],
+            event_type="tool.drill_approval_requested",
+            status="pending",
+            source="ToolGate",
+            summary="Safe ToolGate drill queued for owner approval",
+            team_id=actor["team_id"],
+            ref_type="tool",
+            ref_id=tool_id,
+        )
+        return {
+            "tool_id": tool_id,
+            "agent_id": actor["agent_id"],
+            "team_id": actor["team_id"],
+            "status": "pending_approval",
+            "request_id": _safe_text(result.get("request_id"), limit=120),
+            "expires_at": _safe_text(result.get("expires_at"), limit=80),
+            "result_summary": "Owner approval is required before ToolGate executes this harmless echo.",
+        }
+    if code == "OK":
+        _record_activity(
+            actor["agent_id"],
+            event_type="tool.drill_executed",
+            status="ok",
+            source="ToolGate",
+            summary="Safe ToolGate drill executed after approval",
+            team_id=actor["team_id"],
+            ref_type="tool",
+            ref_id=tool_id,
+        )
+        return {
+            "tool_id": tool_id,
+            "agent_id": actor["agent_id"],
+            "team_id": actor["team_id"],
+            "status": "executed",
+            "request_id": _safe_text(payload.approval_request_id, limit=120),
+            "result_summary": "ToolGate executed the approved harmless echo.",
+            "output_digest": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        }
+    _record_activity(
+        actor["agent_id"],
+        event_type="tool.drill_failed",
+        status="failed",
+        source="ToolGate",
+        summary=f"Safe ToolGate drill returned {code}",
+        team_id=actor["team_id"],
+        ref_type="tool",
+        ref_id=tool_id,
+    )
+    return {
+        "tool_id": tool_id,
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "status": "blocked",
+        "result_summary": _redact_audit_text(result.get("message") or code, limit=160),
     }
 
 

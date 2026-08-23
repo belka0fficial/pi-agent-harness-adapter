@@ -61,6 +61,17 @@ class FakeGates:
                 "authorization": "owner_confirmation",
                 "policy": {"usage_limits": {"max_per_minute": 1}},
             },
+            {
+                "id": "approval.test-echo",
+                "name": "Approval Test Echo",
+                "description": "Harmless owner-confirmation echo drill",
+                "status": "active",
+                "authorization": "owner_confirmation",
+                "inputs": [{"name": "value", "type": "string", "required": True}],
+                "outputs": [{"name": "result", "type": "object"}],
+                "execution": {"type": "local_echo"},
+                "policy": {"usage_limits": {"max_per_minute": 3}},
+            },
         ]
 
     def update_tool_policy(self, tool_id: str, *, authorization: str, usage_limits: dict[str, int]):
@@ -107,6 +118,35 @@ class FakeGates:
 
     def request_status(self, request_id: str):
         return getattr(self, "requests", {}).get(request_id)
+
+    def invoke_tool(self, tool_id: str, *, args: dict, execution_key: str, approval_request_id: str | None = None):
+        self.invoked_tool = {
+            "tool_id": tool_id,
+            "args": args,
+            "execution_key": execution_key,
+            "approval_request_id": approval_request_id,
+        }
+        if not approval_request_id:
+            request = self.create_admin_request(
+                kind="tool_verification",
+                title=f"Run {tool_id}",
+                details="Owner confirmation is required for this exact immutable tool invocation.",
+                payload={
+                    "subject_type": "tool",
+                    "subject_id": tool_id,
+                    "argument_digest": "fake-digest",
+                },
+                severity="warning",
+            )
+            return {
+                "code": "CONFIRMATION_REQUIRED",
+                "request_id": request["id"],
+                "expires_at": "2026-01-02T00:01:00+00:00",
+            }
+        request = self.request_status(approval_request_id)
+        if not request or request.get("status") != "approved":
+            raise RuntimeError("approval invalid")
+        return {"code": "OK", "message": "Tool completed", "result": {"result": args}}
 
     def memory_context(self, query: str, *, agent_id: str | None = None, team_id: str | None = None):
         self.memory_agent_id = agent_id
@@ -875,6 +915,55 @@ def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_p
     assert "danger.write" not in str(activity)
 
 
+def test_safe_toolgate_echo_drill_requires_grant_and_executes_after_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        denied = client.post(
+            "/api/tools/approval.test-echo/drill",
+            json={"agent_id": "agent_pi_operator", "team_id": "team_core"},
+        )
+        client.patch("/api/agents/agent_pi_operator", json={"tool_ids": ["approval.test-echo"]})
+        queued = client.post(
+            "/api/tools/approval.test-echo/drill",
+            json={
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "value": "safe proof token=abc123 https://private.example/path",
+            },
+        )
+        request_id = queued.json()["request_id"]
+        approved = client.post(f"/api/approvals/{request_id}/decision", json={"decision": "approved"})
+        executed = client.post(
+            "/api/tools/approval.test-echo/drill",
+            json={
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "value": "safe proof token=abc123 https://private.example/path",
+                "approval_request_id": request_id,
+            },
+        )
+        activity = client.get("/api/activity").json()["activity"]
+
+    assert denied.status_code == 403
+    assert queued.status_code == 200
+    assert queued.json()["status"] == "pending_approval"
+    assert queued.json()["request_id"]
+    assert approved.status_code == 200
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "executed"
+    assert executed.json()["output_digest"]
+    assert app.state.gates.invoked_tool["execution_key"] == "tgx_fake_private_key_agent_pi_operator@team_core_1234567890"
+    combined = json.dumps({"queued": queued.json(), "executed": executed.json(), "activity": activity}).lower()
+    for forbidden in ["token=abc123", "https://private.example", "safe proof"]:
+        assert forbidden not in combined
+    assert "tool.drill_approval_requested" in [item["event_type"] for item in activity]
+    assert "tool.drill_executed" in [item["event_type"] for item in activity]
+
+
 def test_tool_policy_update_is_limited_to_authorization_and_usage_limits(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
@@ -1307,7 +1396,7 @@ def test_agentgate_filters_tools_and_skills_by_agent_team_grants():
     assert tools.status_code == 200
     assert skills.status_code == 200
     assert tools.json()["scope"] == "agent-effective"
-    assert tools.json()["total"] == 2
+    assert tools.json()["total"] == 3
     assert tools.json()["visible"] == 1
     assert [tool["id"] for tool in tools.json()["tools"]] == ["echo"]
     assert [skill["id"] for skill in skills.json()["skills"]] == ["skill-1"]

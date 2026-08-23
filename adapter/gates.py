@@ -140,15 +140,29 @@ class GateClients:
             raise RuntimeError(f"{service} is unavailable") from exc
         return json.loads(body.decode("utf-8")) if body else {}
 
-    def _toolgate_execution_request(self, path: str, *, execution_key: str | None = None, timeout: float = 8):
+    def _toolgate_execution_request(
+        self,
+        path: str,
+        *,
+        execution_key: str | None = None,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        timeout: float = 8,
+    ):
         base_url = self.services["toolgate"][0]
         selected_key = execution_key if execution_key is not None else self.toolgate_execution_key
         if not selected_key:
             raise RuntimeError("toolgate execution key is unavailable")
+        headers = {"Accept": "application/json", "X-ToolGate-Execution-Key": selected_key}
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             f"{base_url}{path}",
-            headers={"Accept": "application/json", "X-ToolGate-Execution-Key": selected_key},
-            method="GET",
+            data=data,
+            headers=headers,
+            method=method,
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -631,6 +645,25 @@ class GateClients:
             "status": current.get("status") or "active",
         }
         result = self._request("toolgate", f"/v2/tools/{tool_id}", method="PUT", payload=payload)
+        return result if isinstance(result, dict) else {}
+
+    def invoke_tool(
+        self,
+        tool_id: str,
+        *,
+        args: dict[str, Any],
+        execution_key: str,
+        approval_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"args": args}
+        if approval_request_id:
+            payload["approval_request_id"] = approval_request_id
+        result = self._toolgate_execution_request(
+            f"/v2/tools/{tool_id}/invoke",
+            execution_key=execution_key,
+            method="POST",
+            payload=payload,
+        )
         return result if isinstance(result, dict) else {}
 
     def skills(self) -> list[dict[str, Any]]:
