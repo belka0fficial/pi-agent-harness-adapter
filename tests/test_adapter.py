@@ -87,6 +87,63 @@ def test_round_trip_chat_against_mocked_pi():
         assert messages[-1]["content"] == "hello world"
 
 
+def test_session_context_is_used_by_chat_stream_without_turn_override():
+    app.state.sessions = {}
+    app.state.messages = {}
+    app.state.agents = {}
+    app.state.teams = {}
+    main._ensure_registry_seeded()
+    app.state.agents["agent_pi_operator"]["memory_scopes"] = []
+    app.state.teams["team_core"]["memory_scopes"] = []
+    app.state.pi = FakePi()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/sessions",
+            json={
+                "title": "Core team room",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+            },
+        ).json()
+        session_id = created["id"]
+        with client.stream("POST", f"/api/sessions/{session_id}/chat/stream", json={"input": "team hello"}) as response:
+            response.read()
+        session = client.get(f"/api/sessions/{session_id}").json()
+
+    assert created["agent_id"] == "agent_pi_operator"
+    assert created["team_id"] == "team_core"
+    assert response.status_code == 200
+    assert session["agent_id"] == "agent_pi_operator"
+    assert session["team_id"] == "team_core"
+
+
+def test_session_context_update_validates_team_membership():
+    app.state.sessions = {}
+    app.state.messages = {}
+    app.state.agents = {}
+    app.state.teams = {}
+    main._ensure_registry_seeded()
+    with TestClient(app) as client:
+        app.state.teams["team_empty"] = {
+            "id": "team_empty",
+            "name": "Empty Team",
+            "purpose": "No members.",
+            "orchestrator_agent_id": "",
+            "member_agent_ids": [],
+            "memory_scopes": [],
+            "tool_ids": [],
+            "skill_ids": [],
+        }
+        created = client.post("/api/sessions", json={"title": "Scoped"}).json()
+        denied = client.patch(
+            f"/api/sessions/{created['id']}",
+            json={"agent_id": "agent_pi_operator", "team_id": "team_empty"},
+        )
+
+    assert denied.status_code == 403
+    assert "not a member" in denied.text
+
+
 def test_stop_endpoint_terminates_stream_and_session_remains_usable():
     async def scenario():
         app.state.sessions = {}

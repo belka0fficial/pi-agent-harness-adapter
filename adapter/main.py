@@ -26,7 +26,7 @@ from .pi_client import PiClient, PiEvent, event_to_sse
 
 class ChatInput(BaseModel):
     input: str = Field(min_length=1)
-    agent_id: str = "agent_pi_operator"
+    agent_id: str | None = None
     team_id: str | None = None
     provider: str | None = None
     model: str | None = None
@@ -517,8 +517,17 @@ def detailed_health():
 
 @app.post("/api/sessions")
 def create_session(payload: dict[str, Any]):
+    actor = _permission_context(payload.get("agent_id"), payload.get("team_id"))
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
-    item = {"id": session_id, "session_id": session_id, "title": payload.get("title") or "New chat", "created_at": now(), "updated_at": now()}
+    item = {
+        "id": session_id,
+        "session_id": session_id,
+        "title": payload.get("title") or "New chat",
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "created_at": now(),
+        "updated_at": now(),
+    }
     app.state.sessions[session_id] = item
     app.state.messages[session_id] = []
     return item
@@ -544,6 +553,10 @@ def update_session(session_id: str, payload: dict[str, Any]):
         raise HTTPException(404, "session not found")
     if isinstance(payload.get("title"), str) and payload["title"].strip():
         item["title"] = payload["title"].strip()
+    if "agent_id" in payload or "team_id" in payload:
+        actor = _permission_context(payload.get("agent_id") or item.get("agent_id"), payload.get("team_id") if "team_id" in payload else item.get("team_id"))
+        item["agent_id"] = actor["agent_id"]
+        item["team_id"] = actor["team_id"]
     item["updated_at"] = now()
     return item
 
@@ -855,6 +868,8 @@ async def fork_session(session_id: str, payload: dict[str, Any]):
         "id": new_session_id,
         "session_id": new_session_id,
         "title": payload.get("title") or f"Fork of {source.get('title') or session_id}",
+        "agent_id": source.get("agent_id") or "agent_pi_operator",
+        "team_id": source.get("team_id"),
         "created_at": now(),
         "updated_at": now(),
         "parent_session_id": session_id,
@@ -867,7 +882,10 @@ async def fork_session(session_id: str, payload: dict[str, Any]):
 
 @app.post("/api/sessions/{session_id}/chat/stream")
 async def chat_stream(session_id: str, payload: ChatInput, request: Request):
-    actor = _permission_context(payload.agent_id, payload.team_id)
+    session = app.state.sessions.get(session_id, {})
+    requested_agent_id = payload.agent_id or session.get("agent_id") or "agent_pi_operator"
+    requested_team_id = payload.team_id if payload.team_id is not None else session.get("team_id")
+    actor = _permission_context(requested_agent_id, requested_team_id)
     if payload.memory_enabled and not actor["memory_scopes"]:
         raise HTTPException(403, "agent has no MemoryGate scopes")
     if session_id not in app.state.sessions:
