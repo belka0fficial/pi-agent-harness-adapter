@@ -1485,6 +1485,55 @@ def test_group_round_runs_each_roster_speaker_once(monkeypatch, tmp_path):
     assert "Everyone give one short view" not in str(activity)
 
 
+def test_group_round_stream_emits_live_speaker_events(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = MultiSpeakerPi()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={"name": "Group Teammate", "purpose": "Participate in live group rounds."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Group Stream Team",
+                "purpose": "Test live group round events.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Group Stream",
+                "agent_id": "agent_pi_operator",
+                "team_id": team["id"],
+                "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        with client.stream(
+            "POST",
+            f"/api/sessions/{session['id']}/group-round/stream",
+            json={"input": "Live safe group update."},
+        ) as response:
+            body = "".join(response.iter_text())
+        messages = client.get(f"/api/chats/{session['id']}/messages").json()["messages"]
+
+    assert response.status_code == 200
+    assert "event: group.round.started" in body
+    assert body.count("event: group.speaker.started") == 2
+    assert body.count("event: message.delta") == 2
+    assert body.count("event: group.speaker.completed") == 2
+    assert "event: group.round.completed" in body
+    assert "operator response" in body
+    assert "teammate response" in body
+    assert "Live safe group update" not in body
+    assert [message["role"] for message in messages] == ["owner", "agent", "agent"]
+
+
 def test_tool_draft_artifacts_are_metadata_only(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
