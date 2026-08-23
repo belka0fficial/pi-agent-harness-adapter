@@ -738,8 +738,37 @@ async def run_job(job_id: str):
     item = app.state.jobs.get(job_id)
     if not item:
         return
-    actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
-    _validate_job_requirements(actor, item.get("required_tool_ids"), item.get("required_memory_scopes"))
+    try:
+        actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
+        _validate_job_requirements(actor, item.get("required_tool_ids"), item.get("required_memory_scopes"))
+    except HTTPException as exc:
+        item["last_run_at"] = now()
+        result = {
+            "job_id": job_id,
+            "status": "blocked",
+            "output_summary": "Requirement check blocked before execution",
+            "output_chars": 0,
+            "error": str(exc.detail),
+            "completed_at": now(),
+        }
+        item["last_result"] = result
+        item["paused"] = True
+        item["next_run_at"] = None
+        item["quarantine_reason"] = "paused after missing required grants"
+        _append_job_run_history(item, result)
+        _sync_scheduler(job_id)
+        _save_registry_item("job", item)
+        _record_activity(
+            item.get("agent_id"),
+            event_type="job.blocked",
+            status="blocked",
+            source="Pi adapter",
+            summary=f"Automation job blocked before execution: {item.get('name') or job_id}",
+            team_id=item.get("team_id"),
+            ref_type="job",
+            ref_id=job_id,
+        )
+        return
     item["last_run_at"] = now()
     _record_activity(
         item.get("agent_id"),

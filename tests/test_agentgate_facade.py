@@ -538,6 +538,12 @@ class FailingJobPi:
         yield PiEvent("run.failed", {"message": "simulated failure"})
 
 
+class BlockedJobPi:
+    async def stream(self, prompt: str, *, session_id: str, options=None):
+        raise AssertionError("Pi should not run when job requirements are missing")
+        yield
+
+
 def test_chat_retrieves_memorygate_context_and_records_completed_transcript():
     reset_state()
     pi = CapturingPi()
@@ -762,6 +768,45 @@ def test_automation_pauses_after_three_failures():
     assert ran["failure_count"] == 3
     assert ran["paused"] is True
     assert "3 consecutive" in ran["quarantine_reason"]
+
+
+def test_automation_run_blocks_cleanly_when_requirements_are_revoked(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = BlockedJobPi()
+
+    with TestClient(app) as client:
+        client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["echo"], "memory_scopes": ["briefing"]},
+        )
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Revoked Requirement",
+                "schedule": "0 9 * * *",
+                "prompt": "should not reach pi",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "required_tool_ids": ["echo"],
+                "required_memory_scopes": ["briefing"],
+            },
+        ).json()
+        client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": [], "memory_scopes": []},
+        )
+        ran = client.post(f"/api/jobs/{created['id']}/run")
+
+    assert ran.status_code == 200
+    body = ran.json()
+    assert body["paused"] is True
+    assert body["quarantine_reason"] == "paused after missing required grants"
+    assert body["last_result"]["status"] == "blocked"
+    assert body["last_result"]["output_chars"] == 0
+    assert body["run_history"][0]["status"] == "blocked"
+    assert "echo" in body["last_result"]["error"]
 
 
 def test_chat_memory_disabled_skips_context_and_transcript_ingest():
