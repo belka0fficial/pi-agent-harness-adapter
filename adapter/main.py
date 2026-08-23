@@ -982,6 +982,187 @@ def _audit_timeline(limit: int = 60) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
+def _workstream_kind(event_type: str, ref_type: str | None = None) -> str:
+    value = (event_type or ref_type or "").lower()
+    if value.startswith("approval"):
+        return "approval"
+    if "memory" in value:
+        return "memory"
+    if "job" in value or "automation" in value:
+        return "automation"
+    if "tool" in value:
+        return "tool"
+    if "task" in value:
+        return "task"
+    if "chat" in value or "session" in value:
+        return "chat"
+    return "activity"
+
+
+def _workstream_event(
+    *,
+    event_id: str,
+    time: Any,
+    kind: str,
+    status: Any,
+    source: Any,
+    summary: Any,
+    risk: Any = "low",
+    agent_id: Any = None,
+    team_id: Any = None,
+    ref_type: Any = None,
+    ref_id: Any = None,
+) -> dict[str, Any]:
+    risk_text = str(risk or "low").strip().lower()
+    if risk_text not in {"low", "medium", "high"}:
+        risk_text = "low"
+    return {
+        "id": _safe_summary(event_id, limit=160),
+        "time": str(time or ""),
+        "kind": _safe_summary(kind or "activity", limit=40),
+        "status": _safe_summary(status or "unknown", limit=60),
+        "risk": risk_text,
+        "source": _safe_summary(source or "AgentGate", limit=80),
+        "summary": _redact_audit_text(summary or "No summary recorded", limit=180),
+        "agent_id": _safe_summary(agent_id or "", limit=120) or None,
+        "team_id": _safe_summary(team_id or "", limit=120) or None,
+        "ref_type": _safe_summary(ref_type or "", limit=80) or None,
+        "ref_id": _safe_summary(ref_id or "", limit=120) or None,
+    }
+
+
+def _workstream_from_audit(row: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(row.get("event_type") or "activity")
+    return _workstream_event(
+        event_id=f"audit:{row.get('id')}",
+        time=row.get("time"),
+        kind=_workstream_kind(event_type, row.get("ref_type")),
+        status=row.get("status"),
+        risk=row.get("risk") or "low",
+        source=row.get("source") or "AgentGate",
+        summary=row.get("action_summary") or event_type,
+        agent_id=row.get("agent_id"),
+        team_id=row.get("team_id"),
+        ref_type=row.get("ref_type"),
+        ref_id=row.get("ref_id"),
+    )
+
+
+def _object_workstream_events() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in app.state.sessions.values():
+        session_id = item.get("id") or item.get("session_id")
+        if not session_id:
+            continue
+        messages = app.state.messages.get(session_id, [])
+        rows.append(_workstream_event(
+            event_id=f"session:{session_id}",
+            time=item.get("updated_at") or item.get("created_at"),
+            kind="chat",
+            status=item.get("mode") or ("group" if len(item.get("participant_agent_ids") or []) > 1 else "direct"),
+            source="AgentGate",
+            summary=(
+                f"Chat session: {item.get('title') or session_id} · "
+                f"{len(messages)} message{'s' if len(messages) != 1 else ''}"
+            ),
+            agent_id=item.get("agent_id"),
+            team_id=item.get("team_id"),
+            ref_type="session",
+            ref_id=session_id,
+        ))
+    for item in app.state.jobs.values():
+        public = _public_job(item)
+        job_id = public.get("id") or public.get("job_id")
+        rows.append(_workstream_event(
+            event_id=f"job:{job_id}",
+            time=public.get("updated_at") or public.get("last_run") or public.get("created_at"),
+            kind="automation",
+            status=public.get("status"),
+            source="AgentGate",
+            summary=(
+                f"Automation: {public.get('name') or job_id} · "
+                f"last {public.get('last_status') or 'never'} · {public.get('runs') or 0} runs"
+            ),
+            agent_id=public.get("agent_id"),
+            team_id=public.get("team_id"),
+            ref_type="job",
+            ref_id=job_id,
+        ))
+    for item in app.state.tasks.values():
+        rows.append(_workstream_event(
+            event_id=f"task:{item.get('id')}",
+            time=item.get("updated_at") or item.get("created_at"),
+            kind="task",
+            status=item.get("status") or "queued",
+            risk=item.get("risk") or "low",
+            source=item.get("source") or "AgentGate",
+            summary=f"Delegated task: {item.get('title') or item.get('id')} · {item.get('status') or 'queued'}",
+            agent_id=item.get("agent_id"),
+            team_id=item.get("team_id"),
+            ref_type="task",
+            ref_id=item.get("id"),
+        ))
+    for item in app.state.tool_drafts.values():
+        rows.append(_workstream_event(
+            event_id=f"tool_draft:{item.get('id')}",
+            time=item.get("updated_at") or item.get("created_at"),
+            kind="tool",
+            status=item.get("status") or item.get("review_state") or "draft",
+            risk=item.get("risk") or "medium",
+            source="AgentGate",
+            summary=f"Tool draft: {item.get('proposed_tool_id') or item.get('id')} · {item.get('review_state') or 'needs owner review'}",
+            ref_type="tool_draft",
+            ref_id=item.get("id"),
+        ))
+    for item in getattr(app.state, "memory_candidates", {}).values():
+        rows.append(_workstream_event(
+            event_id=f"memory_candidate:{item.get('id')}",
+            time=item.get("updated_at") or item.get("created_at"),
+            kind="memory",
+            status=item.get("status") or "pending",
+            source="MemoryGate" if item.get("status") == "approved" else "AgentGate",
+            summary=(
+                f"Memory candidate: {item.get('memory_type') or 'context'} · "
+                f"{item.get('confidence') or 'medium'} confidence"
+            ),
+            ref_type="memory_candidate",
+            ref_id=item.get("id"),
+        ))
+    return rows
+
+
+def _workstream(limit: int = 60) -> dict[str, Any]:
+    limit = min(max(limit, 1), 100)
+    seen: set[str] = set()
+    events: list[dict[str, Any]] = []
+    for row in [*[_workstream_from_audit(item) for item in _audit_timeline(limit=limit)], *_object_workstream_events()]:
+        event_id = str(row.get("id") or "")
+        if not event_id or event_id in seen:
+            continue
+        seen.add(event_id)
+        events.append(row)
+    events.sort(key=lambda item: _audit_time(item.get("time")), reverse=True)
+    events = events[:limit]
+    counts = {
+        "total": len(events),
+        "by_kind": {},
+        "by_status": {},
+    }
+    for item in events:
+        kind = str(item.get("kind") or "activity")
+        status = str(item.get("status") or "unknown")
+        counts["by_kind"][kind] = counts["by_kind"].get(kind, 0) + 1
+        counts["by_status"][status] = counts["by_status"].get(status, 0) + 1
+    return {
+        "events": events,
+        "counts": counts,
+        "safety": {
+            "mode": "metadata_only",
+            "redacted_fields": ["prompts", "memory_contents", "tool_arguments", "credentials"],
+        },
+    }
+
+
 def _ensure_registry_seeded() -> None:
     if not app.state.agents:
         app.state.agents["agent_pi_operator"] = {
@@ -4066,6 +4247,11 @@ def agentgate_activity(
 @app.get("/api/audit")
 def agentgate_audit(limit: int = 60):
     return {"events": _audit_timeline(limit=limit)}
+
+
+@app.get("/api/workstream")
+def agentgate_workstream(limit: int = 60):
+    return _workstream(limit=limit)
 
 
 @app.get("/api/system")

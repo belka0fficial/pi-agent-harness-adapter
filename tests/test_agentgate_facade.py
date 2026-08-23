@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from fastapi.testclient import TestClient
 
 from adapter import main
@@ -1594,6 +1596,86 @@ def test_audit_timeline_merges_redacted_approvals_and_activity(monkeypatch, tmp_
     assert any(item["event_type"] == "approval.pending" for item in audit)
     assert any(item["event_type"] == "approval.decided" for item in audit)
     assert any(item["event_type"] == "tool.arguments" for item in audit)
+
+
+def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+
+    with TestClient(app) as client:
+        chat = client.post(
+            "/api/sessions/sess-workstream/chat/stream",
+            json={"input": "private prompt token=chat-secret https://chat.example/path"},
+        )
+        assert chat.status_code == 200
+        job = client.post(
+            "/api/jobs",
+            json={
+                "name": "Morning proof",
+                "schedule": "0 8 * * *",
+                "prompt": "job secret token=job-secret https://job.example/path",
+            },
+        )
+        assert job.status_code == 200
+        task = client.post(
+            "/api/tasks",
+            json={
+                "title": "Safe task title",
+                "summary": "task secret token=task-secret https://task.example/path",
+            },
+        )
+        assert task.status_code == 200
+        draft = client.post(
+            "/api/tool-drafts",
+            json={
+                "title": "Debug helper",
+                "purpose": "tool secret token=tool-secret https://tool.example/path",
+                "proposed_tool_id": "debug.helper",
+                "risk": "high",
+            },
+        )
+        assert draft.status_code == 200
+        memory = client.post(
+            "/api/memory/candidates",
+            json={
+                "text": "memory secret token=memory-secret https://memory.example/path",
+                "session_id": "sess-1",
+                "source_message_id": "a1",
+                "memory_type": "preference",
+                "confidence": "high",
+                "candidate_id": "memcand_workstream",
+            },
+        )
+        assert memory.status_code == 200
+        response = client.get("/api/workstream?limit=50")
+
+    assert response.status_code == 200
+    body = response.json()
+    events = body["events"]
+    kinds = {item["kind"] for item in events}
+    assert {"chat", "automation", "task", "tool", "memory", "approval"} <= kinds
+    assert body["counts"]["total"] == len(events)
+    assert body["safety"]["mode"] == "metadata_only"
+    joined = json.dumps(body).lower()
+    for forbidden in [
+        "chat-secret",
+        "job-secret",
+        "task-secret",
+        "tool-secret",
+        "memory-secret",
+        "https://chat.example",
+        "https://job.example",
+        "https://task.example",
+        "https://tool.example",
+        "https://memory.example",
+        "private prompt",
+        "job secret",
+        "memory secret",
+        "tool secret",
+    ]:
+        assert forbidden not in joined
 
 
 def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
