@@ -103,12 +103,20 @@ class FakeGates:
     def request_status(self, request_id: str):
         return getattr(self, "requests", {}).get(request_id)
 
-    def memory_context(self, query: str, *, agent_id: str | None = None):
+    def memory_context(self, query: str, *, agent_id: str | None = None, team_id: str | None = None):
         self.memory_agent_id = agent_id
+        self.memory_team_id = team_id
+        self.memory_actor_id = self._memory_store_id(agent_id, team_id)
         return {"memories": [{"text": "Owner prefers concise answers", "confidence": "high"}], "entities": []}
 
-    def record_transcript(self, session_id: str, messages: list[dict], *, agent_id: str | None = None):
-        self.recorded = {"session_id": session_id, "messages": messages, "agent_id": agent_id}
+    def record_transcript(self, session_id: str, messages: list[dict], *, agent_id: str | None = None, team_id: str | None = None):
+        self.recorded = {
+            "session_id": session_id,
+            "messages": messages,
+            "agent_id": agent_id,
+            "team_id": team_id,
+            "memory_actor_id": self._memory_store_id(agent_id, team_id),
+        }
         return {"status": "ok"}
 
     def write_memory_candidate(self, candidate: dict):
@@ -178,16 +186,40 @@ class FakeGates:
     def memorygate_agent_keys(self):
         return getattr(self, "memorygate_keys", [])
 
-    def ensure_memorygate_agent_read_key(self, agent_id: str):
-        self.ensured_memorygate_agent_id = agent_id
+    @staticmethod
+    def _memory_store_id(agent_id: str | None, team_id: str | None = None) -> str:
+        if not agent_id:
+            return ""
+        return f"{agent_id}@{team_id}" if team_id else agent_id
+
+    def ensure_memorygate_agent_read_key(self, agent_id: str, team_id: str | None = None):
+        store_id = self._memory_store_id(agent_id, team_id)
+        self.ensured_memorygate_agent_id = store_id
         self.memorygate_private_keys = {
             *getattr(self, "memorygate_private_keys", set()),
-            agent_id,
+            store_id,
         }
-        return {"status": "cached", "agent_id": agent_id}
+        self.memorygate_keys = [
+            row for row in getattr(self, "memorygate_keys", []) if row.get("label") != f"AgentGate:{store_id}"
+        ] + [{"id": f"mg-{store_id}", "label": f"AgentGate:{store_id}", "agent_id": store_id, "revoked": False}]
+        return {"status": "cached", "agent_id": agent_id, "team_id": team_id or "", "memory_actor_id": store_id}
 
-    def has_memorygate_agent_read_key(self, agent_id: str):
-        return agent_id in getattr(self, "memorygate_private_keys", {"agent_pi_operator"})
+    def has_memorygate_agent_read_key(self, agent_id: str, team_id: str | None = None):
+        return self._memory_store_id(agent_id, team_id) in getattr(self, "memorygate_private_keys", {"agent_pi_operator"})
+
+    def forget_memorygate_agent_read_key(self, agent_id: str, team_id: str | None = None):
+        store_id = self._memory_store_id(agent_id, team_id)
+        self.memorygate_private_keys = {
+            item for item in getattr(self, "memorygate_private_keys", set()) if item != store_id
+        }
+
+    def forget_memorygate_agent_read_keys_for_agent(self, agent_id: str):
+        prefix = f"{agent_id}@"
+        self.memorygate_private_keys = {
+            item
+            for item in getattr(self, "memorygate_private_keys", set())
+            if item != agent_id and not item.startswith(prefix)
+        }
 
 
 def reset_state():
@@ -470,8 +502,14 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
             "agent_id": "agent_pi_operator",
             "revoked": False,
         },
+        {
+            "id": "mg-ready-team",
+            "label": "AgentGate:agent_pi_operator@team_core",
+            "agent_id": "agent_pi_operator@team_core",
+            "revoked": False,
+        },
     ]
-    app.state.gates.memorygate_private_keys = {"agent_pi_operator"}
+    app.state.gates.memorygate_private_keys = {"agent_pi_operator", "agent_pi_operator@team_core"}
 
     with TestClient(app) as client:
         client.patch(
@@ -507,6 +545,14 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
     assert boundaries["summary"]["toolgate_contexts"] >= 2
     assert {row["team_id"] for row in ready_contexts} >= {None, "team_core"}
     assert all(row["status"] == "ready" for row in ready_contexts)
+    ready_memory_contexts = [
+        row
+        for row in boundaries["memorygate_contexts"]
+        if row["agent_id"] == "agent_pi_operator"
+    ]
+    assert boundaries["summary"]["memorygate_contexts"] >= 2
+    assert {row["team_id"] for row in ready_memory_contexts} >= {None, "team_core"}
+    assert all(row["status"] == "ready" for row in ready_memory_contexts)
     assert missing["status"] == "drift"
     assert missing["toolgate_key_status"] == "ready"
     assert missing["toolgate_adapter_credential_status"] == "ready"
@@ -531,7 +577,7 @@ def test_memorygate_boundary_requires_adapter_read_credential(monkeypatch, tmp_p
     ]
     app.state.gates.memorygate_private_keys = set()
 
-    def fail_bootstrap(agent_id: str):
+    def fail_bootstrap(agent_id: str, team_id: str | None = None):
         raise RuntimeError("native key exists but raw read credential is not recoverable")
 
     app.state.gates.ensure_memorygate_agent_read_key = fail_bootstrap
@@ -549,7 +595,13 @@ def test_memorygate_boundary_requires_adapter_read_credential(monkeypatch, tmp_p
     assert row["status"] == "drift"
     assert row["memorygate_key_count"] == 1
     assert row["memorygate_adapter_credential_status"] == "missing"
-    assert "adapter MemoryGate read credential unavailable" in row["issues"]
+    assert "one or more MemoryGate team contexts are not ready" in row["issues"]
+    context_issues = [
+        issue
+        for context in system["access_boundaries"]["memorygate_contexts"]
+        for issue in context.get("issues", [])
+    ]
+    assert "adapter MemoryGate read credential unavailable" in context_issues
     assert response.status_code == 503
     assert "mg_" + "read_" not in str(system)
 
@@ -579,12 +631,63 @@ def test_gate_client_bootstraps_agent_memory_key_privately(monkeypatch, tmp_path
     gates = RecordingGateClients()
     result = gates.ensure_memorygate_agent_read_key("agent_alpha")
 
-    assert result == {"status": "created", "agent_id": "agent_alpha", "memorygate_key_id": "mg-agent-a"}
+    assert result == {
+        "status": "created",
+        "agent_id": "agent_alpha",
+        "team_id": "",
+        "memory_actor_id": "agent_alpha",
+        "memorygate_key_id": "mg-agent-a",
+    }
     assert gates.created_payloads == [{"label": "AgentGate:agent_alpha", "agent_id": "agent_alpha"}]
     assert gates.has_memorygate_agent_read_key("agent_alpha")
     assert gates.memorygate_agent_read_key("agent_alpha").startswith("mg_" + "read_")
     assert gates.agent_memory_key_path.exists()
     assert oct(gates.agent_memory_key_path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_gate_client_scopes_agent_memorygate_keys_by_team(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADAPTER_DATA_DIR", str(tmp_path))
+
+    class RecordingGateClients(GateClients):
+        def __init__(self):
+            super().__init__()
+            self.created_payloads = []
+
+        def _request(self, service: str, path: str, *, method: str = "GET", payload=None, timeout: float = 8):
+            read_prefix = "mg_" + "read_"
+            if service == "memorygate" and path == "/auth/agent-keys" and method == "GET":
+                return {"results": []}
+            if service == "memorygate" and path == "/auth/agent-keys" and method == "POST":
+                self.created_payloads.append(payload)
+                return {
+                    "id": f"mg-{payload['agent_id']}",
+                    "label": payload["label"],
+                    "agent_id": payload["agent_id"],
+                    "key": f"{read_prefix}test_private_key_{payload['agent_id']}_1234567890",
+                }
+            raise AssertionError(f"unexpected request {service} {method} {path}")
+
+    gates = RecordingGateClients()
+    direct = gates.ensure_memorygate_agent_read_key("agent_alpha")
+    team = gates.ensure_memorygate_agent_read_key("agent_alpha", team_id="team_core")
+
+    assert direct["memory_actor_id"] == "agent_alpha"
+    assert team["memory_actor_id"] == "agent_alpha@team_core"
+    assert gates.created_payloads == [
+        {"label": "AgentGate:agent_alpha", "agent_id": "agent_alpha"},
+        {"label": "AgentGate:agent_alpha@team_core", "agent_id": "agent_alpha@team_core"},
+    ]
+    assert gates.memorygate_agent_read_key("agent_alpha") != gates.memorygate_agent_read_key(
+        "agent_alpha",
+        team_id="team_core",
+    )
+    assert gates.has_memorygate_agent_read_key("agent_alpha")
+    assert gates.has_memorygate_agent_read_key("agent_alpha", team_id="team_core")
+
+    gates.forget_memorygate_agent_read_keys_for_agent("agent_alpha")
+
+    assert not gates.has_memorygate_agent_read_key("agent_alpha")
+    assert not gates.has_memorygate_agent_read_key("agent_alpha", team_id="team_core")
 
 
 def test_gate_client_bootstraps_agent_toolgate_key_privately(monkeypatch, tmp_path):
@@ -1178,6 +1281,40 @@ def test_chat_retrieves_memorygate_context_and_records_completed_transcript():
     assert app.state.gates.recorded["agent_id"] == "agent_pi_operator"
     assert app.state.gates.memory_agent_id == "agent_pi_operator"
     assert app.state.gates.recorded["messages"][-1]["content"] == "context-aware"
+
+
+def test_chat_uses_team_scoped_memorygate_actor_for_context_and_transcript():
+    reset_state()
+    pi = CapturingPi()
+    app.state.pi = pi
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Memory Team",
+                "purpose": "Team-scoped memory probe.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator"],
+                "memory_scopes": ["team-journal"],
+                "tool_ids": [],
+                "skill_ids": [],
+            },
+        ).json()
+        response = client.post(
+            "/api/sessions/sess-1/chat/stream",
+            json={"input": "What does the team remember?", "team_id": team["id"], "memory_enabled": True},
+        )
+
+    assert response.status_code == 200
+    assert app.state.gates.ensured_memorygate_agent_id == f"agent_pi_operator@{team['id']}"
+    assert app.state.gates.memory_agent_id == "agent_pi_operator"
+    assert app.state.gates.memory_team_id == team["id"]
+    assert app.state.gates.memory_actor_id == f"agent_pi_operator@{team['id']}"
+    assert app.state.gates.recorded["agent_id"] == "agent_pi_operator"
+    assert app.state.gates.recorded["team_id"] == team["id"]
+    assert app.state.gates.recorded["memory_actor_id"] == f"agent_pi_operator@{team['id']}"
 
 
 def test_chat_uses_selected_agent_model_defaults_when_payload_omits_model():

@@ -160,26 +160,41 @@ class GateClients:
             raise RuntimeError("toolgate is unavailable") from exc
         return json.loads(body.decode("utf-8")) if body else {}
 
+    @staticmethod
+    def _memory_actor_store_id(agent_id: str | None, team_id: str | None = None) -> str:
+        if not agent_id:
+            return ""
+        clean_agent = str(agent_id).strip()
+        clean_team = str(team_id or "").strip()
+        return f"{clean_agent}@{clean_team}" if clean_team else clean_agent
+
+    @staticmethod
+    def _memory_actor_label(agent_id: str, team_id: str | None = None) -> str:
+        store_id = GateClients._memory_actor_store_id(agent_id, team_id)
+        return f"AgentGate:{store_id}" if store_id else "AgentGate"
+
     def _memory_read_request(
         self,
         path: str,
         *,
         agent_id: str | None,
+        team_id: str | None = None,
         method: str = "GET",
         payload: dict[str, Any] | None = None,
         timeout: float = 8,
     ):
         base_url = self.services["memorygate"][0]
-        read_key = self.memorygate_agent_read_key(agent_id) if agent_id else ""
-        if not read_key and agent_id == "agent_pi_operator":
+        memory_actor_id = self._memory_actor_store_id(agent_id, team_id)
+        read_key = self.memorygate_agent_read_key(agent_id, team_id=team_id) if memory_actor_id else ""
+        if not read_key and memory_actor_id == "agent_pi_operator":
             read_key = os.environ.get("MEMORYGATE_READ_KEY", "")
-        if agent_id and not read_key:
+        if memory_actor_id and not read_key:
             raise RuntimeError("memorygate read key is unavailable for agent")
         if not read_key:
             return self._request("memorygate", path, method=method, payload=payload, timeout=timeout)
         headers = {"Accept": "application/json", "X-MemoryGate-Key": read_key}
-        if agent_id:
-            headers["X-Agent-Id"] = agent_id
+        if memory_actor_id:
+            headers["X-Agent-Id"] = memory_actor_id
         data = None
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
@@ -335,33 +350,47 @@ class GateClients:
             "toolgate_key_id": str(record.get("id") or ""),
         }
 
-    def memorygate_agent_read_key(self, agent_id: str | None) -> str:
-        if not agent_id:
+    def memorygate_agent_read_key(self, agent_id: str | None, team_id: str | None = None) -> str:
+        store_id = self._memory_actor_store_id(agent_id, team_id)
+        if not store_id:
             return ""
-        item = self._load_agent_memory_keys().get(agent_id)
+        item = self._load_agent_memory_keys().get(store_id)
         return str((item or {}).get("key") or "")
 
-    def has_memorygate_agent_read_key(self, agent_id: str) -> bool:
-        return bool(self.memorygate_agent_read_key(agent_id))
+    def has_memorygate_agent_read_key(self, agent_id: str, team_id: str | None = None) -> bool:
+        return bool(self.memorygate_agent_read_key(agent_id, team_id=team_id))
 
-    def forget_memorygate_agent_read_key(self, agent_id: str) -> None:
+    def forget_memorygate_agent_read_key(self, agent_id: str, team_id: str | None = None) -> None:
         store = self._load_agent_memory_keys()
-        if agent_id not in store:
+        store_id = self._memory_actor_store_id(agent_id, team_id)
+        if store_id not in store:
             return
-        store.pop(agent_id, None)
+        store.pop(store_id, None)
         self._save_agent_memory_keys(store)
 
-    def ensure_memorygate_agent_read_key(self, agent_id: str) -> dict[str, Any]:
+    def forget_memorygate_agent_read_keys_for_agent(self, agent_id: str) -> None:
+        prefix = f"{str(agent_id).strip()}@"
+        store = self._load_agent_memory_keys()
+        next_store = {
+            key: value
+            for key, value in store.items()
+            if key != agent_id and not str(key).startswith(prefix)
+        }
+        if next_store != store:
+            self._save_agent_memory_keys(next_store)
+
+    def ensure_memorygate_agent_read_key(self, agent_id: str, team_id: str | None = None) -> dict[str, Any]:
         agent_id = str(agent_id or "").strip()
         if not agent_id:
             raise RuntimeError("agent id is required")
-        cached = self.memorygate_agent_read_key(agent_id)
+        store_id = self._memory_actor_store_id(agent_id, team_id)
+        cached = self.memorygate_agent_read_key(agent_id, team_id=team_id)
         if cached:
-            return {"status": "cached", "agent_id": agent_id}
-        label = f"AgentGate:{agent_id}"
+            return {"status": "cached", "agent_id": agent_id, "team_id": str(team_id or "")}
+        label = self._memory_actor_label(agent_id, team_id)
         keys = self.memorygate_agent_keys()
         if any(
-            str(row.get("agent_id") or "") == agent_id
+            str(row.get("agent_id") or "") == store_id
             and str(row.get("label") or "").strip().lower() == label.lower()
             and not bool(row.get("revoked"))
             for row in keys
@@ -371,15 +400,18 @@ class GateClients:
             "memorygate",
             "/auth/agent-keys",
             method="POST",
-            payload={"label": label, "agent_id": agent_id},
+            payload={"label": label, "agent_id": store_id},
         )
         raw_key = str((created or {}).get("key") or "")
         if not raw_key.startswith("mg_read_"):
             raise RuntimeError("memorygate did not return a read key")
         store = self._load_agent_memory_keys()
-        store[agent_id] = {
+        store[store_id] = {
             "key": raw_key,
             "label": label,
+            "agent_id": agent_id,
+            "team_id": str(team_id or ""),
+            "memory_actor_id": store_id,
             "memorygate_key_id": str(created.get("id") or ""),
             "created_at": datetime.now(UTC).isoformat(),
         }
@@ -387,6 +419,8 @@ class GateClients:
         return {
             "status": "created",
             "agent_id": agent_id,
+            "team_id": str(team_id or ""),
+            "memory_actor_id": store_id,
             "memorygate_key_id": str(created.get("id") or ""),
         }
 
@@ -515,18 +549,21 @@ class GateClients:
             "window_hours": int(payload.get("window_hours") or hours),
         }
 
-    def memory_context(self, query: str, *, agent_id: str | None = None) -> dict[str, Any]:
+    def memory_context(self, query: str, *, agent_id: str | None = None, team_id: str | None = None) -> dict[str, Any]:
         self.memory_counts["reads"] += 1
+        memory_actor_id = self._memory_actor_store_id(agent_id, team_id)
         payload = self._memory_read_request(
             "/runtime/context",
             method="POST",
-            payload={"query": query, "max_items": 10, "include_evidence": False, "agent_id": agent_id},
+            payload={"query": query, "max_items": 10, "include_evidence": False, "agent_id": memory_actor_id or agent_id},
             agent_id=agent_id,
+            team_id=team_id,
         )
         return payload if isinstance(payload, dict) else {}
 
-    def record_transcript(self, session_id: str, messages: list[dict[str, Any]], *, agent_id: str | None = None):
+    def record_transcript(self, session_id: str, messages: list[dict[str, Any]], *, agent_id: str | None = None, team_id: str | None = None):
         self.memory_counts["writes"] += 1
+        memory_actor_id = self._memory_actor_store_id(agent_id, team_id)
         transcript = "\n\n".join(
             f"{str(message.get('role') or 'unknown').upper()}: {str(message.get('content') or '')}"
             for message in messages
@@ -535,7 +572,7 @@ class GateClients:
             "memorygate",
             "/transcripts",
             method="POST",
-            payload={"session_id": session_id, "transcript": transcript, "agent_id": agent_id},
+            payload={"session_id": session_id, "transcript": transcript, "agent_id": memory_actor_id or agent_id},
         )
 
     def write_memory_candidate(self, candidate: dict[str, Any]):
