@@ -1237,6 +1237,133 @@ def _workstream(limit: int = 60) -> dict[str, Any]:
     }
 
 
+def _safe_session_detail(session_id: str) -> dict[str, Any]:
+    item = app.state.sessions.get(session_id)
+    if not item:
+        raise HTTPException(404, "workstream reference not found")
+    public = _public_session(item)
+    return {
+        "id": public.get("id") or session_id,
+        "title": _redact_audit_text(public.get("title") or "Chat session", limit=160),
+        "mode": public.get("mode"),
+        "agent_id": public.get("agent_id"),
+        "team_id": public.get("team_id"),
+        "participant_count": len(public.get("participant_agent_ids") or []),
+        "message_count": len(app.state.messages.get(session_id, [])),
+        "current_speaker_id": public.get("current_speaker_id"),
+        "created_at": public.get("created_at"),
+        "updated_at": public.get("updated_at"),
+    }
+
+
+def _safe_memory_candidate_detail(candidate_id: str) -> dict[str, Any]:
+    item = getattr(app.state, "memory_candidates", {}).get(candidate_id)
+    if not item:
+        raise HTTPException(404, "workstream reference not found")
+    evidence = item.get("evidence") if isinstance(item.get("evidence"), dict) else {}
+    return {
+        "id": item.get("id"),
+        "status": item.get("status") or "pending",
+        "memory_type": item.get("memory_type") or "context",
+        "confidence": item.get("confidence") or "medium",
+        "tag_count": len(item.get("tags") or []),
+        "source_session_id": evidence.get("session_id") or item.get("session_id"),
+        "source_message_id": evidence.get("source_message_id") or item.get("source_message_id"),
+        "source_role": evidence.get("source_role") or item.get("source_role") or "selected",
+        "memory_result_id": item.get("memory_result_id"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
+    clean_type = _safe_summary(ref_type, limit=80)
+    clean_id = _safe_summary(ref_id, limit=160)
+    if not clean_type or not clean_id:
+        raise HTTPException(422, "ref_type and ref_id are required")
+    supported_types = {"job", "task", "session", "tool_draft", "memory_candidate"}
+    if clean_type not in supported_types:
+        raise HTTPException(422, "unsupported workstream reference type")
+    activity = [
+        _activity_audit_event(item)
+        for item in _list_activity(limit=80)
+        if item.get("ref_type") == clean_type and item.get("ref_id") == clean_id
+    ][:20]
+    events = [
+        item
+        for item in _workstream(limit=100)["events"]
+        if item.get("ref_type") == clean_type and item.get("ref_id") == clean_id
+    ][:20]
+    detail: dict[str, Any]
+    if clean_type == "job":
+        if clean_id not in app.state.jobs:
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _public_job(app.state.jobs[clean_id])
+    elif clean_type == "task":
+        if clean_id not in app.state.tasks:
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _public_task(app.state.tasks[clean_id])
+    elif clean_type == "session":
+        if clean_id not in app.state.sessions:
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _safe_session_detail(clean_id)
+    elif clean_type == "tool_draft":
+        if clean_id not in app.state.tool_drafts:
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            draft = _public_tool_draft(app.state.tool_drafts[clean_id])
+            detail = {
+                **draft,
+                "purpose": _redact_tool_draft_text(draft.get("purpose") or "", limit=500),
+            }
+    elif clean_type == "memory_candidate":
+        if clean_id not in getattr(app.state, "memory_candidates", {}):
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _safe_memory_candidate_detail(clean_id)
+    if not activity and not events and detail.get("state") == "audit_only":
+        raise HTTPException(404, "workstream reference not found")
+    return {
+        "ref_type": clean_type,
+        "ref_id": clean_id,
+        "detail": detail,
+        "activity": activity,
+        "events": events,
+        "safety": {
+            "mode": "metadata_only",
+            "redacted_fields": ["prompts", "memory_contents", "tool_arguments", "credentials", "provider_urls"],
+        },
+    }
+
+
 def _ensure_registry_seeded() -> None:
     if not app.state.agents:
         app.state.agents["agent_pi_operator"] = {
@@ -4551,6 +4678,11 @@ def agentgate_audit(limit: int = 60):
 @app.get("/api/workstream")
 def agentgate_workstream(limit: int = 60):
     return _workstream(limit=limit)
+
+
+@app.get("/api/workstream/refs/{ref_type}/{ref_id}")
+def agentgate_workstream_ref(ref_type: str, ref_id: str):
+    return _safe_workstream_ref_detail(ref_type, ref_id)
 
 
 @app.get("/api/system")

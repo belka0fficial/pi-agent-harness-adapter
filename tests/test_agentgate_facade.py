@@ -1776,9 +1776,24 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
             },
         )
         assert memory.status_code == 200
+        main._record_activity(
+            "agent_pi_operator",
+            event_type="automation",
+            status="scheduled",
+            source="AgentGate",
+            summary="Automation job created: Retired proof",
+            ref_type="job",
+            ref_id="job_missing_from_runtime",
+        )
         response = client.get("/api/workstream?limit=50")
+        job_detail = client.get(f"/api/workstream/refs/job/{job.json()['id']}")
+        memory_detail = client.get("/api/workstream/refs/memory_candidate/memcand_workstream")
+        ghost_detail = client.get("/api/workstream/refs/job/job_missing_from_runtime")
 
     assert response.status_code == 200
+    assert job_detail.status_code == 200
+    assert memory_detail.status_code == 200
+    assert ghost_detail.status_code == 200
     body = response.json()
     events = body["events"]
     kinds = {item["kind"] for item in events}
@@ -1803,6 +1818,24 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
         "tool secret",
     ]:
         assert forbidden not in joined
+        assert forbidden not in job_detail.text.lower()
+        assert forbidden not in memory_detail.text.lower()
+    job_body = job_detail.json()
+    assert job_body["ref_type"] == "job"
+    assert job_body["detail"]["name"] == "Morning proof"
+    assert job_body["detail"]["failure_policy"]["automatic_retries"] is False
+    assert job_body["safety"]["mode"] == "metadata_only"
+    memory_body = memory_detail.json()
+    assert memory_body["ref_type"] == "memory_candidate"
+    assert memory_body["detail"]["memory_type"] == "preference"
+    assert memory_body["detail"]["confidence"] == "high"
+    assert "text" not in memory_body["detail"]
+    assert memory_body["safety"]["mode"] == "metadata_only"
+    ghost_body = ghost_detail.json()
+    assert ghost_body["ref_type"] == "job"
+    assert ghost_body["detail"]["available"] is False
+    assert ghost_body["detail"]["state"] == "audit_only"
+    assert ghost_body["events"][0]["ref_id"] == "job_missing_from_runtime"
 
 
 def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
