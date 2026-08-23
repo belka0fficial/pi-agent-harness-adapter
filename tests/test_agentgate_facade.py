@@ -737,6 +737,9 @@ def test_automation_run_persists_safe_result_summary_only():
             },
         ).json()
         ran = client.post(f"/api/jobs/{created['id']}/run").json()
+        facade_job = next(
+            item for item in client.get("/api/automations").json()["automations"] if item["id"] == created["id"]
+        )
     result = ran["last_result"]
     assert result["status"] == "ok"
     assert result["output_summary"] == "context-aware"
@@ -749,6 +752,10 @@ def test_automation_run_persists_safe_result_summary_only():
     assert ran["run_history"][0]["status"] == "ok"
     assert ran["run_history"][0]["output_summary"] == "context-aware"
     assert "prompt" not in ran["run_history"][0]
+    assert facade_job["last_result"]["status"] == "ok"
+    assert facade_job["last_result"]["output_summary"] == "context-aware"
+    assert "output" not in facade_job["last_result"]
+    assert "prompt" not in facade_job["last_result"]
 
 
 def test_automation_pauses_after_three_failures():

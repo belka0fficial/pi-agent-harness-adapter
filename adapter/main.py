@@ -1531,6 +1531,7 @@ def agentgate_automations():
             "runs": item.get("runs", 0),
             "last_status": result.get("status", "never"),
             "last_run": item.get("last_run_at") or "—",
+            "last_result": result,
             "output": result.get("output_summary") or "No runs yet",
             "history": item.get("history", "------------"),
             "description": item.get("description") or item.get("prompt", ""),
