@@ -208,6 +208,62 @@ def test_agent_registry_persists_to_sqlite(monkeypatch, tmp_path):
     assert agent_id not in app.state.agents
 
 
+def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/agents",
+            json={
+                "name": "Character Coach",
+                "title": "Persona agent",
+                "purpose": "Shape safe character profiles.",
+                "voice": "Warm\x00, precise, and short.\\u0000",
+                "personality": ["kind", "kind", "evidence-first", ""],
+                "appearance": {
+                    "mode": "character",
+                    "style": "clean cel-shaded profile card",
+                    "height": "170 cm",
+                    "body_type": "athletic",
+                    "palette": "warm neutrals",
+                    "raw_asset_path": "should-not-persist",
+                },
+                "story": "A studio guide for agent identity drafts.",
+            },
+        )
+        patched = client.patch(
+            f"/api/agents/{created.json()['id']}",
+            json={
+                "personality": ["steady", "steady", "playful"],
+                "appearance": {
+                    "visual_summary": "Simple professional portrait with no generated asset yet.",
+                    "avatar_hint": "future optional avatar sidecar",
+                    "raw_tool_args": {"not": "stored"},
+                },
+            },
+        )
+
+    assert created.status_code == 200
+    assert created.json()["voice"] == "Warm, precise, and short."
+    assert created.json()["personality"] == ["kind", "evidence-first"]
+    assert created.json()["appearance"] == {
+        "mode": "character",
+        "style": "clean cel-shaded profile card",
+        "height": "170 cm",
+        "body_type": "athletic",
+        "palette": "warm neutrals",
+    }
+    assert patched.status_code == 200
+    assert patched.json()["personality"] == ["steady", "playful"]
+    assert patched.json()["appearance"] == {
+        "visual_summary": "Simple professional portrait with no generated asset yet.",
+        "avatar_hint": "future optional avatar sidecar",
+    }
+    assert "raw" not in str(patched.json()).lower()
+
+
 def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

@@ -298,6 +298,77 @@ def _safe_summary(value: str, *, limit: int = 160) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+AGENT_APPEARANCE_FIELDS = {
+    "mode": 40,
+    "style": 240,
+    "visual_summary": 600,
+    "height": 80,
+    "body_type": 120,
+    "palette": 160,
+    "avatar_hint": 240,
+}
+
+
+def _safe_text(value: Any, *, limit: int) -> str:
+    text = str(value or "").replace("\x00", "").replace("\\u0000", "").strip()
+    text = "\n".join(line.strip() for line in text.splitlines())
+    return text[:limit]
+
+
+def _safe_profile_list(values: Any, *, limit: int = 16, item_limit: int = 80) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        value = _safe_text(item, limit=item_limit)
+        if not value or value in seen:
+            continue
+        result.append(value)
+        seen.add(value)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _safe_appearance(value: Any) -> dict[str, str]:
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, str] = {}
+    for key, limit in AGENT_APPEARANCE_FIELDS.items():
+        text = _safe_text(source.get(key), limit=limit)
+        if text:
+            result[key] = text
+    return result
+
+
+def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(payload)
+    for field, limit in {
+        "name": 80,
+        "title": 120,
+        "purpose": 1000,
+        "mode": 80,
+        "soul": 12000,
+        "voice": 1000,
+        "story": 4000,
+        "primary_provider": 120,
+        "primary_model": 160,
+        "fallback_provider": 120,
+        "fallback_model": 160,
+        "status": 40,
+    }.items():
+        if field in cleaned:
+            cleaned[field] = _safe_text(cleaned.get(field), limit=limit)
+    if "personality" in cleaned:
+        cleaned["personality"] = _safe_profile_list(cleaned.get("personality"))
+    if "appearance" in cleaned:
+        cleaned["appearance"] = _safe_appearance(cleaned.get("appearance"))
+    for field in ("tool_ids", "skill_ids", "memory_scopes", "team_ids"):
+        if field in cleaned:
+            cleaned[field] = _clean_list(cleaned.get(field))
+    return cleaned
+
+
 def _record_activity(
     agent_id: str | None,
     *,
@@ -1366,9 +1437,10 @@ def create_agent(payload: AgentInput):
     agent_id = f"agent_{_slug(payload.name)}"
     if agent_id in app.state.agents:
         agent_id = f"{agent_id}_{uuid.uuid4().hex[:6]}"
+    profile = _sanitize_agent_profile(payload.model_dump())
     item = {
         "id": agent_id,
-        **payload.model_dump(),
+        **profile,
         "status": "draft",
         "created_at": now(),
         "updated_at": now(),
@@ -1396,7 +1468,7 @@ def update_agent(agent_id: str, payload: dict[str, Any]):
     if not item:
         raise HTTPException(404, "agent not found")
     allowed = set(AgentInput.model_fields) | {"status"}
-    item.update({key: value for key, value in payload.items() if key in allowed})
+    item.update(_sanitize_agent_profile({key: value for key, value in payload.items() if key in allowed}))
     item["updated_at"] = now()
     _save_registry_item("agent", item)
     _record_activity(
