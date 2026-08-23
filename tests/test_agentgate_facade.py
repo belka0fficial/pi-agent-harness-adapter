@@ -979,6 +979,71 @@ def test_team_templates_create_metadata_only_team(monkeypatch, tmp_path):
     assert updated_security["already_created"] is True
 
 
+def test_team_orchestration_readiness_redacts_public_surfaces(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        created = client.post(
+            "/api/teams",
+            json={
+                "name": "Ops token=abc123 Cell",
+                "purpose": "Coordinate https://private.example/path and bearer abc123 safely.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator"],
+                "memory_scopes": ["project-context", "secret=https://memory.example"],
+                "tool_ids": ["approval.test-echo", "api_key=abc"],
+                "skill_ids": ["safe-skill", "token=skillsecret"],
+                "orchestrator_policy": {
+                    "handoff_mode": "not-real",
+                    "approval_mode": "not-real",
+                    "review_status": "not-real",
+                    "max_parallel_tasks": 999,
+                    "escalation_summary": "Stop before https://private.example or bearer xyz.",
+                },
+            },
+        ).json()
+        patched = client.patch(
+            f"/api/teams/{created['id']}",
+            json={
+                "orchestrator_policy": {
+                    "handoff_mode": "owner_confirmed",
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                    "max_parallel_tasks": 2,
+                    "escalation_summary": "Escalate risky handoffs before running tools.",
+                }
+            },
+        ).json()
+        listed = client.get("/api/teams").json()["teams"]
+        fetched = client.get(f"/api/teams/{created['id']}").json()
+        workrooms = client.get("/api/workrooms").json()["workrooms"]
+        workroom = client.get(f"/api/workrooms/{created['id']}").json()
+        exported = client.get("/api/registry/export").json()
+
+    team = next(item for item in listed if item["id"] == created["id"])
+    room = next(item for item in workrooms if item["id"] == created["id"])
+    assert created["orchestrator_policy"]["handoff_mode"] == "manual"
+    assert created["orchestrator_policy"]["approval_mode"] == "toolgate_required"
+    assert created["orchestrator_policy"]["review_status"] == "unreviewed"
+    assert created["orchestrator_policy"]["max_parallel_tasks"] == 8
+    assert patched["orchestration_readiness"]["review_status"] == "owner_reviewed"
+    assert patched["orchestration_readiness"]["ready"] is True
+    assert team["orchestration_readiness"]["approval_mode"] == "toolgate_required"
+    assert fetched["orchestrator_policy"]["max_parallel_tasks"] == 2
+    assert room["orchestration_readiness"]["member_count"] == 1
+    assert workroom["readiness"]["orchestrator_is_member"] is True
+    combined = f"{created} {patched} {team} {fetched} {room} {workroom} {exported}".lower()
+    assert "token=abc123" not in combined
+    assert "skillsecret" not in combined
+    assert "api_key=abc" not in combined
+    assert "https://private.example" not in combined
+    assert "bearer abc123" not in combined
+    assert "bearer xyz" not in combined
+
+
 def test_automation_jobs_persist_to_sqlite(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

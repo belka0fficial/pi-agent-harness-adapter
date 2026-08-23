@@ -119,6 +119,7 @@ class TeamInput(BaseModel):
     memory_scopes: list[str] = Field(default_factory=list)
     tool_ids: list[str] = Field(default_factory=list)
     skill_ids: list[str] = Field(default_factory=list)
+    orchestrator_policy: dict[str, Any] = Field(default_factory=dict)
 
 
 class RegistryImportInput(BaseModel):
@@ -376,6 +377,17 @@ AGENT_PROFILE_PROVENANCE_FIELDS = {
 
 AGENT_PROFILE_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed"}
 
+TEAM_ORCHESTRATOR_POLICY_FIELDS = {
+    "handoff_mode": 40,
+    "approval_mode": 40,
+    "review_status": 40,
+    "escalation_summary": 600,
+}
+
+TEAM_POLICY_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed"}
+TEAM_HANDOFF_MODES = {"manual", "owner_confirmed", "bounded_auto"}
+TEAM_APPROVAL_MODES = {"toolgate_required", "owner_checkpoint", "metadata_only"}
+
 
 def _safe_text(value: Any, *, limit: int) -> str:
     text = str(value or "").replace("\x00", "").replace("\\u0000", "").strip()
@@ -475,6 +487,105 @@ def _public_agent(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str,
     }
 
 
+def _safe_orchestrator_policy(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, Any] = {}
+    for key, limit in TEAM_ORCHESTRATOR_POLICY_FIELDS.items():
+        text = _redact_profile_metadata_text(source.get(key), limit=limit)
+        if key == "handoff_mode" and text not in TEAM_HANDOFF_MODES:
+            text = "manual"
+        if key == "approval_mode" and text not in TEAM_APPROVAL_MODES:
+            text = "toolgate_required"
+        if key == "review_status" and text not in TEAM_POLICY_REVIEW_STATUSES:
+            text = "unreviewed"
+        if text:
+            result[key] = text
+    max_parallel = source.get("max_parallel_tasks")
+    try:
+        max_parallel_int = int(max_parallel)
+    except (TypeError, ValueError):
+        max_parallel_int = 1
+    result["max_parallel_tasks"] = min(max(max_parallel_int, 1), 8)
+    result.setdefault("handoff_mode", "manual")
+    result.setdefault("approval_mode", "toolgate_required")
+    result.setdefault("review_status", "unreviewed")
+    return result
+
+
+def _sanitize_team_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(payload)
+    for field, limit in {
+        "name": 80,
+        "purpose": 1000,
+        "status": 40,
+    }.items():
+        if field in cleaned:
+            cleaned[field] = _redact_profile_metadata_text(cleaned.get(field), limit=limit)
+    if "orchestrator_agent_id" in cleaned:
+        cleaned["orchestrator_agent_id"] = _safe_text(cleaned.get("orchestrator_agent_id"), limit=120)
+    for field in ("member_agent_ids", "tool_ids", "skill_ids", "memory_scopes"):
+        if field in cleaned:
+            cleaned[field] = [
+                _redact_profile_metadata_text(item, limit=160)
+                for item in _clean_list(cleaned.get(field))
+            ]
+    if "orchestrator_policy" in cleaned:
+        cleaned["orchestrator_policy"] = _safe_orchestrator_policy(cleaned.get("orchestrator_policy"))
+    return cleaned
+
+
+def _team_orchestration_readiness(item: dict[str, Any]) -> dict[str, Any]:
+    member_ids = _clean_list(item.get("member_agent_ids"))
+    orchestrator_id = str(item.get("orchestrator_agent_id") or "").strip()
+    policy = _safe_orchestrator_policy(item.get("orchestrator_policy"))
+    checks = {
+        "purpose": bool(str(item.get("purpose") or "").strip()),
+        "orchestrator": bool(orchestrator_id and orchestrator_id in app.state.agents),
+        "orchestrator_member": bool(orchestrator_id and orchestrator_id in member_ids),
+        "members": bool(member_ids),
+        "shared_context": bool(item.get("memory_scopes") or item.get("tool_ids") or item.get("skill_ids")),
+        "policy_review": policy.get("review_status") == "owner_reviewed",
+        "toolgate_boundary": policy.get("approval_mode") == "toolgate_required",
+    }
+    missing = [key for key, ready in checks.items() if not ready]
+    score = round(((len(checks) - len(missing)) / len(checks)) * 100)
+    risk_notes = []
+    if not checks["orchestrator"]:
+        risk_notes.append("orchestrator_missing")
+    if not checks["orchestrator_member"]:
+        risk_notes.append("orchestrator_not_member")
+    if not checks["shared_context"]:
+        risk_notes.append("no_shared_access")
+    if not checks["policy_review"]:
+        risk_notes.append("policy_review_pending")
+    if not checks["toolgate_boundary"]:
+        risk_notes.append("toolgate_boundary_not_required")
+    return {
+        "score": score,
+        "ready": score >= 75 and not {"orchestrator", "orchestrator_member", "toolgate_boundary"} & set(missing),
+        "missing_fields": missing,
+        "risk_notes": risk_notes,
+        "review_status": policy.get("review_status") or "unreviewed",
+        "handoff_mode": policy.get("handoff_mode") or "manual",
+        "approval_mode": policy.get("approval_mode") or "toolgate_required",
+        "member_count": len(member_ids),
+        "shared_access_count": len(_clean_list(item.get("memory_scopes"))) + len(_clean_list(item.get("tool_ids"))) + len(_clean_list(item.get("skill_ids"))),
+    }
+
+
+def _public_team(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str, Any]:
+    return {
+        **item,
+        "member_agent_ids": _clean_list(item.get("member_agent_ids")),
+        "tool_ids": _clean_list(item.get("tool_ids")),
+        "skill_ids": _clean_list(item.get("skill_ids")),
+        "memory_scopes": _clean_list(item.get("memory_scopes")),
+        "orchestrator_policy": _safe_orchestrator_policy(item.get("orchestrator_policy")),
+        "orchestration_readiness": _team_orchestration_readiness(item),
+        "recent_activity": _list_activity(team_id=item.get("id"), limit=activity_limit),
+    }
+
+
 def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
     cleaned = dict(payload)
     for field, limit in {
@@ -515,6 +626,7 @@ def _sanitize_registry_id(value: Any, *, prefix: str) -> str:
 def _redact_portable_registry_value(value: Any) -> Any:
     if isinstance(value, str):
         text = re.sub(r"(?i)\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+", r"\1=[redacted]", value)
+        text = re.sub(r"(?i)\bbearer\s+\S+", "bearer [redacted]", text)
         text = re.sub(r"https?://\S+", "[redacted-url]", text)
         return text
     if isinstance(value, list):
@@ -559,6 +671,7 @@ def _portable_team(item: dict[str, Any]) -> dict[str, Any]:
         "memory_scopes",
         "tool_ids",
         "skill_ids",
+        "orchestrator_policy",
         "status",
     ]
     return _redact_portable_registry_value({field: item.get(field) for field in fields if field in item})
@@ -591,7 +704,7 @@ def _registry_import_preview(payload: RegistryImportInput) -> dict[str, Any]:
     team_rows = []
     for row in payload.teams:
         team_id = _sanitize_registry_id(row.get("id"), prefix="team_")
-        team_payload = {key: value for key, value in row.items() if key in set(TeamInput.model_fields) | {"status"}}
+        team_payload = _sanitize_team_profile({key: value for key, value in row.items() if key in set(TeamInput.model_fields) | {"status"}})
         team_payload = _redact_portable_registry_value(team_payload)
         team_payload["member_agent_ids"] = _clean_list(team_payload.get("member_agent_ids"))
         team_payload["orchestrator_agent_id"] = str(team_payload.get("orchestrator_agent_id") or "").strip()
@@ -905,6 +1018,13 @@ def _ensure_registry_seeded() -> None:
             "memory_scopes": ["system-summary", "project-context"],
             "tool_ids": [],
             "skill_ids": [],
+            "orchestrator_policy": {
+                "handoff_mode": "manual",
+                "approval_mode": "toolgate_required",
+                "review_status": "unreviewed",
+                "max_parallel_tasks": 1,
+                "escalation_summary": "Default team requires owner-visible ToolGate boundaries before sensitive action.",
+            },
             "status": "ready",
             "created_at": now(),
             "updated_at": now(),
@@ -2142,18 +2262,22 @@ def _public_workroom(team_id: str) -> dict[str, Any]:
     ]
     activity = _list_activity(team_id=team_id, limit=12)
     sessions = _team_sessions(team_id)
+    team_public = _public_team(team, activity_limit=0)
+    readiness = _team_orchestration_readiness(team)
     return {
         "id": team_id,
         "team": {
-            "id": team_id,
-            "name": team.get("name"),
-            "purpose": team.get("purpose"),
-            "status": team.get("status") or "unknown",
-            "orchestrator_agent_id": team.get("orchestrator_agent_id"),
-            "member_agent_ids": team.get("member_agent_ids", []),
-            "memory_scopes": team.get("memory_scopes", []),
-            "tool_ids": team.get("tool_ids", []),
-            "skill_ids": team.get("skill_ids", []),
+            "id": team_public.get("id"),
+            "name": team_public.get("name"),
+            "purpose": team_public.get("purpose"),
+            "status": team_public.get("status") or "unknown",
+            "orchestrator_agent_id": team_public.get("orchestrator_agent_id"),
+            "member_agent_ids": team_public.get("member_agent_ids", []),
+            "memory_scopes": team_public.get("memory_scopes", []),
+            "tool_ids": team_public.get("tool_ids", []),
+            "skill_ids": team_public.get("skill_ids", []),
+            "orchestrator_policy": team_public.get("orchestrator_policy"),
+            "orchestration_readiness": readiness,
             "created_at": team.get("created_at"),
             "updated_at": team.get("updated_at"),
         },
@@ -2174,7 +2298,9 @@ def _public_workroom(team_id: str) -> dict[str, Any]:
         "activity": activity,
         "pending_approvals": _team_pending_approval_count(team_id),
         "readiness": {
+            **readiness,
             "orchestrator_configured": bool(team.get("orchestrator_agent_id")),
+            "orchestrator_is_member": bool(team.get("orchestrator_agent_id") in set(team.get("member_agent_ids") or [])),
             "member_count": len(members),
             "session_count": len(sessions),
             "automation_count": len(jobs),
@@ -3346,10 +3472,7 @@ def delete_agent(agent_id: str):
 @app.get("/api/teams")
 def list_teams():
     _ensure_registry_seeded()
-    teams = []
-    for item in app.state.teams.values():
-        teams.append({**item, "recent_activity": _list_activity(team_id=item.get("id"), limit=3)})
-    return {"teams": teams}
+    return {"teams": [_public_team(item, activity_limit=3) for item in app.state.teams.values()]}
 
 
 @app.get("/api/team-templates")
@@ -3412,7 +3535,7 @@ def get_team(team_id: str):
     item = app.state.teams.get(team_id)
     if not item:
         raise HTTPException(404, "team not found")
-    return {**item, "recent_activity": _list_activity(team_id=team_id, limit=10)}
+    return _public_team(item, activity_limit=10)
 
 
 @app.get("/api/teams/{team_id}/activity")
@@ -3429,11 +3552,13 @@ def create_team(payload: TeamInput):
     team_id = f"team_{_slug(payload.name)}"
     if team_id in app.state.teams:
         team_id = f"{team_id}_{uuid.uuid4().hex[:6]}"
-    member_agent_ids = _normalized_team_member_ids(payload.member_agent_ids, payload.orchestrator_agent_id)
+    profile = _sanitize_team_profile(payload.model_dump())
+    member_agent_ids = _normalized_team_member_ids(profile.get("member_agent_ids", []), profile.get("orchestrator_agent_id", ""))
     item = {
         "id": team_id,
-        **payload.model_dump(),
+        **profile,
         "member_agent_ids": member_agent_ids,
+        "orchestrator_policy": _safe_orchestrator_policy(profile.get("orchestrator_policy")),
         "status": "draft",
         "created_at": now(),
         "updated_at": now(),
@@ -3443,7 +3568,7 @@ def create_team(payload: TeamInput):
     _sync_agent_team_memberships(team_id, member_agent_ids)
     if item.get("tool_ids"):
         _sync_toolgate_execution_scopes()
-    return item
+    return _public_team(item, activity_limit=3)
 
 
 @app.patch("/api/teams/{team_id}")
@@ -3458,14 +3583,14 @@ def update_team(team_id: str, payload: dict[str, Any]):
         next_member_ids = payload.get("member_agent_ids", item.get("member_agent_ids", []))
         next_orchestrator = payload.get("orchestrator_agent_id", item.get("orchestrator_agent_id", ""))
         payload = {**payload, "member_agent_ids": _normalized_team_member_ids(next_member_ids, next_orchestrator)}
-    item.update({key: value for key, value in payload.items() if key in allowed})
+    item.update(_sanitize_team_profile({key: value for key, value in payload.items() if key in allowed}))
     item["updated_at"] = now()
     _save_registry_item("team", item)
     if "member_agent_ids" in payload:
         _sync_agent_team_memberships(team_id, item.get("member_agent_ids", []), previous_member_agent_ids)
     if "tool_ids" in payload:
         _sync_toolgate_execution_scopes()
-    return item
+    return _public_team(item, activity_limit=10)
 
 
 @app.delete("/api/teams/{team_id}")
@@ -3491,18 +3616,21 @@ def list_workrooms():
     return {
         "workrooms": [
             {
-                "id": item.get("id"),
-                "name": item.get("name"),
-                "purpose": item.get("purpose"),
-                "status": item.get("status") or "unknown",
-                "orchestrator_agent_id": item.get("orchestrator_agent_id"),
-                "member_count": len(item.get("member_agent_ids") or []),
-                "tool_count": len(item.get("tool_ids") or []),
-                "skill_count": len(item.get("skill_ids") or []),
-                "memory_scope_count": len(item.get("memory_scopes") or []),
+                "id": team.get("id"),
+                "name": team.get("name"),
+                "purpose": team.get("purpose"),
+                "status": team.get("status") or "unknown",
+                "orchestrator_agent_id": team.get("orchestrator_agent_id"),
+                "member_count": len(team.get("member_agent_ids") or []),
+                "tool_count": len(team.get("tool_ids") or []),
+                "skill_count": len(team.get("skill_ids") or []),
+                "memory_scope_count": len(team.get("memory_scopes") or []),
+                "orchestrator_policy": team.get("orchestrator_policy"),
+                "orchestration_readiness": team.get("orchestration_readiness"),
                 "recent_activity": _list_activity(team_id=item.get("id"), limit=3),
             }
             for item in app.state.teams.values()
+            for team in [_public_team(item, activity_limit=0)]
         ]
     }
 
