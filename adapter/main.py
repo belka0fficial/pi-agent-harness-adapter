@@ -575,6 +575,39 @@ def _permission_context(agent_id: str | None, team_id: str | None = None) -> dic
     }
 
 
+def _session_participants(agent_id: str, team_id: str | None, requested: list[Any] | None) -> list[str]:
+    participant_ids = _clean_list(requested)
+    if agent_id not in participant_ids:
+        participant_ids.insert(0, agent_id)
+    participants = []
+    for participant_id in participant_ids[:12]:
+        actor = _permission_context(participant_id, team_id)
+        if team_id and actor.get("team_id") != team_id:
+            raise HTTPException(403, f"agent {participant_id} is not in team {team_id}")
+        participants.append(actor["agent_id"])
+    return list(dict.fromkeys(participants))
+
+
+def _public_session(item: dict[str, Any]) -> dict[str, Any]:
+    participant_ids = item.get("participant_agent_ids") or [item.get("agent_id") or "agent_pi_operator"]
+    participants = []
+    for agent_id in participant_ids:
+        agent = app.state.agents.get(agent_id) or {}
+        participants.append({
+            "id": agent_id,
+            "name": agent.get("name") or agent_id,
+            "title": agent.get("title") or "Agent",
+            "status": agent.get("status") or "unknown",
+        })
+    return {
+        **item,
+        "mode": item.get("mode") or ("group" if len(participant_ids) > 1 else "direct"),
+        "participant_agent_ids": participant_ids,
+        "participants": participants,
+        "current_speaker_id": item.get("current_speaker_id") or item.get("agent_id"),
+    }
+
+
 def _normalized_team_member_ids(member_agent_ids: list[str], orchestrator_agent_id: str = "") -> list[str]:
     _ensure_registry_seeded()
     values = [str(item).strip() for item in member_agent_ids if str(item).strip()]
@@ -791,6 +824,7 @@ def detailed_health():
 @app.post("/api/sessions")
 def create_session(payload: dict[str, Any]):
     actor = _permission_context(payload.get("agent_id"), payload.get("team_id"))
+    participants = _session_participants(actor["agent_id"], actor["team_id"], payload.get("participant_agent_ids"))
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
     item = {
         "id": session_id,
@@ -798,17 +832,20 @@ def create_session(payload: dict[str, Any]):
         "title": payload.get("title") or "New chat",
         "agent_id": actor["agent_id"],
         "team_id": actor["team_id"],
+        "mode": "group" if len(participants) > 1 else "direct",
+        "participant_agent_ids": participants,
+        "current_speaker_id": actor["agent_id"],
         "created_at": now(),
         "updated_at": now(),
     }
     app.state.sessions[session_id] = item
     app.state.messages[session_id] = []
-    return item
+    return _public_session(item)
 
 
 @app.get("/api/sessions")
 def list_sessions():
-    return {"sessions": list(app.state.sessions.values())}
+    return {"sessions": [_public_session(item) for item in app.state.sessions.values()]}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -816,7 +853,7 @@ def get_session(session_id: str):
     item = app.state.sessions.get(session_id)
     if not item:
         raise HTTPException(404, "session not found")
-    return item
+    return _public_session(item)
 
 
 @app.patch("/api/sessions/{session_id}")
@@ -830,8 +867,25 @@ def update_session(session_id: str, payload: dict[str, Any]):
         actor = _permission_context(payload.get("agent_id") or item.get("agent_id"), payload.get("team_id") if "team_id" in payload else item.get("team_id"))
         item["agent_id"] = actor["agent_id"]
         item["team_id"] = actor["team_id"]
+    else:
+        actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
+    if "participant_agent_ids" in payload or "agent_id" in payload or "team_id" in payload:
+        item["participant_agent_ids"] = _session_participants(
+            actor["agent_id"],
+            actor["team_id"],
+            payload.get("participant_agent_ids", item.get("participant_agent_ids")),
+        )
+        item["mode"] = "group" if len(item["participant_agent_ids"]) > 1 else "direct"
+        if item.get("current_speaker_id") not in item["participant_agent_ids"]:
+            item["current_speaker_id"] = actor["agent_id"]
+    if "current_speaker_id" in payload:
+        speaker_id = str(payload.get("current_speaker_id") or "").strip()
+        if speaker_id not in item.get("participant_agent_ids", []):
+            raise HTTPException(403, "speaker is not in this session roster")
+        item["current_speaker_id"] = speaker_id
+        item["agent_id"] = speaker_id
     item["updated_at"] = now()
-    return item
+    return _public_session(item)
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -1530,6 +1584,9 @@ async def fork_session(session_id: str, payload: dict[str, Any]):
         "title": payload.get("title") or f"Fork of {source.get('title') or session_id}",
         "agent_id": source.get("agent_id") or "agent_pi_operator",
         "team_id": source.get("team_id"),
+        "mode": source.get("mode") or "direct",
+        "participant_agent_ids": source.get("participant_agent_ids") or [source.get("agent_id") or "agent_pi_operator"],
+        "current_speaker_id": source.get("current_speaker_id") or source.get("agent_id") or "agent_pi_operator",
         "created_at": now(),
         "updated_at": now(),
         "parent_session_id": session_id,
@@ -1537,7 +1594,7 @@ async def fork_session(session_id: str, payload: dict[str, Any]):
     app.state.sessions[new_session_id] = item
     app.state.messages[new_session_id] = list(app.state.messages.get(session_id, []))
     await app.state.pi.fork_session(session_id, new_session_id)
-    return item
+    return _public_session(item)
 
 
 @app.post("/api/sessions/{session_id}/chat/stream")
@@ -1546,6 +1603,9 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
     requested_agent_id = payload.agent_id or session.get("agent_id") or "agent_pi_operator"
     requested_team_id = payload.team_id if payload.team_id is not None else session.get("team_id")
     actor = _permission_context(requested_agent_id, requested_team_id)
+    participants = session.get("participant_agent_ids") or [actor["agent_id"]]
+    if len(participants) > 1 and actor["agent_id"] not in participants:
+        raise HTTPException(403, "agent is not in this group session roster")
     if payload.memory_enabled and not actor["memory_scopes"]:
         raise HTTPException(403, "agent has no MemoryGate scopes")
     if session_id not in app.state.sessions:
@@ -1553,6 +1613,13 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
         app.state.messages[session_id] = []
     app.state.sessions[session_id]["agent_id"] = actor["agent_id"]
     app.state.sessions[session_id]["team_id"] = actor["team_id"]
+    app.state.sessions[session_id]["participant_agent_ids"] = _session_participants(
+        actor["agent_id"],
+        actor["team_id"],
+        app.state.sessions[session_id].get("participant_agent_ids"),
+    )
+    app.state.sessions[session_id]["mode"] = "group" if len(app.state.sessions[session_id]["participant_agent_ids"]) > 1 else "direct"
+    app.state.sessions[session_id]["current_speaker_id"] = actor["agent_id"]
     app.state.sessions[session_id]["updated_at"] = now()
     linked_task_id = app.state.sessions[session_id].get("task_id")
     linked_task = app.state.tasks.get(linked_task_id) if linked_task_id else None
@@ -1644,7 +1711,14 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
             run_status = "failed"
             yield event_to_sse(PiEvent("run.failed", {"message": str(exc)[:1000]}))
         if collected:
-            request.app.state.messages[session_id].append({"id": f"msg_{uuid.uuid4().hex[:12]}", "role": "assistant", "content": "".join(collected), "created_at": now()})
+            request.app.state.messages[session_id].append({
+                "id": f"msg_{uuid.uuid4().hex[:12]}",
+                "role": "assistant",
+                "content": "".join(collected),
+                "agent_id": actor["agent_id"],
+                "team_id": actor["team_id"],
+                "created_at": now(),
+            })
             if payload.memory_enabled:
                 try:
                     request.app.state.gates.record_transcript(session_id, request.app.state.messages[session_id], agent_id=actor["agent_id"])
@@ -2175,6 +2249,11 @@ def create_workroom_session(team_id: str, payload: dict[str, Any] | None = None)
         or (team.get("member_agent_ids") or ["agent_pi_operator"])[0]
     )
     actor = _permission_context(agent_id, team_id)
+    participants = _session_participants(
+        actor["agent_id"],
+        actor["team_id"],
+        payload.get("participant_agent_ids") or team.get("member_agent_ids") or [actor["agent_id"]],
+    )
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
     item = {
         "id": session_id,
@@ -2182,6 +2261,9 @@ def create_workroom_session(team_id: str, payload: dict[str, Any] | None = None)
         "title": payload.get("title") or f"{team.get('name') or 'Team'} workroom",
         "agent_id": actor["agent_id"],
         "team_id": actor["team_id"],
+        "mode": "group" if len(participants) > 1 else "direct",
+        "participant_agent_ids": participants,
+        "current_speaker_id": actor["agent_id"],
         "created_at": now(),
         "updated_at": now(),
     }
@@ -2197,7 +2279,7 @@ def create_workroom_session(team_id: str, payload: dict[str, Any] | None = None)
         ref_type="session",
         ref_id=session_id,
     )
-    return item
+    return _public_session(item)
 
 
 @app.get("/api/tasks")
@@ -2514,8 +2596,9 @@ def agentgate_chats():
         session_id = item.get("id") or item.get("session_id")
         messages = app.state.messages.get(session_id, [])
         preview = messages[-1].get("content", "") if messages else ""
+        row = _public_session(item)
         rows.append({
-            **item,
+            **row,
             "id": session_id,
             "preview": preview,
             "message_count": len(messages),

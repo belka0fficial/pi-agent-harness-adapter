@@ -1148,6 +1148,69 @@ def test_delegated_task_dependencies_and_owner_checkpoint_gate_sessions(monkeypa
     assert "token" not in str(opened.json()).lower()
 
 
+def test_group_session_roster_and_speaker_are_enforced(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        teammate = client.post(
+            "/api/agents",
+            json={
+                "name": "Group Speaker",
+                "purpose": "Participate in scoped group rooms.",
+                "team_ids": ["team_core"],
+            },
+        ).json()
+        team = client.get("/api/teams/team_core").json()
+        client.patch(
+            "/api/teams/team_core",
+            json={"member_agent_ids": [*team["member_agent_ids"], teammate["id"]]},
+        )
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Group proof",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        switched = client.patch(
+            f"/api/sessions/{session['id']}",
+            json={"current_speaker_id": teammate["id"]},
+        ).json()
+        response = client.post(
+            f"/api/sessions/{session['id']}/chat/stream",
+            json={"input": "Group room turn", "agent_id": teammate["id"], "team_id": "team_core"},
+        )
+        outsider = client.post(
+            "/api/agents",
+            json={"name": "Outside Speaker", "purpose": "No group access."},
+        ).json()
+        rejected = client.post(
+            f"/api/sessions/{session['id']}/chat/stream",
+            json={"input": "Should not run", "agent_id": outsider["id"], "team_id": None},
+        )
+        messages = client.get(f"/api/chats/{session['id']}/messages").json()["messages"]
+        listed = client.get("/api/chats").json()["sessions"]
+
+    assert session["mode"] == "group"
+    assert teammate["id"] in session["participant_agent_ids"]
+    assert switched["current_speaker_id"] == teammate["id"]
+    assert response.status_code == 200
+    assert rejected.status_code == 403
+    assistant_messages = [item for item in messages if item["role"] == "agent"]
+    assert assistant_messages[-1]["agent_id"] == teammate["id"]
+    row = next(item for item in listed if item["id"] == session["id"])
+    assert row["mode"] == "group"
+    assert row["participants"][1]["id"] == teammate["id"]
+    assert "Group room turn" not in str(row)
+    assert "token" not in str(row).lower()
+
+
 def test_chat_defaults_to_no_memory_side_effects():
     reset_state()
     pi = CapturingPi()
