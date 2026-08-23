@@ -100,6 +100,7 @@ class AgentInput(BaseModel):
     personality: list[str] = Field(default_factory=list)
     appearance: dict[str, Any] = Field(default_factory=dict)
     story: str = Field(default="", max_length=4000)
+    profile_provenance: dict[str, Any] = Field(default_factory=dict)
     primary_provider: str = ""
     primary_model: str = ""
     fallback_provider: str = ""
@@ -367,6 +368,14 @@ AGENT_APPEARANCE_FIELDS = {
     "avatar_hint": 240,
 }
 
+AGENT_PROFILE_PROVENANCE_FIELDS = {
+    "origin_mode": 40,
+    "review_status": 40,
+    "notes_summary": 600,
+}
+
+AGENT_PROFILE_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed"}
+
 
 def _safe_text(value: Any, *, limit: int) -> str:
     text = str(value or "").replace("\x00", "").replace("\\u0000", "").strip()
@@ -400,6 +409,72 @@ def _safe_appearance(value: Any) -> dict[str, str]:
     return result
 
 
+def _redact_profile_metadata_text(value: Any, *, limit: int) -> str:
+    text = _safe_text(value, limit=limit)
+    text = re.sub(r"(?i)\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+    text = re.sub(r"(?i)\bbearer\s+\S+", "bearer [redacted]", text)
+    text = re.sub(r"https?://\S+", "[redacted-url]", text)
+    return text[:limit]
+
+
+def _safe_profile_provenance(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, Any] = {}
+    for key, limit in AGENT_PROFILE_PROVENANCE_FIELDS.items():
+        text = _redact_profile_metadata_text(source.get(key), limit=limit)
+        if key == "review_status" and text not in AGENT_PROFILE_REVIEW_STATUSES:
+            text = "unreviewed"
+        if text:
+            result[key] = text
+    labels = _safe_profile_list(source.get("source_labels"), limit=8, item_limit=120)
+    labels = [_redact_profile_metadata_text(label, limit=120) for label in labels]
+    if labels:
+        result["source_labels"] = labels
+    if result:
+        result.setdefault("review_status", "unreviewed")
+    return result
+
+
+def _agent_profile_readiness(item: dict[str, Any]) -> dict[str, Any]:
+    appearance = item.get("appearance") if isinstance(item.get("appearance"), dict) else {}
+    provenance = item.get("profile_provenance") if isinstance(item.get("profile_provenance"), dict) else {}
+    checks = {
+        "purpose": bool(str(item.get("purpose") or "").strip()),
+        "soul": bool(str(item.get("soul") or "").strip()),
+        "voice": bool(str(item.get("voice") or "").strip()),
+        "personality": bool(item.get("personality")),
+        "appearance": bool(appearance.get("visual_summary") or appearance.get("style")),
+        "model_route": bool(str(item.get("primary_provider") or "").strip() and str(item.get("primary_model") or "").strip()),
+        "memory_scope": bool(item.get("memory_scopes")),
+        "source_review": provenance.get("review_status") == "owner_reviewed",
+    }
+    missing = [key for key, ready in checks.items() if not ready]
+    score = round(((len(checks) - len(missing)) / len(checks)) * 100)
+    risk_notes = []
+    if not checks["source_review"]:
+        risk_notes.append("source_review_pending")
+    if not checks["model_route"]:
+        risk_notes.append("model_route_missing")
+    if not checks["memory_scope"]:
+        risk_notes.append("no_memory_scope")
+    return {
+        "score": score,
+        "ready": score >= 75 and not {"soul", "purpose", "model_route"} & set(missing),
+        "missing_fields": missing,
+        "risk_notes": risk_notes,
+        "review_status": provenance.get("review_status") or "unreviewed",
+    }
+
+
+def _public_agent(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str, Any]:
+    return {
+        **item,
+        "profile_provenance": _safe_profile_provenance(item.get("profile_provenance")),
+        "profile_readiness": _agent_profile_readiness(item),
+        "recent_activity": _list_activity(item.get("id"), limit=activity_limit),
+    }
+
+
 def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
     cleaned = dict(payload)
     for field, limit in {
@@ -422,6 +497,8 @@ def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
         cleaned["personality"] = _safe_profile_list(cleaned.get("personality"))
     if "appearance" in cleaned:
         cleaned["appearance"] = _safe_appearance(cleaned.get("appearance"))
+    if "profile_provenance" in cleaned:
+        cleaned["profile_provenance"] = _safe_profile_provenance(cleaned.get("profile_provenance"))
     for field in ("tool_ids", "skill_ids", "memory_scopes", "team_ids"):
         if field in cleaned:
             cleaned[field] = _clean_list(cleaned.get(field))
@@ -3124,10 +3201,7 @@ def _safe_backup_summary(system: dict[str, Any]) -> dict[str, Any]:
 def list_agents():
     _ensure_registry_seeded()
     _normalize_agent_model_defaults()
-    agents = []
-    for item in app.state.agents.values():
-        agents.append({**item, "recent_activity": _list_activity(item.get("id"), limit=3)})
-    return {"agents": agents}
+    return {"agents": [_public_agent(item, activity_limit=3) for item in app.state.agents.values()]}
 
 
 @app.get("/api/registry/export")
@@ -3170,7 +3244,7 @@ def get_agent(agent_id: str):
     item = app.state.agents.get(agent_id)
     if not item:
         raise HTTPException(404, "agent not found")
-    return {**item, "recent_activity": _list_activity(agent_id, limit=10)}
+    return _public_agent(item, activity_limit=10)
 
 
 @app.get("/api/agents/{agent_id}/activity")
@@ -3208,7 +3282,7 @@ def create_agent(payload: AgentInput):
     )
     if item.get("tool_ids"):
         _sync_toolgate_execution_scopes()
-    return item
+    return _public_agent(item, activity_limit=3)
 
 
 @app.patch("/api/agents/{agent_id}")
@@ -3233,7 +3307,7 @@ def update_agent(agent_id: str, payload: dict[str, Any]):
     )
     if "tool_ids" in payload:
         _sync_toolgate_execution_scopes()
-    return item
+    return _public_agent(item, activity_limit=10)
 
 
 @app.delete("/api/agents/{agent_id}")

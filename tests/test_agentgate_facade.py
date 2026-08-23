@@ -412,6 +412,12 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
                     "palette": "warm neutrals",
                     "raw_asset_path": "should-not-persist",
                 },
+                "profile_provenance": {
+                    "origin_mode": "owner_notes",
+                    "review_status": "owner_reviewed",
+                    "source_labels": ["owner seed", "https://private.example/profile"],
+                    "notes_summary": "Drafted from token=abc123 owner notes.",
+                },
                 "story": "A studio guide for agent identity drafts.",
             },
         )
@@ -437,13 +443,65 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
         "body_type": "athletic",
         "palette": "warm neutrals",
     }
+    assert created.json()["profile_provenance"]["review_status"] == "owner_reviewed"
+    assert created.json()["profile_provenance"]["source_labels"] == ["owner seed", "[redacted-url]"]
+    assert "token=abc123" not in created.json()["profile_provenance"]["notes_summary"]
     assert patched.status_code == 200
     assert patched.json()["personality"] == ["steady", "playful"]
     assert patched.json()["appearance"] == {
         "visual_summary": "Simple professional portrait with no generated asset yet.",
         "avatar_hint": "future optional avatar sidecar",
     }
-    assert "raw" not in str(patched.json()).lower()
+    assert patched.json()["profile_readiness"]["review_status"] == "owner_reviewed"
+    payload = str(patched.json()).lower()
+    assert "raw" not in payload
+    assert "https://private.example" not in payload
+    assert "token=abc123" not in payload
+
+
+def test_agent_profile_readiness_public_projection_redacts_provenance(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/agents",
+            json={
+                "name": "Readiness Probe",
+                "title": "Agent",
+                "purpose": "Check readiness metadata.",
+                "soul": "Stay inside granted scopes.",
+                "voice": "Brief and careful.",
+                "personality": ["safe"],
+                "appearance": {"style": "clean"},
+                "primary_provider": "openai-codex",
+                "primary_model": "gpt-test",
+                "memory_scopes": ["project-context"],
+                "profile_provenance": {
+                    "origin_mode": "search_notes",
+                    "review_status": "not-a-real-status",
+                    "source_labels": ["api_key=abc", "clean label"],
+                    "notes_summary": "No bearer abc123 or https://private.example/path should leak.",
+                },
+            },
+        ).json()
+        listed = client.get("/api/agents").json()["agents"]
+        fetched = client.get(f"/api/agents/{created['id']}").json()
+
+    row = next(agent for agent in listed if agent["id"] == created["id"])
+    assert row["profile_readiness"]["score"] >= 75
+    assert row["profile_readiness"]["review_status"] == "unreviewed"
+    assert "source_review" in row["profile_readiness"]["missing_fields"]
+    assert fetched["profile_provenance"]["review_status"] == "unreviewed"
+    assert fetched["profile_provenance"]["source_labels"] == ["api_key=[redacted]", "clean label"]
+    combined = f"{row} {fetched}".lower()
+    assert "bearer abc123" not in combined
+    assert "https://private.example" not in combined
+    assert "tgx_" not in combined
+    assert "mg_read_" not in combined
+    assert "password" not in combined
+    assert "secret" not in combined
 
 
 def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path):
