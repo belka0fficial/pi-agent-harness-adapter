@@ -740,6 +740,24 @@ class CapturingPi:
         yield PiEvent("message.completed", {"message_id": "done"})
 
 
+class MultiSpeakerPi:
+    def __init__(self):
+        self.calls = []
+
+    async def stream(self, prompt: str, *, session_id: str, options=None):
+        from adapter.pi_client import PiEvent
+        agent_hint = (options or {}).get("instructions") or ""
+        self.calls.append({"prompt": prompt, "session_id": session_id, "options": options})
+        speaker = "speaker"
+        if "Pi Agent" in agent_hint:
+            speaker = "operator"
+        if "Group Teammate" in agent_hint:
+            speaker = "teammate"
+        yield PiEvent("run.started", {"run_id": f"run-{len(self.calls)}"})
+        yield PiEvent("message.delta", {"delta": f"{speaker} response"})
+        yield PiEvent("message.completed", {"message_id": f"done-{len(self.calls)}"})
+
+
 class FailingJobPi:
     async def stream(self, prompt: str, *, session_id: str, options=None):
         from adapter.pi_client import PiEvent
@@ -1283,6 +1301,68 @@ def test_group_session_roster_and_speaker_are_enforced(monkeypatch, tmp_path):
     assert row["participants"][1]["id"] == teammate["id"]
     assert "Group room turn" not in str(row)
     assert "token" not in str(row).lower()
+
+
+def test_group_round_runs_each_roster_speaker_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = MultiSpeakerPi()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={
+                "name": "Group Teammate",
+                "purpose": "Participate in scoped group rounds.",
+                "memory_scopes": ["project-context"],
+            },
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Group Round Team",
+                "purpose": "Test group rounds.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                "memory_scopes": ["project-context"],
+            },
+        ).json()
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Group Round",
+                "agent_id": "agent_pi_operator",
+                "team_id": team["id"],
+                "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        result = client.post(
+            f"/api/sessions/{session['id']}/group-round",
+            json={"input": "Everyone give one short view.", "memory_enabled": True},
+        )
+        messages = client.get(f"/api/chats/{session['id']}/messages").json()["messages"]
+        activity = client.get(f"/api/activity?team_id={team['id']}").json()["activity"]
+
+    assert result.status_code == 200
+    payload = result.json()
+    assert payload["round"]["speaker_count"] == 2
+    assert [item["agent_id"] for item in payload["round"]["responses"]] == [
+        "agent_pi_operator",
+        teammate["id"],
+    ]
+    assert len(app.state.pi.calls) == 2
+    assert [message["role"] for message in messages] == ["owner", "agent", "agent"]
+    assert messages[1]["agent_id"] == "agent_pi_operator"
+    assert messages[2]["agent_id"] == teammate["id"]
+    assert {message["content"] for message in messages[1:]} == {
+        "operator response",
+        "teammate response",
+    }
+    event_types = [item["event_type"] for item in activity]
+    assert event_types.count("group.speaker_started") == 2
+    assert event_types.count("group.speaker_completed") == 2
+    assert "Everyone give one short view" not in str(activity)
 
 
 def test_tool_draft_artifacts_are_metadata_only(monkeypatch, tmp_path):
