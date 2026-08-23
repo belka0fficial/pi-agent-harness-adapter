@@ -1184,13 +1184,23 @@ def capabilities():
 
 
 @app.get("/v1/skills")
-def discovered_skills():
-    return app.state.gates.skills()
+def discovered_skills(agent_id: str | None = None, team_id: str | None = None):
+    actor = _permission_context(agent_id, team_id)
+    allowed = actor["skill_ids"]
+    return [
+        row for row in app.state.gates.skills()
+        if _capability_allowed(str(row.get("id") or ""), allowed)
+    ]
 
 
 @app.get("/v1/toolsets")
-def discovered_toolsets():
-    return app.state.gates.tools()
+def discovered_toolsets(agent_id: str | None = None, team_id: str | None = None):
+    actor = _permission_context(agent_id, team_id)
+    allowed = actor["tool_ids"]
+    return [
+        row for row in app.state.gates.tools()
+        if _capability_allowed(str(row.get("id") or ""), allowed)
+    ]
 
 
 @app.post("/v1/runs/{run_id}/stop")

@@ -332,11 +332,33 @@ def test_agentgate_filters_tools_and_skills_by_agent_team_grants():
 def test_pi_discovery_exposes_memorygate_skills_and_toolgate_capabilities():
     reset_state()
     with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = ["echo"]
+        app.state.teams["team_core"]["skill_ids"] = ["skill-1"]
         capabilities = client.get("/v1/capabilities").json()
         skills = client.get("/v1/skills").json()
+        toolsets = client.get("/v1/toolsets").json()
     assert capabilities["skills"] is True
     assert capabilities["toolsets"] is True
     assert skills[0]["id"] == "skill-1"
+    assert toolsets[0]["id"] == "echo"
+    assert "skill-secret" not in [skill["id"] for skill in skills]
+    assert "danger.write" not in [tool["id"] for tool in toolsets]
+
+
+def test_pi_discovery_defaults_to_empty_without_registry_grants():
+    reset_state()
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = []
+        app.state.agents["agent_pi_operator"]["skill_ids"] = []
+        app.state.teams["team_core"]["tool_ids"] = []
+        app.state.teams["team_core"]["skill_ids"] = []
+        skills = client.get("/v1/skills").json()
+        toolsets = client.get("/v1/toolsets").json()
+
+    assert skills == []
+    assert toolsets == []
 
 
 class CapturingPi:
