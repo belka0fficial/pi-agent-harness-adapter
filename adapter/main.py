@@ -521,6 +521,84 @@ def _list_activity(
     return [dict(row) for row in rows]
 
 
+def _redact_audit_text(value: Any, *, limit: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    for pattern, replacement in (
+        (r"(?i)\b(api[_-]?key|token|password|secret)\s*[:=]\s*\S+", r"\1=[redacted]"),
+        (r"https?://\S+", "[redacted-url]"),
+        (r"(?i)\b(raw\s+)?(tool\s+)?arguments?\b", "redacted arguments"),
+        (r"(?i)\b(prompt|memory contents?|transcript)\b", "redacted content"),
+    ):
+        text = re.sub(pattern, replacement, text)
+    return _safe_summary(text, limit=limit)
+
+
+def _audit_time(value: Any) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _approval_audit_event(item: dict[str, Any], *, pending: bool) -> dict[str, Any]:
+    binding = item.get("binding") if isinstance(item.get("binding"), dict) else {}
+    status = "pending" if pending else str(item.get("decision") or "decided")
+    severity = str(item.get("severity") or "low")
+    risk = severity if severity in {"low", "medium", "high"} else "low"
+    action_summary = _redact_audit_text(
+        f"{status} approval {binding.get('type') or 'request'} {binding.get('id') or item.get('id')}"
+    )
+    return {
+        "id": f"approval:{item.get('id')}",
+        "time": str(item.get("created_at") if pending else item.get("decided_at") or item.get("created_at") or ""),
+        "risk": risk,
+        "source": _safe_summary(item.get("source") or "ToolGate", limit=80),
+        "status": status,
+        "event_type": "approval.pending" if pending else "approval.decided",
+        "action_summary": action_summary,
+        "ref_type": _safe_summary(binding.get("type") or "approval", limit=80),
+        "ref_id": _redact_audit_text(item.get("id") or "", limit=120),
+        "digest": _redact_audit_text(binding.get("digest") or "", limit=80),
+    }
+
+
+def _activity_audit_event(item: dict[str, Any]) -> dict[str, Any]:
+    status = str(item.get("status") or "event")
+    risk = "high" if status in {"failed", "blocked", "rejected"} else "low"
+    if status in {"pending", "paused", "running", "in_progress"}:
+        risk = "medium"
+    return {
+        "id": f"activity:{item.get('id')}",
+        "time": str(item.get("created_at") or ""),
+        "risk": risk,
+        "source": _safe_summary(item.get("source") or "AgentGate", limit=80),
+        "status": _safe_summary(status, limit=60),
+        "event_type": _safe_summary(item.get("event_type") or "activity", limit=80),
+        "action_summary": _redact_audit_text(item.get("summary") or "activity event"),
+        "ref_type": _safe_summary(item.get("ref_type") or "", limit=80),
+        "ref_id": _safe_summary(item.get("ref_id") or "", limit=120),
+        "agent_id": _safe_summary(item.get("agent_id") or "", limit=120),
+        "team_id": _safe_summary(item.get("team_id") or "", limit=120),
+    }
+
+
+def _audit_timeline(limit: int = 60) -> list[dict[str, Any]]:
+    limit = min(max(limit, 1), 100)
+    pending = app.state.gates.approvals(history=False)
+    decided = app.state.gates.approvals(history=True)
+    activity = _list_activity(limit=limit)
+    rows = [
+        *[_approval_audit_event(item, pending=True) for item in pending],
+        *[_approval_audit_event(item, pending=False) for item in decided],
+        *[_activity_audit_event(item) for item in activity],
+    ]
+    rows.sort(key=lambda item: _audit_time(item.get("time")), reverse=True)
+    return rows[:limit]
+
+
 def _ensure_registry_seeded() -> None:
     if not app.state.agents:
         app.state.agents["agent_pi_operator"] = {
@@ -2730,6 +2808,11 @@ def agentgate_activity(
     team_id: str | None = None,
 ):
     return {"activity": _list_activity(agent_id=agent_id, team_id=team_id, limit=limit)}
+
+
+@app.get("/api/audit")
+def agentgate_audit(limit: int = 60):
+    return {"events": _audit_timeline(limit=limit)}
 
 
 @app.get("/api/system")

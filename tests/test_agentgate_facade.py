@@ -840,6 +840,66 @@ def test_global_activity_feed_uses_safe_metadata(monkeypatch, tmp_path):
     assert all(required_keys <= set(item) for item in activity)
 
 
+def test_audit_timeline_merges_redacted_approvals_and_activity(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    def approvals(*, history: bool = False):
+        if history:
+            return [{
+                "id": "req-decided",
+                "source": "ToolGate",
+                "severity": "low",
+                "title": "Completed request",
+                "details": "Already reviewed",
+                "binding": {"type": "tool", "id": "echo", "version": "1", "digest": "abc"},
+                "decision": "approved",
+                "decided_at": "2026-01-01T00:00:00+00:00",
+                "decided_by": "Owner",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }]
+        return [{
+            "id": "req-pending",
+            "source": "ToolGate",
+            "severity": "medium",
+            "title": "Run echo token=abc123",
+            "details": "Approval required with https://private.example/path",
+            "binding": {
+                "type": "tool",
+                "id": "echo",
+                "version": "1",
+                "digest": "sha256:abc",
+            },
+            "created_at": "2026-01-02T00:00:00+00:00",
+        }]
+
+    monkeypatch.setattr(app.state.gates, "approvals", approvals)
+    main._record_activity(
+        "agent_pi_operator",
+        event_type="tool.arguments",
+        status="failed",
+        source="ToolGate",
+        summary="raw tool arguments token=abc123 https://private.example/path",
+        team_id="team_core",
+        ref_type="tool",
+        ref_id="echo",
+    )
+
+    with TestClient(app) as client:
+        audit = client.get("/api/audit").json()["events"]
+
+    assert audit
+    assert {"time", "risk", "source", "status", "event_type", "action_summary"} <= set(audit[0])
+    joined = str(audit)
+    assert "token=abc123" not in joined
+    assert "https://private.example" not in joined
+    assert "raw tool arguments" not in joined.lower()
+    assert any(item["event_type"] == "approval.pending" for item in audit)
+    assert any(item["event_type"] == "approval.decided" for item in audit)
+    assert any(item["event_type"] == "tool.arguments" for item in audit)
+
+
 def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
