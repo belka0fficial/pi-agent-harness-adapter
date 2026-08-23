@@ -72,6 +72,9 @@ class FakeGates:
         self.synced_toolgate_scope_history = [*getattr(self, "synced_toolgate_scope_history", []), scopes]
         return {"id": "agent-key", "scopes": scopes}
 
+    def toolgate_execution_status(self):
+        return {"id": "agent-key", "scopes": getattr(self, "synced_toolgate_scopes", [])}
+
 
 def reset_state():
     app.state.sessions = {"sess-1": {"id": "sess-1", "title": "Real session", "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-02T00:00:00+00:00"}}
@@ -199,6 +202,35 @@ def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path)
     ]
     assert cleared.status_code == 200
     assert app.state.gates.synced_toolgate_scope_history[-1] == []
+
+
+def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        granted = client.patch("/api/agents/agent_pi_operator", json={"tool_ids": ["echo"]})
+        ok = client.post(
+            "/api/tools/echo/health",
+            json={"agent_id": "agent_pi_operator", "team_id": "team_core"},
+        )
+        denied = client.post(
+            "/api/tools/danger.write/health",
+            json={"agent_id": "agent_pi_operator", "team_id": "team_core"},
+        )
+        activity = client.get("/api/agents/agent_pi_operator/activity").json()["activity"]
+
+    assert granted.status_code == 200
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "ok"
+    assert ok.json()["registry_allowed"] is True
+    assert ok.json()["execution_scope_allowed"] is True
+    assert ok.json()["required_scope"] == "tool:echo"
+    assert denied.status_code == 403
+    assert "tool.health_checked" in [item["event_type"] for item in activity]
+    assert "danger.write" not in str(activity)
 
 
 def test_team_membership_updates_agent_team_ids(monkeypatch, tmp_path):

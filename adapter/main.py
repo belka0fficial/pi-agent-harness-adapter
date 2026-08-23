@@ -473,6 +473,13 @@ def _toolgate_scope_for_tool_id(tool_id: str) -> str:
     return f"tool:{value}"
 
 
+def _toolgate_scope_allows_tool(tool_id: str, scopes: list[str]) -> bool:
+    wanted = _toolgate_scope_for_tool_id(tool_id)
+    if not wanted:
+        return False
+    return _capability_allowed(wanted, scopes)
+
+
 def _effective_toolgate_scopes() -> list[str]:
     grants: set[str] = set()
     for item in [*app.state.agents.values(), *app.state.teams.values()]:
@@ -1593,6 +1600,49 @@ def agentgate_tools(agent_id: str | None = None, team_id: str | None = None):
         "allowed_ids": allowed,
         "total": len(rows),
         "visible": len(visible),
+    }
+
+
+@app.post("/api/tools/{tool_id}/health")
+def agentgate_tool_health(tool_id: str, payload: dict[str, Any] | None = None):
+    payload = payload or {}
+    actor = _permission_context(payload.get("agent_id"), payload.get("team_id"))
+    if not _tool_allowed(tool_id, actor["tool_ids"]):
+        raise HTTPException(403, "tool is not granted to the selected agent/team")
+    tool = next((row for row in app.state.gates.tools() if str(row.get("id") or "") == tool_id), None)
+    if not tool:
+        raise HTTPException(404, "tool not found")
+    try:
+        execution_status = app.state.gates.toolgate_execution_status()
+        execution_scopes = [str(item) for item in execution_status.get("scopes", [])]
+        execution_allowed = _toolgate_scope_allows_tool(tool_id, execution_scopes)
+        toolgate_status = "ok"
+    except (RuntimeError, AttributeError):
+        execution_scopes = []
+        execution_allowed = False
+        toolgate_status = "unavailable"
+    status = "ok" if toolgate_status == "ok" and execution_allowed and tool.get("status") == "active" else "blocked"
+    _record_activity(
+        actor["agent_id"],
+        event_type="tool.health_checked",
+        status=status,
+        source="AgentGate",
+        summary=f"Tool access checked: {tool_id}",
+        team_id=actor["team_id"],
+        ref_type="tool",
+        ref_id=tool_id,
+    )
+    return {
+        "tool_id": tool_id,
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "status": status,
+        "toolgate_status": toolgate_status,
+        "tool_status": tool.get("status") or "unknown",
+        "registry_allowed": True,
+        "execution_scope_allowed": execution_allowed,
+        "required_scope": _toolgate_scope_for_tool_id(tool_id),
+        "authorization": tool.get("authorization") or "auto",
     }
 
 
