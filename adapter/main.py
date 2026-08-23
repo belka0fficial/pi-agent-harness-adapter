@@ -90,6 +90,58 @@ class TeamInput(BaseModel):
     skill_ids: list[str] = Field(default_factory=list)
 
 
+TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
+    "persona-development": {
+        "id": "persona-development",
+        "name": "Persona Development Team",
+        "purpose": "Help the owner shape education, body, skills, personality, goals, and long-term direction with scoped context.",
+        "memory_scopes": ["persona-development"],
+    },
+    "emotional-reflection": {
+        "id": "emotional-reflection",
+        "name": "Emotional Reflection Team",
+        "purpose": "Support private daily reflection and emotional processing while keeping sensitive memory access explicitly scoped.",
+        "memory_scopes": ["emotional-reflection"],
+    },
+    "tech-invention": {
+        "id": "tech-invention",
+        "name": "Tech Invention Team",
+        "purpose": "Invent, build, test, and document software ideas for the private AgentGate stack and owner projects.",
+        "memory_scopes": ["project-context"],
+    },
+    "automation": {
+        "id": "automation",
+        "name": "Automation Team",
+        "purpose": "Design safe cron jobs, routines, notifications, and maintenance loops that stay approval-gated when actions matter.",
+        "memory_scopes": ["automation-context"],
+    },
+    "security": {
+        "id": "security",
+        "name": "Security Team",
+        "purpose": "Review ports, secrets, permissions, scopes, risky flows, and rollback paths before higher-trust delegation.",
+        "memory_scopes": ["system-summary"],
+    },
+    "knowledge": {
+        "id": "knowledge",
+        "name": "Knowledge Team",
+        "purpose": "Organize notes, summaries, research trails, and reusable knowledge without exposing memory contents by default.",
+        "memory_scopes": ["knowledge-index"],
+    },
+    "creative-character": {
+        "id": "creative-character",
+        "name": "Creative Character Team",
+        "purpose": "Draft agent identities, character profiles, voice/style concepts, and story-safe creative options for owner review.",
+        "memory_scopes": ["character-studio"],
+    },
+    "operations": {
+        "id": "operations",
+        "name": "Operations Team",
+        "purpose": "Coordinate system health, backups, routine checks, and owner-facing operational status across the local stack.",
+        "memory_scopes": ["system-summary"],
+    },
+}
+
+
 DATA_DIR = Path(os.environ.get("ADAPTER_DATA_DIR", "/app/data"))
 REGISTRY_DB = DATA_DIR / "registry.sqlite3"
 
@@ -1361,6 +1413,60 @@ def list_teams():
     for item in app.state.teams.values():
         teams.append({**item, "recent_activity": _list_activity(team_id=item.get("id"), limit=3)})
     return {"teams": teams}
+
+
+@app.get("/api/team-templates")
+def list_team_templates():
+    _ensure_registry_seeded()
+    existing_slugs = {
+        _slug(item.get("name") or "") for item in app.state.teams.values()
+    }
+    templates = []
+    for template in TEAM_TEMPLATES.values():
+        templates.append({
+            **template,
+            "tool_ids": [],
+            "skill_ids": [],
+            "already_created": _slug(template["name"]) in existing_slugs,
+        })
+    return {"templates": templates}
+
+
+@app.post("/api/team-templates/{template_id}/create")
+def create_team_from_template(
+    template_id: str,
+    payload: dict[str, Any] | None = None,
+):
+    _ensure_registry_seeded()
+    template = TEAM_TEMPLATES.get(template_id)
+    if not template:
+        raise HTTPException(404, "team template not found")
+    payload = payload or {}
+    orchestrator = str(
+        payload.get("orchestrator_agent_id") or "agent_pi_operator"
+    ).strip()
+    member_ids = payload.get("member_agent_ids") or [orchestrator]
+    team_input = TeamInput(
+        name=template["name"],
+        purpose=template["purpose"],
+        orchestrator_agent_id=orchestrator,
+        member_agent_ids=member_ids,
+        memory_scopes=list(template.get("memory_scopes") or []),
+        tool_ids=[],
+        skill_ids=[],
+    )
+    team = create_team(team_input)
+    _record_activity(
+        team.get("orchestrator_agent_id") or "agent_pi_operator",
+        event_type="team.template_created",
+        status="created",
+        source="AgentGate",
+        summary=f"Team template created: {team.get('name')}",
+        team_id=team.get("id"),
+        ref_type="team_template",
+        ref_id=template_id,
+    )
+    return team
 
 
 @app.get("/api/teams/{team_id}")

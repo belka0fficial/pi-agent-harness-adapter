@@ -272,6 +272,34 @@ def test_team_membership_updates_agent_team_ids(monkeypatch, tmp_path):
     assert app.state.agents[agent_id]["team_ids"] == []
 
 
+def test_team_templates_create_metadata_only_team(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        templates = client.get("/api/team-templates").json()["templates"]
+        created = client.post("/api/team-templates/security/create").json()
+        updated_templates = client.get("/api/team-templates").json()["templates"]
+
+    security_template = next(
+        item for item in templates if item["id"] == "security"
+    )
+    updated_security = next(
+        item for item in updated_templates if item["id"] == "security"
+    )
+    assert security_template["tool_ids"] == []
+    assert security_template["skill_ids"] == []
+    assert created["name"] == "Security Team"
+    assert created["orchestrator_agent_id"] == "agent_pi_operator"
+    assert created["member_agent_ids"] == ["agent_pi_operator"]
+    assert created["tool_ids"] == []
+    assert created["skill_ids"] == []
+    assert created["memory_scopes"] == ["system-summary"]
+    assert created["id"] in app.state.agents["agent_pi_operator"]["team_ids"]
+    assert updated_security["already_created"] is True
+
+
 def test_automation_jobs_persist_to_sqlite(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
