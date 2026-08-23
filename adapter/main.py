@@ -1281,7 +1281,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_id = _safe_summary(ref_id, limit=160)
     if not clean_type or not clean_id:
         raise HTTPException(422, "ref_type and ref_id are required")
-    supported_types = {"job", "task", "session", "tool_draft", "memory_candidate"}
+    supported_types = {"agent", "team", "job", "task", "session", "tool_draft", "memory_candidate"}
     if clean_type not in supported_types:
         raise HTTPException(422, "unsupported workstream reference type")
     activity = [
@@ -1295,7 +1295,27 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
         if item.get("ref_type") == clean_type and item.get("ref_id") == clean_id
     ][:20]
     detail: dict[str, Any]
-    if clean_type == "job":
+    if clean_type == "agent":
+        if clean_id not in app.state.agents:
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _public_agent(app.state.agents[clean_id], activity_limit=5)
+    elif clean_type == "team":
+        if clean_id not in app.state.teams:
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _public_team(app.state.teams[clean_id], activity_limit=5)
+    elif clean_type == "job":
         if clean_id not in app.state.jobs:
             detail = {
                 "id": clean_id,

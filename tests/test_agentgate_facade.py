@@ -1789,11 +1789,15 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
         job_detail = client.get(f"/api/workstream/refs/job/{job.json()['id']}")
         memory_detail = client.get("/api/workstream/refs/memory_candidate/memcand_workstream")
         ghost_detail = client.get("/api/workstream/refs/job/job_missing_from_runtime")
+        agent_detail = client.get("/api/workstream/refs/agent/agent_pi_operator")
+        team_detail = client.get("/api/workstream/refs/team/team_core")
 
     assert response.status_code == 200
     assert job_detail.status_code == 200
     assert memory_detail.status_code == 200
     assert ghost_detail.status_code == 200
+    assert agent_detail.status_code == 200
+    assert team_detail.status_code == 200
     body = response.json()
     events = body["events"]
     kinds = {item["kind"] for item in events}
@@ -1820,6 +1824,8 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
         assert forbidden not in joined
         assert forbidden not in job_detail.text.lower()
         assert forbidden not in memory_detail.text.lower()
+        assert forbidden not in agent_detail.text.lower()
+        assert forbidden not in team_detail.text.lower()
     job_body = job_detail.json()
     assert job_body["ref_type"] == "job"
     assert job_body["detail"]["name"] == "Morning proof"
@@ -1836,6 +1842,16 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert ghost_body["detail"]["available"] is False
     assert ghost_body["detail"]["state"] == "audit_only"
     assert ghost_body["events"][0]["ref_id"] == "job_missing_from_runtime"
+    agent_body = agent_detail.json()
+    assert agent_body["ref_type"] == "agent"
+    assert agent_body["detail"]["id"] == "agent_pi_operator"
+    assert "profile_readiness" in agent_body["detail"]
+    assert agent_body["safety"]["mode"] == "metadata_only"
+    team_body = team_detail.json()
+    assert team_body["ref_type"] == "team"
+    assert team_body["detail"]["id"] == "team_core"
+    assert "orchestration_readiness" in team_body["detail"]
+    assert team_body["safety"]["mode"] == "metadata_only"
 
 
 def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
