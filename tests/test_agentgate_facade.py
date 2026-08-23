@@ -15,6 +15,18 @@ class FakeGates:
             return [{"id": "req-decided", "source": "ToolGate", "severity": "low", "title": "Completed request", "details": "Already reviewed", "binding": {"type": "tool", "id": "echo", "version": "1", "digest": "abc"}, "decision": "approved", "decided_at": "2026-01-01T00:00:00+00:00", "decided_by": "Owner", "created_at": "2026-01-01T00:00:00+00:00"}]
         return [{"id": "req-pending", "source": "ToolGate", "severity": "medium", "title": "Run echo", "details": "Approval required", "binding": {"type": "tool", "id": "echo", "version": "1", "digest": "def"}, "created_at": "2026-01-02T00:00:00+00:00"}]
 
+    def operations_summary(self, *, pending=None):
+        return {
+            "service_health": {},
+            "pending_approvals": len(pending or []),
+            "action_counts_24h": {"approved": 1, "rejected": 1, "expired": 0, "failed": 0},
+            "recent_verification_events": [
+                {"time": "2026-01-02T00:00:00+00:00", "risk": "low", "source": "ToolGate", "action_summary": "request decided request req-decided"}
+            ],
+            "toolgate_counts": {"success": 2, "failure": 0},
+            "memorygate_counts": {"reads": 3, "writes": 1},
+        }
+
     def memory_records(self):
         return [{"id": "mem-1", "title": "Owner prefers concise updates", "kind": "preference", "confidence": "high", "updated_at": "2026-01-03T00:00:00+00:00"}]
 
@@ -85,6 +97,9 @@ def test_agentgate_facade_aggregates_gates_without_exposing_credentials():
         character = client.get("/api/character").json()
     assert home["health"]["pi"]["status"] == "ok"
     assert home["health"]["toolgate"]["status"] == "ok"
+    assert home["operations"]["pending_approvals"] == 1
+    assert home["operations"]["toolgate_counts"] == {"success": 2, "failure": 0}
+    assert home["operations"]["memorygate_counts"] == {"reads": 3, "writes": 1}
     assert home["pending_verifications"][0]["id"] == "req-pending"
     assert system["vitals"]["cpu_percent"] == 12
     assert pending[0]["id"] == "req-pending"
@@ -358,13 +373,13 @@ def test_chat_retrieves_memorygate_context_and_records_completed_transcript():
 
 def test_chat_uses_selected_agent_model_defaults_when_payload_omits_model():
     reset_state()
-    main._ensure_registry_seeded()
-    app.state.agents["agent_pi_operator"]["primary_provider"] = "openai-codex"
-    app.state.agents["agent_pi_operator"]["primary_model"] = "gpt-5.6-luna"
     pi = CapturingPi()
     app.state.pi = pi
 
     with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["primary_provider"] = "openai-codex"
+        app.state.agents["agent_pi_operator"]["primary_model"] = "gpt-5.6-luna"
         response = client.post("/api/sessions/sess-1/chat/stream", json={"input": "Use default model"})
 
     assert response.status_code == 200

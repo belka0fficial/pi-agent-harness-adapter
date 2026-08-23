@@ -4,6 +4,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 
@@ -27,6 +28,47 @@ class GateClients:
                 "X-SystemGate-Key",
                 os.environ.get("SYSTEMGATE_ADMIN_KEY", ""),
             ),
+        }
+        self.memory_counts = {"reads": 0, "writes": 0}
+
+    @staticmethod
+    def _parse_time(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+
+    @staticmethod
+    def _safe_label(value: Any) -> str:
+        text = str(value or "").replace("_", " ").replace("-", " ").strip()
+        text = " ".join(text.split())
+        text = text.replace("key", "credential").replace("Key", "Credential")
+        return text[:140]
+
+    @classmethod
+    def _redacted_event(cls, event: dict[str, Any]) -> dict[str, Any]:
+        event_type = str(event.get("event_type") or "event")
+        severity = str(event.get("severity") or "info").lower()
+        risk = {
+            "critical": "high",
+            "error": "high",
+            "warning": "medium",
+            "warn": "medium",
+            "info": "low",
+        }.get(severity, "low")
+        subject_type = cls._safe_label(event.get("subject_type") or "event")
+        subject_id = cls._safe_label(event.get("subject_id") or "")
+        summary = cls._safe_label(f"{event_type} {subject_type} {subject_id}")
+        return {
+            "time": str(event.get("created_at") or ""),
+            "risk": risk,
+            "source": "ToolGate",
+            "action_summary": summary,
         }
 
     def _request(self, service: str, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, timeout: float = 8):
@@ -136,6 +178,7 @@ class GateClients:
         )
 
     def memory_context(self, query: str, *, agent_id: str | None = None) -> dict[str, Any]:
+        self.memory_counts["reads"] += 1
         payload = self._memory_read_request(
             "/runtime/context",
             method="POST",
@@ -145,6 +188,7 @@ class GateClients:
         return payload if isinstance(payload, dict) else {}
 
     def record_transcript(self, session_id: str, messages: list[dict[str, Any]], *, agent_id: str | None = None):
+        self.memory_counts["writes"] += 1
         transcript = "\n\n".join(
             f"{str(message.get('role') or 'unknown').upper()}: {str(message.get('content') or '')}"
             for message in messages
@@ -157,6 +201,7 @@ class GateClients:
         )
 
     def write_memory_candidate(self, candidate: dict[str, Any]):
+        self.memory_counts["writes"] += 1
         payload = {
             "text": candidate["text"],
             "source_type": candidate.get("source_type", "agentgate_owner_approved"),
@@ -169,6 +214,7 @@ class GateClients:
         return self._request("memorygate", "/memory/write", method="POST", payload=payload)
 
     def memory_records(self) -> list[dict[str, Any]]:
+        self.memory_counts["reads"] += 1
         payload = self._request("memorygate", "/memory")
         rows = payload if isinstance(payload, list) else payload.get("results", payload.get("memories", []))
         return [{
@@ -218,4 +264,70 @@ class GateClients:
             "packages": packages.get("packages", packages if isinstance(packages, list) else []),
             "backups": {"latest": backup_rows[0] if backup_rows else None},
             "sources": sources,
+        }
+
+    def operations_summary(self, *, pending: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        cutoff = datetime.now(UTC) - timedelta(hours=24)
+        try:
+            requests_payload = self._request("toolgate", "/v2/requests")
+            requests = requests_payload if isinstance(requests_payload, list) else requests_payload.get("results", requests_payload.get("requests", []))
+        except RuntimeError:
+            requests = []
+        try:
+            events_payload = self._request("toolgate", "/v2/events?limit=100")
+            events = events_payload if isinstance(events_payload, list) else events_payload.get("results", events_payload.get("events", []))
+        except RuntimeError:
+            events = []
+
+        recent_requests = []
+        for record in requests:
+            decision = record.get("decision") if isinstance(record.get("decision"), dict) else {}
+            observed_at = self._parse_time(decision.get("at") or record.get("updated_at") or record.get("created_at"))
+            if observed_at and observed_at >= cutoff:
+                recent_requests.append(record)
+
+        action_counts = {"approved": 0, "rejected": 0, "expired": 0, "failed": 0}
+        now_dt = datetime.now(UTC)
+        for record in recent_requests:
+            status = str(record.get("status") or "pending")
+            if status == "approved":
+                action_counts["approved"] += 1
+            elif status in {"rejected", "dismissed"}:
+                action_counts["rejected"] += 1
+            payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+            binding = payload.get("binding") if isinstance(payload.get("binding"), dict) else payload
+            expires_at = self._parse_time(binding.get("expires_at"))
+            if status == "pending" and expires_at and expires_at < now_dt:
+                action_counts["expired"] += 1
+
+        recent_events = []
+        tool_success = 0
+        tool_failure = 0
+        for event in events:
+            created = self._parse_time(event.get("created_at"))
+            if not created or created < cutoff:
+                continue
+            event_type = str(event.get("event_type") or "")
+            subject_type = str(event.get("subject_type") or "")
+            severity = str(event.get("severity") or "").lower()
+            if subject_type == "tool" and event_type == "tool_executed":
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                if payload.get("ok") is False:
+                    tool_failure += 1
+                else:
+                    tool_success += 1
+            elif subject_type == "tool" and (severity in {"warning", "critical", "error"} or "failed" in event_type or "blocked" in event_type):
+                tool_failure += 1
+            if severity in {"warning", "critical", "error"} or "failed" in event_type or "blocked" in event_type:
+                action_counts["failed"] += 1
+            if event_type.startswith("verification") or event_type.startswith("request_") or subject_type in {"request", "verification_method"}:
+                recent_events.append(self._redacted_event(event))
+
+        return {
+            "service_health": {},
+            "pending_approvals": len(pending or []),
+            "action_counts_24h": action_counts,
+            "recent_verification_events": recent_events[:8],
+            "toolgate_counts": {"success": tool_success, "failure": tool_failure},
+            "memorygate_counts": dict(self.memory_counts),
         }

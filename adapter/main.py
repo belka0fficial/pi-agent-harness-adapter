@@ -1044,8 +1044,12 @@ def agentgate_automations():
 def agentgate_home():
     gates = app.state.gates
     pending = gates.approvals(history=False)
+    health = {"pi": {"status": "ok"}, **gates.health()}
+    operations = gates.operations_summary(pending=pending)
+    operations["service_health"] = health
     return {
-        "health": {"pi": {"status": "ok"}, **gates.health()},
+        "health": health,
+        "operations": operations,
         "pending_verifications": pending,
         "suggestions": [],
         "anomalies": [],
