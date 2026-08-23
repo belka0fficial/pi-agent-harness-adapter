@@ -661,6 +661,32 @@ def test_agent_activity_records_safe_chat_and_job_metadata(monkeypatch, tmp_path
     assert all("summary" in item and "created_at" in item for item in activity)
 
 
+def test_global_activity_feed_uses_safe_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+
+    with TestClient(app) as client:
+        chat = client.post(
+            "/api/sessions/sess-global-activity/chat/stream",
+            json={"input": "Private global prompt must not be stored"},
+        )
+        assert chat.status_code == 200
+        home = client.get("/api/home").json()
+        activity = client.get("/api/activity").json()["activity"]
+
+    assert home["activity_feed"]
+    assert home["activity"]
+    assert activity
+    assert "chat.started" in [item["event_type"] for item in activity]
+    assert "chat.completed" in [item["event_type"] for item in activity]
+    assert "Private global prompt" not in str(home)
+    assert "Private global prompt" not in str(activity)
+    required_keys = {"event_type", "status", "source", "summary", "created_at"}
+    assert all(required_keys <= set(item) for item in activity)
+
+
 def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

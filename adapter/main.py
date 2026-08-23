@@ -1670,6 +1670,7 @@ def agentgate_home():
     health = {"pi": {"status": "ok"}, **gates.health()}
     operations = gates.operations_summary(pending=pending)
     operations["service_health"] = health
+    activity_feed = _list_activity(limit=12)
     system = gates.system_overview()
     return {
         "health": health,
@@ -1679,9 +1680,22 @@ def agentgate_home():
         "pending_verifications": pending,
         "suggestions": [],
         "anomalies": [],
-        "activity": [],
+        "activity": [
+            f"{item.get('event_type')} · {item.get('status')} · {item.get('source')}"
+            for item in activity_feed[:8]
+        ],
+        "activity_feed": activity_feed,
         "pinned_apps": [],
     }
+
+
+@app.get("/api/activity")
+def agentgate_activity(
+    limit: int = 40,
+    agent_id: str | None = None,
+    team_id: str | None = None,
+):
+    return {"activity": _list_activity(agent_id=agent_id, team_id=team_id, limit=limit)}
 
 
 @app.get("/api/system")
