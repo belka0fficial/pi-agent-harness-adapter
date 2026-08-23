@@ -448,7 +448,21 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
             "scopes": ["tool:echo"],
             "status": "active",
         },
+        {
+            "id": "tg-ready-team",
+            "name": "AgentGate:agent_pi_operator@team_core",
+            "scopes": ["tool:echo"],
+            "status": "active",
+        },
     ]
+    app.state.gates.toolgate_private_keys = {
+        "agent_pi_operator": "tgx_fake_private_key_agent_pi_operator_1234567890",
+        "agent_pi_operator@team_core": "tgx_fake_private_key_agent_pi_operator_team_core_1234567890",
+    }
+    app.state.gates.toolgate_private_key_scopes = {
+        "agent_pi_operator": ["tool:echo"],
+        "agent_pi_operator@team_core": ["tool:echo"],
+    }
     app.state.gates.memorygate_keys = [
         {
             "id": "mg-ready",
@@ -485,6 +499,14 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
     assert ready["memorygate_adapter_credential_status"] == "ready"
     assert ready["expected_tool_scope_count"] == 1
     assert ready["expected_memory_scope_count"] == 3
+    ready_contexts = [
+        row
+        for row in boundaries["toolgate_contexts"]
+        if row["agent_id"] == "agent_pi_operator"
+    ]
+    assert boundaries["summary"]["toolgate_contexts"] >= 2
+    assert {row["team_id"] for row in ready_contexts} >= {None, "team_core"}
+    assert all(row["status"] == "ready" for row in ready_contexts)
     assert missing["status"] == "drift"
     assert missing["toolgate_key_status"] == "ready"
     assert missing["toolgate_adapter_credential_status"] == "ready"

@@ -1220,6 +1220,16 @@ def _label_matches_agent(label: Any, agent_id: str) -> bool:
     return normalized in labels or normalized.startswith(f"agentgate:{wanted}@")
 
 
+def _label_matches_toolgate_context(label: Any, agent_id: str, team_id: str | None) -> bool:
+    normalized = str(label or "").strip().lower()
+    wanted_agent = str(agent_id or "").strip().lower()
+    wanted_team = str(team_id or "").strip().lower()
+    if not wanted_agent:
+        return False
+    wanted = f"agentgate:{wanted_agent}@{wanted_team}" if wanted_team else f"agentgate:{wanted_agent}"
+    return normalized == wanted
+
+
 def _native_access_boundaries() -> dict[str, Any]:
     _ensure_registry_seeded()
     try:
@@ -1235,6 +1245,7 @@ def _native_access_boundaries() -> dict[str, Any]:
         memorygate_keys = []
         memorygate_available = False
     rows = []
+    toolgate_context_rows = []
     for agent_id, agent in sorted(app.state.agents.items()):
         expected_tool_scopes = _expected_toolgate_scopes_for_actor(agent_id)
         expected_tool_contexts = _expected_toolgate_contexts_for_actor(agent_id)
@@ -1263,26 +1274,65 @@ def _native_access_boundaries() -> dict[str, Any]:
             )
         except AttributeError:
             adapter_toolgate_credential_ready = False
-        tool_scope_ready = False
-        if not expected_tool_scopes:
-            tool_scope_ready = bool(matching_tool_keys) or not toolgate_available
-        else:
-            for key in matching_tool_keys:
-                scopes = [str(scope) for scope in key.get("scopes", [])]
-                if all(_toolgate_scope_allows_tool(scope.removeprefix("tool:"), scopes) for scope in expected_tool_scopes):
-                    tool_scope_ready = True
-                    break
-        tool_key_ready = not expected_tool_scopes or (
-            bool(matching_tool_keys) and tool_scope_ready and adapter_toolgate_credential_ready
-        )
+        agent_tool_context_ready = True
+        for context in expected_tool_contexts:
+            team_id = context.get("team_id")
+            context_scopes = [str(scope) for scope in context.get("scopes", [])]
+            context_matching_keys = [
+                key
+                for key in toolgate_keys
+                if _label_matches_toolgate_context(key.get("name") or key.get("label"), agent_id, team_id)
+                and str(key.get("status") or "active") == "active"
+            ]
+            context_scope_ready = False
+            if not context_scopes:
+                context_scope_ready = True
+            else:
+                for key in context_matching_keys:
+                    scopes = [str(scope) for scope in key.get("scopes", [])]
+                    if all(_toolgate_scope_allows_tool(scope.removeprefix("tool:"), scopes) for scope in context_scopes):
+                        context_scope_ready = True
+                        break
+            try:
+                context_adapter_ready = not context_scopes or app.state.gates.has_toolgate_agent_execution_key(
+                    agent_id,
+                    team_id=team_id,
+                )
+            except AttributeError:
+                context_adapter_ready = False
+            context_issues = []
+            if not toolgate_available:
+                context_issues.append("ToolGate key inventory unavailable")
+            elif context_scopes and not context_matching_keys:
+                context_issues.append("missing native ToolGate key record")
+            elif context_scopes and not context_scope_ready:
+                context_issues.append("ToolGate scopes do not match context grants")
+            elif context_scopes and not context_adapter_ready:
+                context_issues.append("adapter ToolGate execution credential unavailable")
+            context_ready = toolgate_available and (not context_scopes or (bool(context_matching_keys) and context_scope_ready and context_adapter_ready))
+            if not context_ready:
+                agent_tool_context_ready = False
+            toolgate_context_rows.append({
+                "agent_id": agent_id,
+                "agent_name": agent.get("name") or agent_id,
+                "team_id": team_id,
+                "team_name": (app.state.teams.get(team_id) or {}).get("name") if team_id else "",
+                "expected_tool_scope_count": len(context_scopes),
+                "toolgate_key_status": "ready" if context_ready else "missing" if toolgate_available else "unavailable",
+                "toolgate_key_count": len(context_matching_keys),
+                "toolgate_adapter_credential_status": "ready" if context_adapter_ready else "missing",
+                "status": "ready" if context_ready else "drift",
+                "issues": context_issues[:4],
+            })
+        tool_key_ready = agent_tool_context_ready
         memory_key_ready = not expected_memory_scopes or (bool(matching_memory_keys) and adapter_memory_credential_ready)
         issues = []
         if not toolgate_available:
             issues.append("ToolGate key inventory unavailable")
-        elif not matching_tool_keys:
+        elif expected_tool_scopes and not agent_tool_context_ready:
+            issues.append("one or more ToolGate team contexts are not ready")
+        elif expected_tool_scopes and not matching_tool_keys:
             issues.append("missing native ToolGate key record")
-        elif not tool_scope_ready:
-            issues.append("ToolGate scopes do not match effective grants")
         elif expected_tool_scopes and not adapter_toolgate_credential_ready:
             issues.append("adapter ToolGate execution credential unavailable")
         if not memorygate_available:
@@ -1313,10 +1363,14 @@ def _native_access_boundaries() -> dict[str, Any]:
             "agents": len(rows),
             "ready": sum(1 for row in rows if row["status"] == "ready"),
             "drift": sum(1 for row in rows if row["status"] != "ready"),
+            "toolgate_contexts": len(toolgate_context_rows),
+            "toolgate_contexts_ready": sum(1 for row in toolgate_context_rows if row["status"] == "ready"),
+            "toolgate_contexts_drift": sum(1 for row in toolgate_context_rows if row["status"] != "ready"),
             "toolgate_inventory": "ok" if toolgate_available else "unavailable",
             "memorygate_inventory": "ok" if memorygate_available else "unavailable",
         },
         "agents": rows,
+        "toolgate_contexts": toolgate_context_rows,
     }
 
 
