@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import hmac
+import hashlib
 import json
 import os
 import sqlite3
@@ -46,6 +47,7 @@ class JobInput(BaseModel):
     timezone: str = "UTC"
     required_tool_ids: list[str] = Field(default_factory=list)
     required_memory_scopes: list[str] = Field(default_factory=list)
+    approval_policy: str = "auto"
 
 
 class MemoryCandidateInput(BaseModel):
@@ -844,6 +846,91 @@ def _validate_job_payload(webhook_url: str | None) -> None:
         raise HTTPException(422, "job webhooks are disabled for this local proof of concept")
 
 
+def _job_prompt_digest(prompt: str) -> str:
+    return hashlib.sha256(str(prompt or "").encode("utf-8")).hexdigest()
+
+
+def _sanitize_job_approval_policy(value: Any) -> str:
+    policy = str(value or "auto").strip().lower()
+    if policy not in {"auto", "owner_confirmation"}:
+        raise HTTPException(422, "approval_policy must be auto or owner_confirmation")
+    return policy
+
+
+def _job_requires_owner_approval(payload: JobInput | dict[str, Any]) -> bool:
+    policy = _sanitize_job_approval_policy(
+        payload.approval_policy if isinstance(payload, JobInput) else payload.get("approval_policy")
+    )
+    deliver = payload.deliver if isinstance(payload, JobInput) else payload.get("deliver", "local")
+    return policy == "owner_confirmation" or str(deliver or "local") != "local"
+
+
+def _create_job_approval_request(item: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "subject_type": "automation",
+        "subject_id": item["id"],
+        "action": "schedule",
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "schedule": item.get("schedule"),
+        "timezone": item.get("timezone"),
+        "deliver": item.get("deliver", "local"),
+        "required_tool_count": len(item.get("required_tool_ids") or []),
+        "required_memory_scope_count": len(item.get("required_memory_scopes") or []),
+        "prompt_digest": _job_prompt_digest(item.get("prompt") or ""),
+    }
+    return app.state.gates.create_admin_request(
+        kind="automation_schedule",
+        title=f"Approve automation schedule: {item.get('name') or item['id']}",
+        details=(
+            "Owner approval required before this automation is scheduled. "
+            "AgentGate sent schedule metadata and a prompt digest only; raw prompt, "
+            "tool arguments, memory contents, and credentials stay server-side."
+        ),
+        payload=payload,
+        severity="warning",
+    )
+
+
+def _activate_approved_job(job_id: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
+    item = app.state.jobs.get(job_id)
+    if not item:
+        raise HTTPException(404, "job not found")
+    request_id = item.get("approval_request_id")
+    if request_id:
+        request = request or app.state.gates.request_status(request_id)
+        status = str((request or {}).get("status") or "")
+        if status != "approved":
+            if status in {"rejected", "dismissed"}:
+                item["approval_status"] = "rejected"
+                item["paused"] = True
+                item["next_run_at"] = None
+                item["updated_at"] = now()
+                _save_registry_item("job", item)
+                raise HTTPException(409, "automation approval was rejected")
+            raise HTTPException(409, "automation is still awaiting owner approval")
+    item["approval_status"] = "approved"
+    item["paused"] = False
+    item["quarantine_reason"] = None
+    _sync_scheduler(job_id)
+    scheduled = app.state.scheduler.get_job(job_id)
+    item["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
+    item["schedule_preview"] = _schedule_preview(item["schedule"], item.get("timezone"))
+    item["updated_at"] = now()
+    _save_registry_item("job", item)
+    _record_activity(
+        item.get("agent_id"),
+        event_type="job.approved",
+        status="scheduled",
+        source="ToolGate",
+        summary=f"Automation job approved and scheduled: {item.get('name') or job_id}",
+        team_id=item.get("team_id"),
+        ref_type="job",
+        ref_id=job_id,
+    )
+    return item
+
+
 def _summarize_job_output(output: str) -> str:
     text = " ".join(output.split())
     if not text:
@@ -884,9 +971,69 @@ def _append_job_run_history(item: dict[str, Any], result: dict[str, Any]) -> Non
     item["run_history"] = [run_record, *list(item.get("run_history") or [])][:12]
 
 
+def _public_job(item: dict[str, Any]) -> dict[str, Any]:
+    result = item.get("last_result") or {}
+    status = "pending_approval" if item.get("approval_status") == "pending" else "paused" if item.get("paused") else "active"
+    return {
+        "id": item.get("id"),
+        "job_id": item.get("job_id") or item.get("id"),
+        "name": item.get("name"),
+        "description": item.get("description") or "Prompt stored server-side",
+        "schedule": item.get("schedule"),
+        "timezone": item.get("timezone", "UTC"),
+        "schedule_preview": item.get("schedule_preview", []),
+        "next": item.get("next_run_at") or "—",
+        "status": status,
+        "runs": item.get("runs", 0),
+        "last_status": result.get("status", "never"),
+        "last_run": item.get("last_run_at") or "—",
+        "last_result": result,
+        "output": result.get("output_summary") or "No runs yet",
+        "history": item.get("history", "------------"),
+        "run_history": item.get("run_history", []),
+        "agent_id": item.get("agent_id"),
+        "team_id": item.get("team_id"),
+        "deliver": item.get("deliver", "local"),
+        "paused": item.get("paused", False),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "approval_policy": item.get("approval_policy", "auto"),
+        "approval_status": item.get("approval_status", "not_required"),
+        "approval_request_id": item.get("approval_request_id"),
+        "failure_count": item.get("failure_count", 0),
+        "quarantine_reason": item.get("quarantine_reason"),
+        "required_tool_ids": item.get("required_tool_ids", []),
+        "required_memory_scopes": item.get("required_memory_scopes", []),
+    }
+
+
 async def run_job(job_id: str):
     item = app.state.jobs.get(job_id)
     if not item:
+        return
+    if item.get("approval_status") == "pending":
+        item["last_run_at"] = now()
+        result = {
+            "job_id": job_id,
+            "status": "blocked",
+            "output_summary": "Automation is waiting for owner approval",
+            "output_chars": 0,
+            "error": "owner approval required before execution",
+            "completed_at": now(),
+        }
+        item["last_result"] = result
+        _append_job_run_history(item, result)
+        _save_registry_item("job", item)
+        _record_activity(
+            item.get("agent_id"),
+            event_type="job.blocked",
+            status="blocked",
+            source="ToolGate",
+            summary=f"Automation job blocked pending approval: {item.get('name') or job_id}",
+            team_id=item.get("team_id"),
+            ref_type="job",
+            ref_id=job_id,
+        )
         return
     try:
         actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
@@ -978,13 +1125,14 @@ async def run_job(job_id: str):
 
 @app.get("/api/jobs")
 def list_jobs():
-    return {"jobs": list(app.state.jobs.values())}
+    return {"jobs": [_public_job(item) for item in app.state.jobs.values()]}
 
 
 @app.post("/api/jobs")
 def create_job(payload: JobInput):
     _validate_job_payload(payload.webhook_url)
     actor = _permission_context(payload.agent_id, payload.team_id)
+    approval_policy = _sanitize_job_approval_policy(payload.approval_policy)
     required_tool_ids, required_memory_scopes = _validate_job_requirements(
         actor,
         payload.required_tool_ids,
@@ -992,6 +1140,7 @@ def create_job(payload: JobInput):
     )
     schedule_preview = _schedule_preview(payload.schedule, payload.timezone)
     job_id = f"job_{uuid.uuid4().hex[:12]}"
+    pending_approval = _job_requires_owner_approval(payload)
     item = {
         "id": job_id,
         "job_id": job_id,
@@ -1000,7 +1149,10 @@ def create_job(payload: JobInput):
         "team_id": actor["team_id"],
         "required_tool_ids": required_tool_ids,
         "required_memory_scopes": required_memory_scopes,
-        "paused": False,
+        "approval_policy": approval_policy,
+        "approval_status": "pending" if pending_approval else "not_required",
+        "approval_request_id": None,
+        "paused": pending_approval,
         "created_at": now(),
         "updated_at": now(),
         "last_run_at": None,
@@ -1010,24 +1162,28 @@ def create_job(payload: JobInput):
         "history": "------------",
         "run_history": [],
         "failure_count": 0,
-        "quarantine_reason": None,
+        "quarantine_reason": "waiting for owner approval" if pending_approval else None,
     }
     app.state.jobs[job_id] = item
-    _sync_scheduler(job_id)
-    scheduled = app.state.scheduler.get_job(job_id)
-    item["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
+    if pending_approval:
+        request = _create_job_approval_request(item, actor)
+        item["approval_request_id"] = request.get("id")
+    else:
+        _sync_scheduler(job_id)
+        scheduled = app.state.scheduler.get_job(job_id)
+        item["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
     _save_registry_item("job", item)
     _record_activity(
         actor["agent_id"],
         event_type="job.created",
-        status="scheduled",
+        status="pending_approval" if pending_approval else "scheduled",
         source="AgentGate",
         summary=f"Automation job created: {item['name']}",
         team_id=actor["team_id"],
         ref_type="job",
         ref_id=job_id,
     )
-    return item
+    return _public_job(item)
 
 
 @app.patch("/api/jobs/{job_id}")
@@ -1048,17 +1204,30 @@ def update_job(job_id: str, payload: dict[str, Any]):
         payload.get("required_tool_ids", app.state.jobs[job_id].get("required_tool_ids")),
         payload.get("required_memory_scopes", app.state.jobs[job_id].get("required_memory_scopes")),
     )
+    if "approval_policy" in payload:
+        payload["approval_policy"] = _sanitize_job_approval_policy(payload.get("approval_policy"))
     payload = {
         **payload,
         "required_tool_ids": next_required_tools,
         "required_memory_scopes": next_required_memory,
     }
-    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes"}})
+    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes", "approval_policy"}})
     app.state.jobs[job_id]["updated_at"] = now()
-    _sync_scheduler(job_id)
-    scheduled = app.state.scheduler.get_job(job_id)
-    app.state.jobs[job_id]["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
     app.state.jobs[job_id]["schedule_preview"] = schedule_preview
+    if _job_requires_owner_approval(app.state.jobs[job_id]) and app.state.jobs[job_id].get("approval_status") != "approved":
+        app.state.jobs[job_id]["paused"] = True
+        app.state.jobs[job_id]["next_run_at"] = None
+        app.state.jobs[job_id]["approval_status"] = "pending"
+        app.state.jobs[job_id]["quarantine_reason"] = "waiting for owner approval"
+        if app.state.scheduler.get_job(job_id):
+            app.state.scheduler.remove_job(job_id)
+        if not app.state.jobs[job_id].get("approval_request_id"):
+            request = _create_job_approval_request(app.state.jobs[job_id], actor)
+            app.state.jobs[job_id]["approval_request_id"] = request.get("id")
+    else:
+        _sync_scheduler(job_id)
+        scheduled = app.state.scheduler.get_job(job_id)
+        app.state.jobs[job_id]["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
     _save_registry_item("job", app.state.jobs[job_id])
     _record_activity(
         app.state.jobs[job_id].get("agent_id"),
@@ -1070,7 +1239,7 @@ def update_job(job_id: str, payload: dict[str, Any]):
         ref_type="job",
         ref_id=job_id,
     )
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -1093,13 +1262,15 @@ def pause_job(job_id: str):
     app.state.jobs[job_id]["next_run_at"] = None
     app.state.jobs[job_id]["updated_at"] = now()
     _save_registry_item("job", app.state.jobs[job_id])
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
 
 
 @app.post("/api/jobs/{job_id}/resume")
 def resume_job(job_id: str):
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
+    if app.state.jobs[job_id].get("approval_status") == "pending":
+        return _public_job(_activate_approved_job(job_id))
     app.state.jobs[job_id]["paused"] = False
     _sync_scheduler(job_id)
     scheduled = app.state.scheduler.get_job(job_id)
@@ -1107,7 +1278,7 @@ def resume_job(job_id: str):
     app.state.jobs[job_id]["schedule_preview"] = _schedule_preview(app.state.jobs[job_id]["schedule"], app.state.jobs[job_id].get("timezone"))
     app.state.jobs[job_id]["updated_at"] = now()
     _save_registry_item("job", app.state.jobs[job_id])
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
 
 
 @app.post("/api/jobs/{job_id}/run")
@@ -1115,7 +1286,7 @@ async def run_now(job_id: str):
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
     await run_job(job_id)
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
 
 
 @app.post("/api/sessions/{session_id}/fork")
@@ -1742,24 +1913,7 @@ def agentgate_chat_messages(session_id: str):
 
 @app.get("/api/automations")
 def agentgate_automations():
-    rows = []
-    for item in app.state.jobs.values():
-        result = item.get("last_result") or {}
-        rows.append({
-            **item,
-            "status": "paused" if item.get("paused") else "active",
-            "next": item.get("next_run_at") or "—",
-            "runs": item.get("runs", 0),
-            "last_status": result.get("status", "never"),
-            "last_run": item.get("last_run_at") or "—",
-            "last_result": result,
-            "output": result.get("output_summary") or "No runs yet",
-            "history": item.get("history", "------------"),
-            "description": item.get("description") or item.get("prompt", ""),
-            "required_tool_ids": item.get("required_tool_ids", []),
-            "required_memory_scopes": item.get("required_memory_scopes", []),
-        })
-    return {"automations": rows}
+    return {"automations": [_public_job(item) for item in app.state.jobs.values()]}
 
 
 @app.get("/api/home")
@@ -1838,6 +1992,22 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
         )
         return {"run_id": binding["run_id"], "session_id": binding["session_id"], "decision": decision, "request_id": record.get("id", request_id), "status": record.get("status", decision)}
     result = app.state.gates.decide_approval(request_id, decision)
+    request_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    if result.get("kind") == "automation_schedule" and request_payload.get("subject_type") == "automation":
+        job_id = str(request_payload.get("subject_id") or "")
+        job = app.state.jobs.get(job_id)
+        if job:
+            if decision == "approved":
+                _activate_approved_job(job_id, result)
+                result["automation_status"] = "scheduled"
+            else:
+                job["approval_status"] = "rejected"
+                job["paused"] = True
+                job["next_run_at"] = None
+                job["quarantine_reason"] = "owner rejected automation schedule"
+                job["updated_at"] = now()
+                _save_registry_item("job", job)
+                result["automation_status"] = "rejected"
     _record_activity(
         "agent_pi_operator",
         event_type="approval.decided",

@@ -197,6 +197,37 @@ class GateClients:
             payload={"status": decision, "note": "Decided in AgentGate"},
         )
 
+    def create_admin_request(
+        self,
+        *,
+        kind: str,
+        title: str,
+        details: str,
+        payload: dict[str, Any],
+        severity: str = "warning",
+    ) -> dict[str, Any]:
+        result = self._request(
+            "toolgate",
+            "/v2/admin/requests",
+            method="POST",
+            payload={
+                "kind": kind,
+                "title": title,
+                "details": details,
+                "payload": payload,
+                "severity": severity,
+            },
+        )
+        return result if isinstance(result, dict) else {}
+
+    def request_status(self, request_id: str) -> dict[str, Any] | None:
+        payload = self._request("toolgate", "/v2/requests")
+        rows = payload if isinstance(payload, list) else payload.get("results", payload.get("requests", []))
+        for row in rows:
+            if row.get("id") == request_id:
+                return row
+        return None
+
     def toolgate_execution_status(self) -> dict[str, Any]:
         payload = self._toolgate_execution_request("/v2/agent/status")
         return payload if isinstance(payload, dict) else {}

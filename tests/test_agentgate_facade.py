@@ -80,7 +80,27 @@ class FakeGates:
         ]
 
     def decide_approval(self, request_id: str, decision: str):
-        return {"id": request_id, "decision": decision}
+        record = getattr(self, "requests", {}).get(request_id, {"id": request_id, "payload": {}})
+        record = {**record, "status": decision, "decision": {"actor": "admin"}}
+        self.requests = {**getattr(self, "requests", {}), request_id: record}
+        return record
+
+    def create_admin_request(self, *, kind: str, title: str, details: str, payload: dict, severity: str = "warning"):
+        request_id = f"req-{len(getattr(self, 'requests', {})) + 1}"
+        record = {
+            "id": request_id,
+            "kind": kind,
+            "title": title,
+            "details": details,
+            "payload": payload,
+            "severity": severity,
+            "status": "pending",
+        }
+        self.requests = {**getattr(self, "requests", {}), request_id: record}
+        return record
+
+    def request_status(self, request_id: str):
+        return getattr(self, "requests", {}).get(request_id)
 
     def memory_context(self, query: str, *, agent_id: str | None = None):
         self.memory_agent_id = agent_id
@@ -165,7 +185,8 @@ def test_agentgate_facade_decides_toolgate_approval():
     with TestClient(app) as client:
         response = client.post("/api/approvals/req-pending/decision", json={"decision": "approved"})
     assert response.status_code == 200
-    assert response.json() == {"id": "req-pending", "decision": "approved"}
+    assert response.json()["id"] == "req-pending"
+    assert response.json()["status"] == "approved"
 
 
 def test_agent_registry_persists_to_sqlite(monkeypatch, tmp_path):
@@ -935,6 +956,46 @@ def test_automation_rejects_webhooks_and_too_frequent_cron():
     assert len(acceptable_step.json()["schedule_preview"]) == 3
     assert invalid_timezone.status_code == 422
     assert "timezone" in invalid_timezone.text.lower()
+
+
+def test_automation_owner_confirmation_uses_toolgate_request_without_raw_prompt():
+    reset_state()
+    app.state.pi = BlockedJobPi()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Approval Required",
+                "schedule": "0 9 * * *",
+                "prompt": "private automation prompt",
+                "approval_policy": "owner_confirmation",
+            },
+        ).json()
+        facade_pending = next(
+            item for item in client.get("/api/automations").json()["automations"] if item["id"] == created["id"]
+        )
+        blocked = client.post(f"/api/jobs/{created['id']}/run").json()
+        request = app.state.gates.requests[created["approval_request_id"]]
+        decision = client.post(
+            f"/api/approvals/{created['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        facade_active = next(
+            item for item in client.get("/api/automations").json()["automations"] if item["id"] == created["id"]
+        )
+
+    assert created["approval_status"] == "pending"
+    assert created["paused"] is True
+    assert facade_pending["status"] == "pending_approval"
+    assert blocked["last_result"]["status"] == "blocked"
+    assert request["kind"] == "automation_schedule"
+    assert request["payload"]["subject_id"] == created["id"]
+    assert request["payload"]["prompt_digest"]
+    assert "private automation prompt" not in str(request)
+    assert decision["automation_status"] == "scheduled"
+    assert facade_active["status"] == "active"
+    assert facade_active["approval_status"] == "approved"
+    assert facade_active["next"] != "—"
 
 
 def test_automation_run_persists_safe_result_summary_only():
