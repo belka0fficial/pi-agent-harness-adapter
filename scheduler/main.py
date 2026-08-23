@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -54,9 +55,17 @@ async def run_job(job_id: str):
         elif event.event == "run.failed":
             status = "failed"
             error = event.data.get("message") or "Pi run failed"
-    result = {"job_id": job_id, "status": status, "prompt": item["prompt"], "output": "".join(chunks), "error": error}
+    output = "".join(chunks)
+    result = {
+        "job_id": job_id,
+        "status": status,
+        "output_summary": _summarize_job_output(output),
+        "output_chars": len(output),
+        "error": error,
+        "completed_at": now(),
+    }
     item["last_result"] = result
-    if item.get("webhook_url"):
+    if item.get("webhook_url") and _webhooks_enabled():
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(item["webhook_url"], json=result)
 
@@ -67,7 +76,17 @@ def _sync_scheduler(job_id: str):
         app.state.scheduler.remove_job(job_id)
     if item.get("paused"):
         return
-    app.state.scheduler.add_job(run_job, "cron", id=job_id, args=[job_id], replace_existing=True, **_cron_kwargs(item["schedule"]))
+    app.state.scheduler.add_job(
+        run_job,
+        "cron",
+        id=job_id,
+        args=[job_id],
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+        **_cron_kwargs(item["schedule"]),
+    )
 
 
 def _cron_kwargs(schedule: str) -> dict[str, Any]:
@@ -75,7 +94,31 @@ def _cron_kwargs(schedule: str) -> dict[str, Any]:
     if len(parts) != 5:
         raise HTTPException(422, "schedule must be five-field cron syntax")
     minute, hour, day, month, day_of_week = parts
+    if _minute_runs_too_often(minute):
+        raise HTTPException(422, "schedule must not run more often than every 5 minutes")
     return {"minute": minute, "hour": hour, "day": day, "month": month, "day_of_week": day_of_week}
+
+
+def _minute_runs_too_often(minute: str) -> bool:
+    if minute == "*":
+        return True
+    if minute.startswith("*/"):
+        try:
+            return int(minute[2:]) < 5
+        except ValueError:
+            return True
+    return False
+
+
+def _webhooks_enabled() -> bool:
+    return os.environ.get("AGENTGATE_ENABLE_JOB_WEBHOOKS", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _summarize_job_output(output: str) -> str:
+    text = " ".join(str(output or "").split())
+    if not text:
+        return ""
+    return text[:160] + ("..." if len(text) > 160 else "")
 
 
 @app.get("/api/jobs")
@@ -85,6 +128,8 @@ def list_jobs():
 
 @app.post("/api/jobs")
 def create_job(payload: JobInput):
+    if payload.webhook_url and not _webhooks_enabled():
+        raise HTTPException(422, "job webhooks are disabled for this legacy scheduler")
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     item = {"id": job_id, "job_id": job_id, **payload.model_dump(), "paused": False, "created_at": now(), "updated_at": now(), "last_run_at": None, "next_run_at": None}
     app.state.jobs[job_id] = item
@@ -98,6 +143,8 @@ def create_job(payload: JobInput):
 def update_job(job_id: str, payload: dict[str, Any]):
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
+    if payload.get("webhook_url") and not _webhooks_enabled():
+        raise HTTPException(422, "job webhooks are disabled for this legacy scheduler")
     app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url"}})
     app.state.jobs[job_id]["updated_at"] = now()
     _sync_scheduler(job_id)

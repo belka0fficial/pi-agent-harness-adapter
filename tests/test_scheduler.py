@@ -27,5 +27,32 @@ def test_scheduler_contract_shape():
         ran = client.post(f"/api/jobs/{job_id}/run").json()
         assert ran["last_run_at"] is not None
         assert ran["last_result"]["status"] == "ok"
-        assert ran["last_result"]["output"] == "done: Summarize logs"
+        assert ran["last_result"]["output_summary"] == "done: Summarize logs"
+        assert ran["last_result"]["output_chars"] == len("done: Summarize logs")
+        assert "prompt" not in ran["last_result"]
+        assert "output" not in ran["last_result"]
         assert client.delete(f"/api/jobs/{job_id}").json()["deleted"] is True
+
+
+def test_scheduler_blocks_webhooks_and_fast_cron_by_default():
+    app.state.jobs = {}
+    app.state.pi = FakePi()
+    with TestClient(app) as client:
+        webhook = client.post(
+            "/api/jobs",
+            json={
+                "name": "Webhook",
+                "schedule": "0 9 * * *",
+                "prompt": "Send somewhere",
+                "webhook_url": "https://example.test/hook",
+            },
+        )
+        fast = client.post(
+            "/api/jobs",
+            json={"name": "Fast", "schedule": "*/1 * * * *", "prompt": "Too often"},
+        )
+
+    assert webhook.status_code == 422
+    assert "webhooks are disabled" in webhook.text
+    assert fast.status_code == 422
+    assert "more often than every 5 minutes" in fast.text

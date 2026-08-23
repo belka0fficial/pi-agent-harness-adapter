@@ -13,11 +13,11 @@ pip install -r requirements.txt
 uvicorn adapter.main:app --host 127.0.0.1 --port 8644
 ```
 
-## Run Scheduler
+## Legacy Scheduler
 
-```bash
-uvicorn scheduler.main:app --host 127.0.0.1 --port 8643
-```
+`scheduler.main` is retained only for legacy contract tests. The supported
+runtime path is `adapter.main`, which owns persisted jobs, approval policy,
+scoped agent/team grants, and safe run history.
 
 ## Pi MCP
 
