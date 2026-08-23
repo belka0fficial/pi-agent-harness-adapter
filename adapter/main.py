@@ -906,6 +906,124 @@ def _effective_toolgate_scopes() -> list[str]:
     return sorted(grants)
 
 
+def _expected_toolgate_scopes_for_actor(agent_id: str) -> list[str]:
+    agent = app.state.agents.get(agent_id) or {}
+    scopes: set[str] = set()
+    team_ids = agent.get("team_ids") or []
+    for tool_id in agent.get("tool_ids", []):
+        scope = _toolgate_scope_for_tool_id(str(tool_id))
+        if scope:
+            scopes.add(scope)
+    for team_id in team_ids:
+        team = app.state.teams.get(team_id) or {}
+        for tool_id in team.get("tool_ids", []):
+            scope = _toolgate_scope_for_tool_id(str(tool_id))
+            if scope:
+                scopes.add(scope)
+    return sorted(scopes)
+
+
+def _expected_memory_scopes_for_actor(agent_id: str) -> list[str]:
+    agent = app.state.agents.get(agent_id) or {}
+    scopes: set[str] = set(str(scope) for scope in agent.get("memory_scopes", []) if str(scope).strip())
+    for team_id in agent.get("team_ids") or []:
+        team = app.state.teams.get(team_id) or {}
+        scopes.update(str(scope) for scope in team.get("memory_scopes", []) if str(scope).strip())
+    return sorted(scopes)
+
+
+def _label_matches_agent(label: Any, agent_id: str) -> bool:
+    normalized = str(label or "").strip().lower()
+    wanted = agent_id.strip().lower()
+    labels = {
+        wanted,
+        f"agentgate:{wanted}",
+        f"agentgate {wanted}",
+        f"agentgate/{wanted}",
+        f"agentgate-{wanted}",
+    }
+    if wanted == "agent_pi_operator":
+        labels.add("agentgate pi")
+    return normalized in labels
+
+
+def _native_access_boundaries() -> dict[str, Any]:
+    _ensure_registry_seeded()
+    try:
+        toolgate_keys = app.state.gates.toolgate_agent_keys()
+        toolgate_available = True
+    except (RuntimeError, AttributeError):
+        toolgate_keys = []
+        toolgate_available = False
+    try:
+        memorygate_keys = app.state.gates.memorygate_agent_keys()
+        memorygate_available = True
+    except (RuntimeError, AttributeError):
+        memorygate_keys = []
+        memorygate_available = False
+    rows = []
+    for agent_id, agent in sorted(app.state.agents.items()):
+        expected_tool_scopes = _expected_toolgate_scopes_for_actor(agent_id)
+        expected_memory_scopes = _expected_memory_scopes_for_actor(agent_id)
+        matching_tool_keys = [
+            key
+            for key in toolgate_keys
+            if _label_matches_agent(key.get("name") or key.get("label"), agent_id)
+        ]
+        matching_memory_keys = [
+            key
+            for key in memorygate_keys
+            if str(key.get("agent_id") or "") == agent_id
+            and not bool(key.get("revoked"))
+            and _label_matches_agent(key.get("label"), agent_id)
+        ]
+        tool_scope_ready = False
+        if not expected_tool_scopes:
+            tool_scope_ready = bool(matching_tool_keys) or not toolgate_available
+        else:
+            for key in matching_tool_keys:
+                scopes = [str(scope) for scope in key.get("scopes", [])]
+                if all(_toolgate_scope_allows_tool(scope.removeprefix("tool:"), scopes) for scope in expected_tool_scopes):
+                    tool_scope_ready = True
+                    break
+        memory_key_ready = not expected_memory_scopes or bool(matching_memory_keys)
+        issues = []
+        if not toolgate_available:
+            issues.append("ToolGate key inventory unavailable")
+        elif not matching_tool_keys:
+            issues.append("missing native ToolGate key record")
+        elif not tool_scope_ready:
+            issues.append("ToolGate scopes do not match effective grants")
+        if not memorygate_available:
+            issues.append("MemoryGate key inventory unavailable")
+        elif expected_memory_scopes and not matching_memory_keys:
+            issues.append("missing native MemoryGate read key")
+        status = "ready" if toolgate_available and memorygate_available and tool_scope_ready and memory_key_ready else "drift"
+        rows.append({
+            "agent_id": agent_id,
+            "name": agent.get("name") or agent_id,
+            "team_count": len(agent.get("team_ids") or []),
+            "expected_tool_scope_count": len(expected_tool_scopes),
+            "expected_memory_scope_count": len(expected_memory_scopes),
+            "toolgate_key_status": "ready" if toolgate_available and tool_scope_ready and matching_tool_keys else "missing" if toolgate_available else "unavailable",
+            "toolgate_key_count": len(matching_tool_keys),
+            "memorygate_key_status": "ready" if memorygate_available and memory_key_ready else "missing" if memorygate_available else "unavailable",
+            "memorygate_key_count": len(matching_memory_keys),
+            "status": status,
+            "issues": issues[:4],
+        })
+    return {
+        "summary": {
+            "agents": len(rows),
+            "ready": sum(1 for row in rows if row["status"] == "ready"),
+            "drift": sum(1 for row in rows if row["status"] != "ready"),
+            "toolgate_inventory": "ok" if toolgate_available else "unavailable",
+            "memorygate_inventory": "ok" if memorygate_available else "unavailable",
+        },
+        "agents": rows,
+    }
+
+
 def _sync_toolgate_execution_scopes() -> None:
     try:
         scopes = _effective_toolgate_scopes()
@@ -2989,7 +3107,11 @@ def agentgate_audit(limit: int = 60):
 
 @app.get("/api/system")
 def agentgate_system():
-    return app.state.gates.system_overview()
+    system = app.state.gates.system_overview()
+    return {
+        **system,
+        "access_boundaries": _native_access_boundaries(),
+    }
 
 
 @app.get("/api/approvals")

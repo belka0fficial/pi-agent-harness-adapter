@@ -122,6 +122,12 @@ class FakeGates:
     def toolgate_execution_status(self):
         return {"id": "agent-key", "scopes": getattr(self, "synced_toolgate_scopes", [])}
 
+    def toolgate_agent_keys(self):
+        return getattr(self, "toolgate_keys", [])
+
+    def memorygate_agent_keys(self):
+        return getattr(self, "memorygate_keys", [])
+
 
 def reset_state():
     app.state.sessions = {"sess-1": {"id": "sess-1", "title": "Real session", "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-02T00:00:00+00:00"}}
@@ -307,6 +313,60 @@ def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path)
     ]
     assert cleared.status_code == 200
     assert app.state.gates.synced_toolgate_scope_history[-1] == []
+
+
+def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.gates.toolgate_keys = [
+        {
+            "id": "tg-ready",
+            "name": "AgentGate:agent_pi_operator",
+            "scopes": ["tool:echo"],
+            "status": "active",
+        },
+    ]
+    app.state.gates.memorygate_keys = [
+        {
+            "id": "mg-ready",
+            "label": "AgentGate:agent_pi_operator",
+            "agent_id": "agent_pi_operator",
+            "revoked": False,
+        },
+    ]
+
+    with TestClient(app) as client:
+        client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["echo"], "memory_scopes": ["briefing"]},
+        )
+        created = client.post(
+            "/api/agents",
+            json={
+                "name": "Missing Keys",
+                "purpose": "Probe missing native key readiness.",
+                "tool_ids": ["danger.write"],
+                "memory_scopes": ["private-journal"],
+            },
+        ).json()
+        system = client.get("/api/system").json()
+
+    boundaries = system["access_boundaries"]
+    ready = next(row for row in boundaries["agents"] if row["agent_id"] == "agent_pi_operator")
+    missing = next(row for row in boundaries["agents"] if row["agent_id"] == created["id"])
+    assert boundaries["summary"]["agents"] == 2
+    assert ready["status"] == "ready"
+    assert ready["toolgate_key_status"] == "ready"
+    assert ready["memorygate_key_status"] == "ready"
+    assert ready["expected_tool_scope_count"] == 1
+    assert ready["expected_memory_scope_count"] == 3
+    assert missing["status"] == "drift"
+    assert missing["toolgate_key_status"] == "missing"
+    assert missing["memorygate_key_status"] == "missing"
+    assert "raw" not in str(boundaries).lower()
+    assert "tgx_" not in str(boundaries)
+    assert "mg_read_" not in str(boundaries)
 
 
 def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_path):

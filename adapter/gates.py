@@ -232,6 +232,11 @@ class GateClients:
         payload = self._toolgate_execution_request("/v2/agent/status")
         return payload if isinstance(payload, dict) else {}
 
+    def toolgate_agent_keys(self) -> list[dict[str, Any]]:
+        payload = self._request("toolgate", "/v2/agent-keys")
+        rows = payload if isinstance(payload, list) else payload.get("results", payload.get("keys", []))
+        return [row for row in rows if isinstance(row, dict)]
+
     def update_toolgate_execution_scopes(self, scopes: list[str]) -> dict[str, Any]:
         status = self.toolgate_execution_status()
         key_id = str(status.get("id") or "")
@@ -244,6 +249,11 @@ class GateClients:
             payload={"scopes": scopes},
         )
         return payload if isinstance(payload, dict) else {}
+
+    def memorygate_agent_keys(self) -> list[dict[str, Any]]:
+        payload = self._request("memorygate", "/auth/agent-keys")
+        rows = payload if isinstance(payload, list) else payload.get("results", payload.get("keys", []))
+        return [row for row in rows if isinstance(row, dict)]
 
     def memory_context(self, query: str, *, agent_id: str | None = None) -> dict[str, Any]:
         self.memory_counts["reads"] += 1
