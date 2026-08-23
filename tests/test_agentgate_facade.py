@@ -130,6 +130,7 @@ def reset_state():
     app.state.gates = FakeGates()
     app.state.agents = {}
     app.state.teams = {}
+    app.state.tool_drafts = {}
     app.state.approval_runs = {}
 
 
@@ -1209,6 +1210,45 @@ def test_group_session_roster_and_speaker_are_enforced(monkeypatch, tmp_path):
     assert row["participants"][1]["id"] == teammate["id"]
     assert "Group room turn" not in str(row)
     assert "token" not in str(row).lower()
+
+
+def test_tool_draft_artifacts_are_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/tool-drafts",
+            json={
+                "title": "Create a cleanup helper",
+                "purpose": "Draft a reviewed local helper. Never include token=abc123 or raw command arguments.",
+                "proposed_tool_id": "Local Cleanup Helper!",
+                "risk": "medium",
+                "source_session_id": "sess-1",
+                "source_message_id": "u1",
+                "source_role": "owner",
+            },
+        ).json()
+        listed = client.get("/api/tool-drafts").json()["drafts"]
+        reviewed = client.patch(
+            f"/api/tool-drafts/{created['id']}",
+            json={"status": "needs_toolgate_review"},
+        ).json()
+        deleted = client.delete(f"/api/tool-drafts/{created['id']}")
+
+    assert created["proposed_tool_id"] == "local.cleanup.helper"
+    assert created["status"] == "draft"
+    assert created["review_state"] == "needs_owner_review"
+    assert listed[0]["id"] == created["id"]
+    assert reviewed["status"] == "needs_toolgate_review"
+    assert reviewed["review_state"] == "ready_for_toolgate_review"
+    assert deleted.status_code == 200
+    payload = str({**created, **reviewed}).lower()
+    assert "token=abc123" not in payload
+    assert "raw command" not in payload
+    assert "code" not in payload
+    assert "args" not in payload
 
 
 def test_chat_defaults_to_no_memory_side_effects():

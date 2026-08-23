@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -65,6 +66,16 @@ class MemoryCandidateInput(BaseModel):
 class ToolPolicyInput(BaseModel):
     authorization: str = "owner_confirmation"
     usage_limits: dict[str, int] = Field(default_factory=dict)
+
+
+class ToolDraftInput(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    purpose: str = Field(default="", max_length=1200)
+    proposed_tool_id: str = Field(default="", max_length=120)
+    risk: str = "medium"
+    source_session_id: str | None = None
+    source_message_id: str | None = None
+    source_role: str | None = None
 
 
 class ModelRouteProbeInput(BaseModel):
@@ -179,6 +190,7 @@ app.state.sessions = {}
 app.state.messages = {}
 app.state.jobs = {}
 app.state.tasks = {}
+app.state.tool_drafts = {}
 app.state.active_runs = {}
 app.state.approval_runs = {}
 app.state.agents = {}
@@ -261,6 +273,7 @@ def _load_registry() -> None:
     app.state.teams = {}
     app.state.jobs = {}
     app.state.tasks = {}
+    app.state.tool_drafts = {}
     for row in rows:
         try:
             item = json.loads(row["data"])
@@ -274,6 +287,8 @@ def _load_registry() -> None:
             app.state.jobs[row["id"]] = item
         elif row["kind"] == "task":
             app.state.tasks[row["id"]] = item
+        elif row["kind"] == "tool_draft":
+            app.state.tool_drafts[row["id"]] = item
     _normalize_agent_model_defaults()
 
 
@@ -298,7 +313,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry_conn() as conn:
         conn.execute(
@@ -314,7 +329,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry_conn() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -712,6 +727,45 @@ def _task_checkpoint_status(item: dict[str, Any]) -> str:
     if not item.get("owner_checkpoint"):
         return "not_required"
     return item.get("checkpoint_status") or "pending"
+
+
+def _sanitize_tool_id(value: Any) -> str:
+    text = str(value or "").strip().lower().replace(" ", ".")
+    allowed = []
+    for char in text:
+        if char.isalnum() or char in {".", "_", "-"}:
+            allowed.append(char)
+    cleaned = "".join(allowed).strip(".-_")
+    return cleaned[:120]
+
+
+def _redact_tool_draft_text(value: Any, *, limit: int) -> str:
+    text = _safe_text(value, limit=limit)
+    patterns = [
+        (r"(?i)\b(api[_-]?key|token|password|secret)\s*[:=]\s*\S+", r"\1=[redacted]"),
+        (r"https?://\S+", "[redacted-url]"),
+        (r"(?i)raw command arguments?", "redacted command details"),
+    ]
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    return text[:limit]
+
+
+def _public_tool_draft(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "title": item.get("title") or "",
+        "purpose": item.get("purpose") or "",
+        "proposed_tool_id": item.get("proposed_tool_id") or "",
+        "risk": item.get("risk") or "medium",
+        "status": item.get("status") or "draft",
+        "review_state": item.get("review_state") or "needs_owner_review",
+        "source_session_id": item.get("source_session_id"),
+        "source_message_id": item.get("source_message_id"),
+        "source_role": item.get("source_role") or "selected",
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
 
 
 def _sanitize_tool_policy(payload: ToolPolicyInput) -> tuple[str, dict[str, int]]:
@@ -2795,6 +2849,91 @@ def agentgate_tools(agent_id: str | None = None, team_id: str | None = None):
         "total": len(rows),
         "visible": len(visible),
     }
+
+
+@app.get("/api/tool-drafts")
+def list_tool_drafts(status: str | None = None):
+    rows = []
+    for item in app.state.tool_drafts.values():
+        if status and item.get("status") != status:
+            continue
+        rows.append(_public_tool_draft(item))
+    rows.sort(key=lambda row: row.get("updated_at") or row.get("created_at") or "", reverse=True)
+    return {"drafts": rows}
+
+
+@app.post("/api/tool-drafts")
+def create_tool_draft(payload: ToolDraftInput):
+    draft_id = f"tooldraft_{uuid.uuid4().hex[:12]}"
+    proposed_tool_id = _sanitize_tool_id(payload.proposed_tool_id or payload.title)
+    item = {
+        "id": draft_id,
+        "title": _redact_tool_draft_text(payload.title, limit=160),
+        "purpose": _redact_tool_draft_text(payload.purpose, limit=1200),
+        "proposed_tool_id": proposed_tool_id,
+        "risk": _sanitize_risk(payload.risk),
+        "status": "draft",
+        "review_state": "needs_owner_review",
+        "source_session_id": _safe_text(payload.source_session_id, limit=120),
+        "source_message_id": _safe_text(payload.source_message_id, limit=120),
+        "source_role": _safe_text(payload.source_role, limit=40) or "selected",
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    app.state.tool_drafts[draft_id] = item
+    _save_registry_item("tool_draft", item)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="tool.draft_created",
+        status="draft",
+        source="AgentGate",
+        summary=f"Tool draft created: {item['proposed_tool_id'] or item['title']}",
+        ref_type="tool_draft",
+        ref_id=draft_id,
+    )
+    return _public_tool_draft(item)
+
+
+@app.patch("/api/tool-drafts/{draft_id}")
+def update_tool_draft(draft_id: str, payload: dict[str, Any]):
+    item = app.state.tool_drafts.get(draft_id)
+    if not item:
+        raise HTTPException(404, "tool draft not found")
+    if "title" in payload:
+        item["title"] = _redact_tool_draft_text(payload.get("title"), limit=160)
+    if "purpose" in payload:
+        item["purpose"] = _redact_tool_draft_text(payload.get("purpose"), limit=1200)
+    if "proposed_tool_id" in payload:
+        item["proposed_tool_id"] = _sanitize_tool_id(payload.get("proposed_tool_id"))
+    if "risk" in payload:
+        item["risk"] = _sanitize_risk(payload.get("risk"))
+    if "status" in payload:
+        status = str(payload.get("status") or "").strip()
+        if status not in {"draft", "needs_toolgate_review", "rejected", "archived"}:
+            raise HTTPException(422, "status must be draft, needs_toolgate_review, rejected, or archived")
+        item["status"] = status
+        item["review_state"] = "ready_for_toolgate_review" if status == "needs_toolgate_review" else status
+    item["updated_at"] = now()
+    _save_registry_item("tool_draft", item)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="tool.draft_updated",
+        status=item["status"],
+        source="AgentGate",
+        summary=f"Tool draft updated: {item.get('proposed_tool_id') or draft_id}",
+        ref_type="tool_draft",
+        ref_id=draft_id,
+    )
+    return _public_tool_draft(item)
+
+
+@app.delete("/api/tool-drafts/{draft_id}")
+def delete_tool_draft(draft_id: str):
+    if draft_id not in app.state.tool_drafts:
+        raise HTTPException(404, "tool draft not found")
+    app.state.tool_drafts.pop(draft_id, None)
+    _delete_registry_item("tool_draft", draft_id)
+    return {"deleted": True}
 
 
 @app.patch("/api/tools/{tool_id}/policy")
