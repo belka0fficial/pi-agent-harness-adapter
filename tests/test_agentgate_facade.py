@@ -60,6 +60,11 @@ class FakeGates:
         self.memory_candidate = candidate
         return {"status": "ok", "id": "mem-approved", "memory_type": candidate.get("memory_type") or "context"}
 
+    def update_toolgate_execution_scopes(self, scopes: list[str]):
+        self.synced_toolgate_scopes = scopes
+        self.synced_toolgate_scope_history = [*getattr(self, "synced_toolgate_scope_history", []), scopes]
+        return {"id": "agent-key", "scopes": scopes}
+
 
 def reset_state():
     app.state.sessions = {"sess-1": {"id": "sess-1", "title": "Real session", "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-02T00:00:00+00:00"}}
@@ -157,6 +162,29 @@ def test_agent_registry_persists_to_sqlite(monkeypatch, tmp_path):
     main._load_registry()
 
     assert agent_id not in app.state.agents
+
+
+def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        response = client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["research.scan-competition", "tool:filesystem.read", "*"]},
+        )
+        cleared = client.patch("/api/agents/agent_pi_operator", json={"tool_ids": []})
+
+    assert response.status_code == 200
+    assert app.state.gates.synced_toolgate_scope_history[0] == [
+        "tool:*",
+        "tool:filesystem.read",
+        "tool:research.scan-competition",
+    ]
+    assert cleared.status_code == 200
+    assert app.state.gates.synced_toolgate_scope_history[-1] == []
 
 
 def test_automation_jobs_persist_to_sqlite(monkeypatch, tmp_path):

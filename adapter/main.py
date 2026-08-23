@@ -409,6 +409,35 @@ def _capability_allowed(capability_id: str | None, allowed: list[str]) -> bool:
     return any(capability_id == item or (item.endswith("*") and capability_id.startswith(item[:-1])) for item in allowed)
 
 
+def _toolgate_scope_for_tool_id(tool_id: str) -> str:
+    value = str(tool_id or "").strip()
+    if not value:
+        return ""
+    if value == "*":
+        return "tool:*"
+    if value.startswith("tool:"):
+        return value
+    return f"tool:{value}"
+
+
+def _effective_toolgate_scopes() -> list[str]:
+    grants: set[str] = set()
+    for item in [*app.state.agents.values(), *app.state.teams.values()]:
+        for tool_id in item.get("tool_ids", []):
+            scope = _toolgate_scope_for_tool_id(str(tool_id))
+            if scope:
+                grants.add(scope)
+    return sorted(grants)
+
+
+def _sync_toolgate_execution_scopes() -> None:
+    try:
+        scopes = _effective_toolgate_scopes()
+        app.state.gates.update_toolgate_execution_scopes(scopes)
+    except (RuntimeError, AttributeError):
+        return
+
+
 def _sync_loaded_jobs() -> None:
     for job_id, item in list(app.state.jobs.items()):
         try:
@@ -1072,6 +1101,8 @@ def create_agent(payload: AgentInput):
         ref_type="agent",
         ref_id=agent_id,
     )
+    if item.get("tool_ids"):
+        _sync_toolgate_execution_scopes()
     return item
 
 
@@ -1095,6 +1126,8 @@ def update_agent(agent_id: str, payload: dict[str, Any]):
         ref_type="agent",
         ref_id=agent_id,
     )
+    if "tool_ids" in payload:
+        _sync_toolgate_execution_scopes()
     return item
 
 
@@ -1113,6 +1146,7 @@ def delete_agent(agent_id: str):
         team["updated_at"] = now()
         _save_registry_item("team", team)
     _delete_registry_item("agent", agent_id)
+    _sync_toolgate_execution_scopes()
     return {"deleted": True}
 
 
@@ -1146,6 +1180,8 @@ def create_team(payload: TeamInput):
     }
     app.state.teams[team_id] = item
     _save_registry_item("team", item)
+    if item.get("tool_ids"):
+        _sync_toolgate_execution_scopes()
     return item
 
 
@@ -1159,6 +1195,8 @@ def update_team(team_id: str, payload: dict[str, Any]):
     item.update({key: value for key, value in payload.items() if key in allowed})
     item["updated_at"] = now()
     _save_registry_item("team", item)
+    if "tool_ids" in payload:
+        _sync_toolgate_execution_scopes()
     return item
 
 
@@ -1175,6 +1213,7 @@ def delete_team(team_id: str):
         agent["updated_at"] = now()
         _save_registry_item("agent", agent)
     _delete_registry_item("team", team_id)
+    _sync_toolgate_execution_scopes()
     return {"deleted": True}
 
 

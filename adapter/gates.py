@@ -30,6 +30,7 @@ class GateClients:
             ),
         }
         self.memory_counts = {"reads": 0, "writes": 0}
+        self.toolgate_execution_key = os.environ.get("TOOLGATE_EXECUTION_KEY", "")
 
     @staticmethod
     def _parse_time(value: Any) -> datetime | None:
@@ -89,6 +90,25 @@ class GateClients:
             raise RuntimeError(f"{service} returned HTTP {exc.code}: {detail}") from exc
         except (TimeoutError, urllib.error.URLError) as exc:
             raise RuntimeError(f"{service} is unavailable") from exc
+        return json.loads(body.decode("utf-8")) if body else {}
+
+    def _toolgate_execution_request(self, path: str, *, timeout: float = 8):
+        base_url = self.services["toolgate"][0]
+        if not self.toolgate_execution_key:
+            raise RuntimeError("toolgate execution key is unavailable")
+        request = urllib.request.Request(
+            f"{base_url}{path}",
+            headers={"Accept": "application/json", "X-ToolGate-Execution-Key": self.toolgate_execution_key},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"toolgate returned HTTP {exc.code}: {detail}") from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            raise RuntimeError("toolgate is unavailable") from exc
         return json.loads(body.decode("utf-8")) if body else {}
 
     def _memory_read_request(
@@ -176,6 +196,23 @@ class GateClients:
             method="POST",
             payload={"status": decision, "note": "Decided in AgentGate"},
         )
+
+    def toolgate_execution_status(self) -> dict[str, Any]:
+        payload = self._toolgate_execution_request("/v2/agent/status")
+        return payload if isinstance(payload, dict) else {}
+
+    def update_toolgate_execution_scopes(self, scopes: list[str]) -> dict[str, Any]:
+        status = self.toolgate_execution_status()
+        key_id = str(status.get("id") or "")
+        if not key_id:
+            raise RuntimeError("toolgate execution key id is unavailable")
+        payload = self._request(
+            "toolgate",
+            f"/v2/agent-keys/{key_id}/scopes",
+            method="PATCH",
+            payload={"scopes": scopes},
+        )
+        return payload if isinstance(payload, dict) else {}
 
     def memory_context(self, query: str, *, agent_id: str | None = None) -> dict[str, Any]:
         self.memory_counts["reads"] += 1
