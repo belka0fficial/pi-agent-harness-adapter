@@ -2744,6 +2744,48 @@ def test_automation_pauses_after_three_failures():
     assert ran["failure_count"] == 3
     assert ran["paused"] is True
     assert "3 consecutive" in ran["quarantine_reason"]
+    assert ran["failure_policy"]["max_consecutive_failures"] == 3
+    assert ran["failure_policy_status"]["remaining_before_terminal"] == 0
+    assert ran["failure_policy_status"]["automatic_retries"] is False
+
+
+def test_automation_failure_policy_is_owner_visible_and_bounded():
+    reset_state()
+    app.state.pi = FailingJobPi()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Fast Failure Probe",
+                "schedule": "0 9 * * *",
+                "prompt": "fail safely",
+                "failure_policy": {
+                    "max_consecutive_failures": 2,
+                    "failure_window_hours": 12,
+                    "terminal_action": "pause",
+                    "retry_strategy": "none",
+                },
+            },
+        ).json()
+        first = client.post(f"/api/jobs/{created['id']}/run").json()
+        second = client.post(f"/api/jobs/{created['id']}/run").json()
+        rejected = client.post(
+            "/api/jobs",
+            json={
+                "name": "Bad Failure Policy",
+                "schedule": "0 9 * * *",
+                "prompt": "fail safely",
+                "failure_policy": {"max_consecutive_failures": 0},
+            },
+        )
+
+    assert created["failure_policy"]["max_consecutive_failures"] == 2
+    assert created["failure_policy"]["automatic_retries"] is False
+    assert first["failure_policy_status"]["remaining_before_terminal"] == 1
+    assert second["failure_count"] == 2
+    assert second["paused"] is True
+    assert "2 consecutive" in second["quarantine_reason"]
+    assert rejected.status_code == 422
 
 
 def test_automation_run_blocks_cleanly_when_requirements_are_revoked(monkeypatch, tmp_path):

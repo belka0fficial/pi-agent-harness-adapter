@@ -58,6 +58,7 @@ class JobInput(BaseModel):
     required_tool_ids: list[str] = Field(default_factory=list)
     required_memory_scopes: list[str] = Field(default_factory=list)
     approval_policy: str = "auto"
+    failure_policy: dict[str, Any] = Field(default_factory=dict)
 
 
 class MemoryCandidateInput(BaseModel):
@@ -2207,6 +2208,33 @@ def _sanitize_job_approval_policy(value: Any) -> str:
     return policy
 
 
+def _sanitize_failure_policy(value: Any) -> dict[str, Any]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise HTTPException(422, "failure_policy must be an object")
+    max_failures = int(value["max_consecutive_failures"]) if "max_consecutive_failures" in value else 3
+    if max_failures < 1 or max_failures > 10:
+        raise HTTPException(422, "failure_policy.max_consecutive_failures must be between 1 and 10")
+    terminal_action = str(value.get("terminal_action") or "pause").strip().lower()
+    if terminal_action not in {"pause"}:
+        raise HTTPException(422, "failure_policy.terminal_action must be pause")
+    retry_strategy = str(value.get("retry_strategy") or "none").strip().lower()
+    if retry_strategy not in {"none"}:
+        raise HTTPException(422, "failure_policy.retry_strategy must be none")
+    failure_window_hours = int(value["failure_window_hours"]) if "failure_window_hours" in value else 24
+    if failure_window_hours < 1 or failure_window_hours > 168:
+        raise HTTPException(422, "failure_policy.failure_window_hours must be between 1 and 168")
+    return {
+        "max_consecutive_failures": max_failures,
+        "terminal_action": terminal_action,
+        "retry_strategy": retry_strategy,
+        "failure_window_hours": failure_window_hours,
+        "automatic_retries": False,
+        "note": "Failures are counted consecutively; the job pauses at the limit and requires owner resume.",
+    }
+
+
 def _sanitize_delivery_policy(value: Any) -> str:
     policy = str(value or "disabled").strip().lower()
     if policy not in {"disabled", "owner_confirmation", "allowlisted"}:
@@ -2425,6 +2453,7 @@ def _append_job_run_history(item: dict[str, Any], result: dict[str, Any]) -> Non
 
 def _public_job(item: dict[str, Any]) -> dict[str, Any]:
     result = item.get("last_result") or {}
+    failure_policy = _sanitize_failure_policy(item.get("failure_policy"))
     status = "pending_approval" if item.get("approval_status") == "pending" else "paused" if item.get("paused") else "active"
     return {
         "id": item.get("id"),
@@ -2457,6 +2486,13 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
         "approval_reasons": item.get("approval_reasons", []),
         "approval_request_id": item.get("approval_request_id"),
         "failure_count": item.get("failure_count", 0),
+        "failure_policy": failure_policy,
+        "failure_policy_status": {
+            "consecutive_failures": item.get("failure_count", 0),
+            "remaining_before_terminal": max(0, int(failure_policy["max_consecutive_failures"]) - int(item.get("failure_count") or 0)),
+            "terminal_action": failure_policy["terminal_action"],
+            "automatic_retries": False,
+        },
         "quarantine_reason": item.get("quarantine_reason"),
         "required_tool_ids": item.get("required_tool_ids", []),
         "required_memory_scopes": item.get("required_memory_scopes", []),
@@ -2722,10 +2758,11 @@ async def run_job(job_id: str):
     _append_job_run_history(item, result)
     if status == "failed":
         item["failure_count"] = int(item.get("failure_count") or 0) + 1
-        if item["failure_count"] >= 3:
+        failure_policy = _sanitize_failure_policy(item.get("failure_policy"))
+        if item["failure_count"] >= int(failure_policy["max_consecutive_failures"]):
             item["paused"] = True
             item["next_run_at"] = None
-            item["quarantine_reason"] = "paused after 3 consecutive failed runs"
+            item["quarantine_reason"] = f"paused after {failure_policy['max_consecutive_failures']} consecutive failed runs"
             _sync_scheduler(job_id)
     else:
         item["failure_count"] = 0
@@ -2757,6 +2794,7 @@ def create_job(payload: JobInput):
     approval_policy = _sanitize_job_approval_policy(payload.approval_policy)
     delivery_policy = _sanitize_delivery_policy(payload.delivery_policy)
     delivery_targets = _sanitize_delivery_targets(payload.delivery_targets)
+    failure_policy = _sanitize_failure_policy(payload.failure_policy)
     required_tool_ids, required_memory_scopes = _validate_job_requirements(
         actor,
         payload.required_tool_ids,
@@ -2775,6 +2813,7 @@ def create_job(payload: JobInput):
         "approval_policy": approval_policy,
         "delivery_policy": delivery_policy,
         "delivery_targets": delivery_targets,
+        "failure_policy": failure_policy,
         "approval_status": "not_required",
         "approval_reasons": [],
         "approval_fingerprint": None,
@@ -2845,12 +2884,14 @@ def update_job(job_id: str, payload: dict[str, Any]):
         payload["delivery_policy"] = _sanitize_delivery_policy(payload.get("delivery_policy"))
     if "delivery_targets" in payload:
         payload["delivery_targets"] = _sanitize_delivery_targets(payload.get("delivery_targets"))
+    if "failure_policy" in payload:
+        payload["failure_policy"] = _sanitize_failure_policy(payload.get("failure_policy"))
     payload = {
         **payload,
         "required_tool_ids": next_required_tools,
         "required_memory_scopes": next_required_memory,
     }
-    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "delivery_policy", "delivery_targets", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes", "approval_policy"}})
+    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "delivery_policy", "delivery_targets", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes", "approval_policy", "failure_policy"}})
     app.state.jobs[job_id]["updated_at"] = now()
     app.state.jobs[job_id]["schedule_preview"] = schedule_preview
     approval_reasons = _job_approval_reasons(app.state.jobs[job_id])
