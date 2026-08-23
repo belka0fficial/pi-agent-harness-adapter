@@ -322,13 +322,55 @@ class GateClients:
         for source_name, source in sources.items():
             if source.get("status") == "unavailable":
                 error_rows.append({"at": "", "service": f"systemgate/{source_name}", "level": "warning", "message": source.get("message", "unavailable")})
-        backup_rows = backups.get("backups", backups.get("results", []))
+        container_rows = containers.get("containers", containers.get("results", containers if isinstance(containers, list) else []))
+        backup_rows = backups.get("backups", backups.get("results", backups if isinstance(backups, list) else []))
+        safe_backups = []
+        for row in backup_rows:
+            if not isinstance(row, dict):
+                continue
+            safe_backups.append({
+                "name": str(row.get("name") or ""),
+                "created_at": row.get("created_at"),
+            })
+        package_rows = packages.get("packages")
+        if package_rows is None:
+            package_rows = []
+            for name in ("apt", "pip", "npm"):
+                payload = packages.get(name) if isinstance(packages.get(name), dict) else {}
+                output = str(payload.get("output") or "")
+                state = "current"
+                if name == "apt" and "\n" in output.strip():
+                    state = "updates_available"
+                elif name in {"pip", "npm"} and output.strip() not in {"", "{}", "[]"}:
+                    state = "updates_available"
+                package_rows.append({
+                    "name": name,
+                    "current": "installed",
+                    "latest": "approved channel",
+                    "state": state,
+                    "ok": bool(payload.get("ok", True)),
+                })
         return {
             "vitals": vitals,
-            "containers": containers.get("containers", containers if isinstance(containers, list) else []),
-            "errors": error_rows,
-            "packages": packages.get("packages", packages if isinstance(packages, list) else []),
-            "backups": {"latest": backup_rows[0] if backup_rows else None},
+            "containers": [{
+                "id": str(row.get("id") or ""),
+                "name": str(row.get("name") or ""),
+                "image": str(row.get("image") or ""),
+                "status": str(row.get("status") or "unknown"),
+                "created": row.get("created"),
+            } for row in container_rows if isinstance(row, dict)],
+            "errors": [{
+                "at": str(row.get("at") or ""),
+                "service": str(row.get("service") or "system"),
+                "level": str(row.get("level") or "warning"),
+                "message": str(row.get("message") or "")[:240],
+            } for row in error_rows[:12] if isinstance(row, dict)],
+            "packages": package_rows,
+            "backups": {
+                "latest": safe_backups[0] if safe_backups else None,
+                "count": len(safe_backups),
+                "results": safe_backups[:10],
+            },
             "sources": sources,
         }
 

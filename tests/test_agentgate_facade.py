@@ -505,10 +505,10 @@ def test_gate_clients_normalize_upstream_contracts(monkeypatch):
         ],
         ("GET", "memorygate", "/memory"): {"results": [{"id": "m1", "text": "Remember this", "memory_type": "fact", "confidence": "high", "updated_at": "2026-01-01T00:00:00+00:00"}]},
         ("GET", "systemgate", "/vitals"): {"cpu_percent": 5, "memory": {"percent": 10}, "disk": {"percent": 20}, "cpu_count": 4},
-        ("GET", "systemgate", "/containers"): {"containers": []},
+        ("GET", "systemgate", "/containers"): {"results": [{"id": "abc123", "name": "agentgate", "image": "agentgate:test", "status": "running", "created": "2026-01-01T00:00:00Z", "stats": {"raw": "hidden"}}]},
         ("GET", "systemgate", "/logs/errors"): {"text": ""},
-        ("GET", "systemgate", "/packages"): {"packages": []},
-        ("GET", "systemgate", "/backups"): {"backups": []},
+        ("GET", "systemgate", "/packages"): {"apt": {"ok": True, "output": ""}, "pip": {"ok": True, "output": "[]"}, "npm": {"ok": True, "output": '{}'}},
+        ("GET", "systemgate", "/backups"): {"results": [{"name": "backup-1.tar.zst", "path": "hidden-upstream-path", "created_at": 1770000000.0}]},
     }
 
     def fake_request(service, path, *, method="GET", payload=None, timeout=8):
@@ -522,7 +522,13 @@ def test_gate_clients_normalize_upstream_contracts(monkeypatch):
     assert gates.approvals()[0]["binding"]["digest"] == "sha256:123"
     assert gates.approvals(history=True)[0]["decision"] == "approved"
     assert gates.memory_records()[0]["title"] == "Remember this"
-    assert gates.system_overview()["vitals"]["cpu_percent"] == 5
+    overview = gates.system_overview()
+    assert overview["vitals"]["cpu_percent"] == 5
+    assert overview["containers"][0]["name"] == "agentgate"
+    assert "stats" not in overview["containers"][0]
+    assert overview["backups"]["latest"]["name"] == "backup-1.tar.zst"
+    assert "path" not in overview["backups"]["latest"]
+    assert overview["packages"][0]["name"] == "apt"
     assert gates.decide_approval("pending", "approved")["status"] == "approved"
 
 
@@ -545,8 +551,8 @@ def test_system_overview_degrades_when_one_systemgate_endpoint_times_out(monkeyp
 
     assert overview["vitals"]["cpu_percent"] == 5
     assert overview["containers"] == []
-    assert overview["packages"] == []
-    assert overview["backups"] == {"latest": None}
+    assert [pkg["name"] for pkg in overview["packages"]] == ["apt", "pip", "npm"]
+    assert overview["backups"] == {"latest": None, "count": 0, "results": []}
     assert overview["sources"]["containers"]["status"] == "unavailable"
     assert "containers" in overview["errors"][0]["service"]
 
