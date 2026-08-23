@@ -137,6 +137,7 @@ def reset_state():
     app.state.agents = {}
     app.state.teams = {}
     app.state.tool_drafts = {}
+    app.state.memory_candidates = {}
     app.state.approval_runs = {}
 
 
@@ -1958,12 +1959,75 @@ def test_agentgate_memory_candidate_approval_writes_owner_approved_memory():
     assert candidate["evidence"]["candidate_id"] == "memcand_test"
 
 
-def test_agentgate_memory_candidate_requires_explicit_owner_approval():
+def test_agentgate_memory_candidate_queue_requires_review_before_write():
+    reset_state()
+    with TestClient(app) as client:
+        queued = client.post("/api/memory/candidates", json={
+            "text": "Owner wants memory candidates reviewed first.",
+            "session_id": "sess-1",
+            "source_message_id": "a1",
+            "memory_type": "context",
+            "confidence": "high",
+            "candidate_id": "memcand_pending",
+            "source_role": "agent",
+        })
+        listed = client.get("/api/memory/candidates").json()
+        assert queued.status_code == 200
+        assert queued.json()["status"] == "pending"
+        assert not hasattr(app.state.gates, "memory_candidate")
+        assert listed["candidates"][0]["id"] == "memcand_pending"
+        assert listed["candidates"][0]["status"] == "pending"
+        approved = client.post("/api/memory/candidates/memcand_pending/approve")
+
+    assert approved.status_code == 200
+    assert approved.json()["candidate"]["status"] == "approved"
+    assert app.state.gates.memory_candidate["text"] == "Owner wants memory candidates reviewed first."
+    assert "owner-approved" in app.state.gates.memory_candidate["tags"]
+
+
+def test_agentgate_memory_candidate_reject_does_not_write_memory():
+    reset_state()
+    with TestClient(app) as client:
+        queued = client.post("/api/memory/candidates", json={
+            "text": "Do not save this.",
+            "session_id": "sess-1",
+            "source_message_id": "a1",
+            "candidate_id": "memcand_reject",
+        })
+        rejected = client.post("/api/memory/candidates/memcand_reject/reject")
+        approved_after_reject = client.post("/api/memory/candidates/memcand_reject/approve")
+
+    assert queued.status_code == 200
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert approved_after_reject.status_code == 409
+    assert not hasattr(app.state.gates, "memory_candidate")
+
+
+def test_agentgate_memory_candidate_delete_removes_rejected_review_record():
+    reset_state()
+    with TestClient(app) as client:
+        client.post("/api/memory/candidates", json={
+            "text": "Remove this rejected candidate.",
+            "session_id": "sess-1",
+            "source_message_id": "a1",
+            "candidate_id": "memcand_delete",
+        })
+        client.post("/api/memory/candidates/memcand_delete/reject")
+        deleted = client.delete("/api/memory/candidates/memcand_delete")
+        listed = client.get("/api/memory/candidates?status=all").json()
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True, "id": "memcand_delete"}
+    assert all(item.get("id") != "memcand_delete" for item in listed["candidates"])
+
+
+def test_agentgate_memory_candidate_requires_source_binding():
     reset_state()
     with TestClient(app) as client:
         response = client.post("/api/memory/candidates", json={"text": "save me", "session_id": "sess-1"})
     assert response.status_code == 422
-    assert "approval" in response.text.lower()
+    assert "source message" in response.text.lower()
 
 
 def test_agentgate_memory_candidate_requires_existing_source_message():

@@ -66,7 +66,7 @@ class MemoryCandidateInput(BaseModel):
     candidate_id: str | None = None
     memory_type: str | None = "context"
     confidence: str | None = "medium"
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
     approved: bool = False
 
 
@@ -288,6 +288,7 @@ def _load_registry() -> None:
     app.state.jobs = {}
     app.state.tasks = {}
     app.state.tool_drafts = {}
+    app.state.memory_candidates = {}
     for row in rows:
         try:
             item = json.loads(row["data"])
@@ -303,6 +304,8 @@ def _load_registry() -> None:
             app.state.tasks[row["id"]] = item
         elif row["kind"] == "tool_draft":
             app.state.tool_drafts[row["id"]] = item
+        elif row["kind"] == "memory_candidate":
+            app.state.memory_candidates[row["id"]] = item
     _normalize_agent_model_defaults()
 
 
@@ -327,7 +330,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry_conn() as conn:
         conn.execute(
@@ -343,7 +346,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry_conn() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -3520,13 +3523,10 @@ def agentgate_memory():
     return {"memories": app.state.gates.memory_records()}
 
 
-@app.post("/api/memory/candidates")
-def agentgate_approve_memory_candidate(payload: MemoryCandidateInput):
+def _memory_candidate_from_input(payload: MemoryCandidateInput) -> dict[str, Any]:
     text = payload.text.strip()
     if not text:
         raise HTTPException(422, "memory candidate text is required")
-    if not payload.approved:
-        raise HTTPException(422, "explicit owner approval is required")
     if not payload.session_id or not payload.source_message_id:
         raise HTTPException(422, "memory candidate must be bound to a source message")
     source_message = next(
@@ -3540,14 +3540,16 @@ def agentgate_approve_memory_candidate(payload: MemoryCandidateInput):
     candidate_id = (payload.candidate_id or f"memcand_{uuid.uuid5(uuid.NAMESPACE_URL, candidate_basis).hex[:16]}").strip()
     tags = []
     seen = set()
-    for tag in [*payload.tags, "agentgate", "owner-approved", "source:chat", f"role:{source_role}", "untrusted-selected-text", f"candidate:{candidate_id}"]:
+    for tag in [*payload.tags, "agentgate", "source:chat", f"role:{source_role}", "untrusted-selected-text", f"candidate:{candidate_id}"]:
         value = str(tag).strip()
         if value and value not in seen:
             tags.append(value)
             seen.add(value)
     if payload.session_id:
         tags.append(f"session:{payload.session_id}")
-    candidate = {
+    timestamp = now()
+    return {
+        "id": candidate_id,
         "text": text,
         "source_type": "agentgate_owner_approved",
         "memory_type": payload.memory_type or "context",
@@ -3561,8 +3563,135 @@ def agentgate_approve_memory_candidate(payload: MemoryCandidateInput):
             "source_role": source_role,
             "candidate_id": candidate_id,
         },
+        "status": "pending",
+        "created_at": timestamp,
+        "updated_at": timestamp,
     }
-    return app.state.gates.write_memory_candidate(candidate)
+
+
+def _write_memory_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    tags = []
+    seen = set()
+    for tag in [*candidate.get("tags", []), "owner-approved"]:
+        value = str(tag).strip()
+        if value and value not in seen:
+            tags.append(value)
+            seen.add(value)
+    payload = {
+        "text": candidate["text"],
+        "source_type": "agentgate_owner_approved",
+        "memory_type": candidate.get("memory_type") or "context",
+        "confidence": candidate.get("confidence") or "medium",
+        "do_not_generalize": True,
+        "tags": tags,
+        "evidence": candidate.get("evidence") or {},
+    }
+    return app.state.gates.write_memory_candidate(payload)
+
+
+@app.get("/api/memory/candidates")
+def agentgate_memory_candidates(status: str = "pending"):
+    allowed = {"pending", "approved", "rejected", "all"}
+    wanted = status if status in allowed else "pending"
+    rows = list(getattr(app.state, "memory_candidates", {}).values())
+    if wanted != "all":
+        rows = [row for row in rows if row.get("status") == wanted]
+    rows = sorted(rows, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return {"candidates": rows[:100]}
+
+
+@app.post("/api/memory/candidates")
+def agentgate_create_memory_candidate(payload: MemoryCandidateInput):
+    candidate = _memory_candidate_from_input(payload)
+    if payload.approved:
+        result = _write_memory_candidate(candidate)
+        candidate["status"] = "approved"
+        candidate["memory_result_id"] = result.get("id")
+        candidate["updated_at"] = now()
+        app.state.memory_candidates[candidate["id"]] = candidate
+        _save_registry_item("memory_candidate", candidate)
+        return result
+    app.state.memory_candidates[candidate["id"]] = candidate
+    _save_registry_item("memory_candidate", candidate)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="memory_candidate.created",
+        status="pending",
+        source="AgentGate",
+        summary="Owner queued a chat selection for MemoryGate review",
+        ref_type="memory_candidate",
+        ref_id=candidate["id"],
+    )
+    return candidate
+
+
+@app.post("/api/memory/candidates/{candidate_id}/approve")
+def agentgate_approve_memory_candidate(candidate_id: str):
+    candidate = getattr(app.state, "memory_candidates", {}).get(candidate_id)
+    if not candidate:
+        raise HTTPException(404, "memory candidate was not found")
+    if candidate.get("status") == "rejected":
+        raise HTTPException(409, "memory candidate was already rejected")
+    result = _write_memory_candidate(candidate)
+    candidate["status"] = "approved"
+    candidate["memory_result_id"] = result.get("id")
+    candidate["updated_at"] = now()
+    app.state.memory_candidates[candidate_id] = candidate
+    _save_registry_item("memory_candidate", candidate)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="memory_candidate.approved",
+        status="approved",
+        source="MemoryGate",
+        summary="Owner approved a queued memory candidate",
+        ref_type="memory_candidate",
+        ref_id=candidate_id,
+    )
+    return {"candidate": candidate, "memory": result}
+
+
+@app.post("/api/memory/candidates/{candidate_id}/reject")
+def agentgate_reject_memory_candidate(candidate_id: str):
+    candidate = getattr(app.state, "memory_candidates", {}).get(candidate_id)
+    if not candidate:
+        raise HTTPException(404, "memory candidate was not found")
+    if candidate.get("status") == "approved":
+        raise HTTPException(409, "memory candidate was already approved")
+    candidate["status"] = "rejected"
+    candidate["updated_at"] = now()
+    app.state.memory_candidates[candidate_id] = candidate
+    _save_registry_item("memory_candidate", candidate)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="memory_candidate.rejected",
+        status="rejected",
+        source="AgentGate",
+        summary="Owner rejected a queued memory candidate",
+        ref_type="memory_candidate",
+        ref_id=candidate_id,
+    )
+    return candidate
+
+
+@app.delete("/api/memory/candidates/{candidate_id}")
+def agentgate_delete_memory_candidate(candidate_id: str):
+    candidate = getattr(app.state, "memory_candidates", {}).get(candidate_id)
+    if not candidate:
+        raise HTTPException(404, "memory candidate was not found")
+    if candidate.get("status") == "approved":
+        raise HTTPException(409, "approved memory candidates are audit history")
+    app.state.memory_candidates.pop(candidate_id, None)
+    _delete_registry_item("memory_candidate", candidate_id)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="memory_candidate.deleted",
+        status="deleted",
+        source="AgentGate",
+        summary="Owner deleted a queued memory candidate record",
+        ref_type="memory_candidate",
+        ref_id=candidate_id,
+    )
+    return {"deleted": True, "id": candidate_id}
 
 
 @app.get("/api/tools")
