@@ -120,34 +120,59 @@ class FakeGates:
         self.synced_toolgate_scope_history = [*getattr(self, "synced_toolgate_scope_history", []), scopes]
         return {"id": "agent-key", "scopes": scopes}
 
-    def toolgate_execution_status(self, agent_id: str | None = None):
+    @staticmethod
+    def _toolgate_store_id(agent_id: str | None, team_id: str | None = None) -> str:
+        if not agent_id:
+            return ""
+        return f"{agent_id}@{team_id}" if team_id else agent_id
+
+    def toolgate_execution_status(self, agent_id: str | None = None, team_id: str | None = None):
         self.status_agent_id = agent_id
-        return {"id": "agent-key", "scopes": getattr(self, "synced_toolgate_scopes", [])}
+        self.status_team_id = team_id
+        store_id = self._toolgate_store_id(agent_id, team_id)
+        scopes = getattr(self, "toolgate_private_key_scopes", {}).get(store_id, getattr(self, "synced_toolgate_scopes", []))
+        return {"id": "agent-key", "scopes": scopes}
 
     def toolgate_agent_keys(self):
         return getattr(self, "toolgate_keys", [])
 
-    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str]):
-        self.ensured_toolgate = {"agent_id": agent_id, "scopes": scopes}
+    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str], team_id: str | None = None):
+        store_id = self._toolgate_store_id(agent_id, team_id)
+        label = f"AgentGate:{agent_id}@{team_id}" if team_id else f"AgentGate:{agent_id}"
+        self.ensured_toolgate = {"agent_id": agent_id, "team_id": team_id, "scopes": scopes}
         self.toolgate_private_keys = {
             **getattr(self, "toolgate_private_keys", {}),
-            agent_id: "tgx_fake_private_key_1234567890",
+            store_id: f"tgx_fake_private_key_{store_id}_1234567890",
+        }
+        self.toolgate_private_key_scopes = {
+            **getattr(self, "toolgate_private_key_scopes", {}),
+            store_id: scopes,
         }
         self.toolgate_keys = [
-            row for row in getattr(self, "toolgate_keys", []) if row.get("name") != f"AgentGate:{agent_id}"
-        ] + [{"id": f"tg-{agent_id}", "name": f"AgentGate:{agent_id}", "status": "active", "scopes": scopes}]
-        return {"status": "cached", "agent_id": agent_id}
+            row for row in getattr(self, "toolgate_keys", []) if row.get("name") != label
+        ] + [{"id": f"tg-{store_id}", "name": label, "status": "active", "scopes": scopes}]
+        return {"status": "cached", "agent_id": agent_id, "team_id": team_id or ""}
 
-    def toolgate_agent_execution_key(self, agent_id: str | None):
-        return getattr(self, "toolgate_private_keys", {}).get(agent_id or "", "")
+    def toolgate_agent_execution_key(self, agent_id: str | None, team_id: str | None = None):
+        return getattr(self, "toolgate_private_keys", {}).get(self._toolgate_store_id(agent_id, team_id), "")
 
-    def has_toolgate_agent_execution_key(self, agent_id: str):
-        return agent_id in getattr(self, "toolgate_private_keys", {"agent_pi_operator": "tgx_fake"})
+    def has_toolgate_agent_execution_key(self, agent_id: str, team_id: str | None = None):
+        return self._toolgate_store_id(agent_id, team_id) in getattr(self, "toolgate_private_keys", {"agent_pi_operator": "tgx_fake"})
 
-    def forget_toolgate_agent_execution_key(self, agent_id: str):
-        self.forgot_toolgate_agent_id = agent_id
+    def forget_toolgate_agent_execution_key(self, agent_id: str, team_id: str | None = None):
+        store_id = self._toolgate_store_id(agent_id, team_id)
+        self.forgot_toolgate_agent_id = store_id
         self.toolgate_private_keys = {
-            key: value for key, value in getattr(self, "toolgate_private_keys", {}).items() if key != agent_id
+            key: value for key, value in getattr(self, "toolgate_private_keys", {}).items() if key != store_id
+        }
+
+    def forget_toolgate_agent_execution_keys_for_agent(self, agent_id: str):
+        self.forgot_toolgate_agent_id = agent_id
+        prefix = f"{agent_id}@"
+        self.toolgate_private_keys = {
+            key: value
+            for key, value in getattr(self, "toolgate_private_keys", {}).items()
+            if key != agent_id and not key.startswith(prefix)
         }
 
     def memorygate_agent_keys(self):
@@ -570,13 +595,65 @@ def test_gate_client_bootstraps_agent_toolgate_key_privately(monkeypatch, tmp_pa
     result = gates.ensure_toolgate_agent_execution_key("agent_alpha", ["tool:echo"])
     cached = gates.ensure_toolgate_agent_execution_key("agent_alpha", ["tool:echo", "tool:notes.*"])
 
-    assert result == {"status": "created", "agent_id": "agent_alpha", "toolgate_key_id": "tg-agent-a"}
-    assert cached == {"status": "cached", "agent_id": "agent_alpha", "toolgate_key_id": "tg-agent-a"}
+    assert result == {"status": "created", "agent_id": "agent_alpha", "team_id": "", "toolgate_key_id": "tg-agent-a"}
+    assert cached == {"status": "cached", "agent_id": "agent_alpha", "team_id": "", "toolgate_key_id": "tg-agent-a"}
     assert gates.created_payloads == [{"name": "AgentGate:agent_alpha", "scopes": ["tool:echo"]}]
     assert gates.has_toolgate_agent_execution_key("agent_alpha")
     assert gates.toolgate_agent_execution_key("agent_alpha").startswith("tgx_")
     assert gates.agent_toolgate_key_path.exists()
     assert oct(gates.agent_toolgate_key_path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_gate_client_scopes_agent_toolgate_keys_by_team(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADAPTER_DATA_DIR", str(tmp_path))
+
+    class RecordingGateClients(GateClients):
+        def __init__(self):
+            super().__init__()
+            self.created_payloads = []
+            self.updated_payloads = []
+
+        def _request(self, service: str, path: str, *, method: str = "GET", payload=None, timeout: float = 8):
+            if service == "toolgate" and path == "/v2/agent-keys" and method == "GET":
+                return {"results": []}
+            if service == "toolgate" and path == "/v2/agent-keys" and method == "POST":
+                self.created_payloads.append(payload)
+                suffix = str(payload["name"]).split("@", 1)[-1]
+                return {
+                    "key": f"tgx_test_private_key_{suffix}_1234567890",
+                    "record": {
+                        "id": f"tg-agent-{suffix}",
+                        "name": payload["name"],
+                        "status": "active",
+                        "scopes": payload["scopes"],
+                    },
+                }
+            if service == "toolgate" and method == "PATCH":
+                self.updated_payloads.append({"path": path, "payload": payload})
+                return {"id": path.rsplit("/", 2)[-2], "scopes": payload["scopes"]}
+            raise AssertionError(f"unexpected request {service} {method} {path}")
+
+    gates = RecordingGateClients()
+    core = gates.ensure_toolgate_agent_execution_key("agent_alpha", ["tool:echo"], team_id="team_core")
+    ops = gates.ensure_toolgate_agent_execution_key("agent_alpha", ["tool:danger.write"], team_id="team_ops")
+
+    assert core["team_id"] == "team_core"
+    assert ops["team_id"] == "team_ops"
+    assert gates.created_payloads == [
+        {"name": "AgentGate:agent_alpha@team_core", "scopes": ["tool:echo"]},
+        {"name": "AgentGate:agent_alpha@team_ops", "scopes": ["tool:danger.write"]},
+    ]
+    assert gates.toolgate_agent_execution_key("agent_alpha", team_id="team_core") != gates.toolgate_agent_execution_key(
+        "agent_alpha",
+        team_id="team_ops",
+    )
+    assert gates.has_toolgate_agent_execution_key("agent_alpha", team_id="team_core")
+    assert gates.has_toolgate_agent_execution_key("agent_alpha", team_id="team_ops")
+
+    gates.forget_toolgate_agent_execution_keys_for_agent("agent_alpha")
+
+    assert not gates.has_toolgate_agent_execution_key("agent_alpha", team_id="team_core")
+    assert not gates.has_toolgate_agent_execution_key("agent_alpha", team_id="team_ops")
 
 
 def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_path):
@@ -604,6 +681,8 @@ def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_p
     assert ok.json()["execution_scope_allowed"] is True
     assert ok.json()["required_scope"] == "tool:echo"
     assert denied.status_code == 403
+    assert app.state.gates.status_agent_id == "agent_pi_operator"
+    assert app.state.gates.status_team_id == "team_core"
     assert "tool.health_checked" in [item["event_type"] for item in activity]
     assert "danger.write" not in str(activity)
 
@@ -2083,8 +2162,42 @@ def test_chat_passes_per_agent_toolgate_execution_key_to_pi():
         response = client.post("/api/sessions/sess-1/chat/stream", json={"input": "use scoped key"})
 
     assert response.status_code == 200
-    assert pi.options["toolgate_execution_key"] == "tgx_fake_private_key_1234567890"
-    assert app.state.gates.ensured_toolgate == {"agent_id": "agent_pi_operator", "scopes": []}
+    assert pi.options["toolgate_execution_key"] == "tgx_fake_private_key_agent_pi_operator@team_core_1234567890"
+    assert app.state.gates.ensured_toolgate == {"agent_id": "agent_pi_operator", "team_id": "team_core", "scopes": []}
+
+
+def test_chat_uses_team_scoped_toolgate_execution_key():
+    reset_state()
+    pi = CapturingPi()
+    app.state.pi = pi
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Ops",
+                "purpose": "Restricted ops test",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator"],
+                "tool_ids": ["danger.write"],
+                "memory_scopes": [],
+                "skill_ids": [],
+            },
+        ).json()
+        client.patch("/api/agents/agent_pi_operator", json={"tool_ids": ["echo"], "team_ids": ["team_core", team["id"]]})
+        response = client.post(
+            "/api/sessions/sess-1/chat/stream",
+            json={"input": "use ops tool boundary", "team_id": team["id"]},
+        )
+
+    assert response.status_code == 200
+    assert pi.options["toolgate_execution_key"] == f"tgx_fake_private_key_agent_pi_operator@{team['id']}_1234567890"
+    assert app.state.gates.ensured_toolgate == {
+        "agent_id": "agent_pi_operator",
+        "team_id": team["id"],
+        "scopes": ["tool:danger.write", "tool:echo"],
+    }
 
 
 

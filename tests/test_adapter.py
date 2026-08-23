@@ -483,12 +483,18 @@ class DecisionGates:
         self.decisions.append((request_id, decision))
         return {"id": request_id, "status": decision, "decision": decision}
 
-    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str]):
-        self.toolgate_private_keys[agent_id] = "tgx_fake_private_key_1234567890"
-        return {"status": "cached", "agent_id": agent_id}
+    @staticmethod
+    def _toolgate_store_id(agent_id: str | None, team_id: str | None = None) -> str:
+        if not agent_id:
+            return ""
+        return f"{agent_id}@{team_id}" if team_id else agent_id
 
-    def toolgate_agent_execution_key(self, agent_id: str | None):
-        return self.toolgate_private_keys.get(agent_id or "", "")
+    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str], team_id: str | None = None):
+        self.toolgate_private_keys[self._toolgate_store_id(agent_id, team_id)] = "tgx_fake_private_key_1234567890"
+        return {"status": "cached", "agent_id": agent_id, "team_id": team_id or ""}
+
+    def toolgate_agent_execution_key(self, agent_id: str | None, team_id: str | None = None):
+        return self.toolgate_private_keys.get(self._toolgate_store_id(agent_id, team_id), "")
 
 
 def test_agentgate_approval_decision_resumes_matching_paused_run():

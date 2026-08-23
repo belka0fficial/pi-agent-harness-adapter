@@ -229,30 +229,57 @@ class GateClients:
         except OSError:
             pass
 
-    def toolgate_agent_execution_key(self, agent_id: str | None) -> str:
+    @staticmethod
+    def _toolgate_actor_store_id(agent_id: str | None, team_id: str | None = None) -> str:
         if not agent_id:
             return ""
-        item = self._load_agent_toolgate_keys().get(agent_id)
+        clean_agent = str(agent_id).strip()
+        clean_team = str(team_id or "").strip()
+        return f"{clean_agent}@{clean_team}" if clean_team else clean_agent
+
+    @staticmethod
+    def _toolgate_actor_label(agent_id: str, team_id: str | None = None) -> str:
+        clean_team = str(team_id or "").strip()
+        return f"AgentGate:{agent_id}@{clean_team}" if clean_team else f"AgentGate:{agent_id}"
+
+    def toolgate_agent_execution_key(self, agent_id: str | None, team_id: str | None = None) -> str:
+        store_id = self._toolgate_actor_store_id(agent_id, team_id)
+        if not store_id:
+            return ""
+        item = self._load_agent_toolgate_keys().get(store_id)
         return str((item or {}).get("key") or "")
 
-    def has_toolgate_agent_execution_key(self, agent_id: str) -> bool:
-        return bool(self.toolgate_agent_execution_key(agent_id))
+    def has_toolgate_agent_execution_key(self, agent_id: str, team_id: str | None = None) -> bool:
+        return bool(self.toolgate_agent_execution_key(agent_id, team_id=team_id))
 
-    def forget_toolgate_agent_execution_key(self, agent_id: str) -> None:
+    def forget_toolgate_agent_execution_key(self, agent_id: str, team_id: str | None = None) -> None:
         store = self._load_agent_toolgate_keys()
-        if agent_id not in store:
+        store_id = self._toolgate_actor_store_id(agent_id, team_id)
+        if store_id not in store:
             return
-        store.pop(agent_id, None)
+        store.pop(store_id, None)
         self._save_agent_toolgate_keys(store)
 
-    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str]) -> dict[str, Any]:
+    def forget_toolgate_agent_execution_keys_for_agent(self, agent_id: str) -> None:
+        prefix = f"{str(agent_id).strip()}@"
+        store = self._load_agent_toolgate_keys()
+        next_store = {
+            key: value
+            for key, value in store.items()
+            if key != agent_id and not str(key).startswith(prefix)
+        }
+        if next_store != store:
+            self._save_agent_toolgate_keys(next_store)
+
+    def ensure_toolgate_agent_execution_key(self, agent_id: str, scopes: list[str], team_id: str | None = None) -> dict[str, Any]:
         agent_id = str(agent_id or "").strip()
         if not agent_id:
             raise RuntimeError("agent id is required")
+        store_id = self._toolgate_actor_store_id(agent_id, team_id)
         normalized_scopes = [str(scope).strip() for scope in scopes if str(scope).strip()]
-        label = f"AgentGate:{agent_id}"
+        label = self._toolgate_actor_label(agent_id, team_id)
         store = self._load_agent_toolgate_keys()
-        cached = store.get(agent_id) if isinstance(store.get(agent_id), dict) else None
+        cached = store.get(store_id) if isinstance(store.get(store_id), dict) else None
         if cached and str(cached.get("key") or "").startswith("tgx_"):
             key_id = str(cached.get("toolgate_key_id") or "")
             if key_id:
@@ -264,14 +291,16 @@ class GateClients:
                 )
                 cached["scopes"] = normalized_scopes
                 cached["updated_at"] = datetime.now(UTC).isoformat()
-                store[agent_id] = cached
+                cached["team_id"] = str(team_id or "")
+                store[store_id] = cached
                 self._save_agent_toolgate_keys(store)
                 return {
                     "status": "cached",
                     "agent_id": agent_id,
+                    "team_id": str(team_id or ""),
                     "toolgate_key_id": str((updated or {}).get("id") or key_id),
                 }
-            return {"status": "cached", "agent_id": agent_id, "toolgate_key_id": ""}
+            return {"status": "cached", "agent_id": agent_id, "team_id": str(team_id or ""), "toolgate_key_id": ""}
         keys = self.toolgate_agent_keys()
         if any(
             str(row.get("name") or row.get("label") or "").strip().lower() == label.lower()
@@ -289,9 +318,11 @@ class GateClients:
         record = (created or {}).get("record") if isinstance((created or {}).get("record"), dict) else {}
         if not raw_key.startswith("tgx_"):
             raise RuntimeError("toolgate did not return an execution key")
-        store[agent_id] = {
+        store[store_id] = {
             "key": raw_key,
             "label": label,
+            "agent_id": agent_id,
+            "team_id": str(team_id or ""),
             "toolgate_key_id": str(record.get("id") or ""),
             "scopes": normalized_scopes,
             "created_at": datetime.now(UTC).isoformat(),
@@ -300,6 +331,7 @@ class GateClients:
         return {
             "status": "created",
             "agent_id": agent_id,
+            "team_id": str(team_id or ""),
             "toolgate_key_id": str(record.get("id") or ""),
         }
 
@@ -444,8 +476,8 @@ class GateClients:
                 return row
         return None
 
-    def toolgate_execution_status(self, agent_id: str | None = None) -> dict[str, Any]:
-        execution_key = self.toolgate_agent_execution_key(agent_id) if agent_id else None
+    def toolgate_execution_status(self, agent_id: str | None = None, team_id: str | None = None) -> dict[str, Any]:
+        execution_key = self.toolgate_agent_execution_key(agent_id, team_id=team_id) if agent_id else None
         payload = self._toolgate_execution_request("/v2/agent/status", execution_key=execution_key)
         return payload if isinstance(payload, dict) else {}
 
