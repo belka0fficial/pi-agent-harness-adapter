@@ -1488,6 +1488,52 @@ def test_automation_rejects_webhooks_and_too_frequent_cron():
     assert "timezone" in invalid_timezone.text.lower()
 
 
+def test_automation_delivery_policy_stores_safe_metadata_only():
+    reset_state()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Desktop Notify Plan",
+                "schedule": "0 9 * * *",
+                "prompt": "private delivery prompt",
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["desktop-main", "phone personal"],
+            },
+        ).json()
+        unsafe_url = client.post(
+            "/api/jobs",
+            json={
+                "name": "Bad Delivery",
+                "schedule": "0 10 * * *",
+                "prompt": "do not store endpoint",
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["https://example.com/hook"],
+            },
+        )
+        unsafe_secret = client.post(
+            "/api/jobs",
+            json={
+                "name": "Bad Secret Delivery",
+                "schedule": "0 11 * * *",
+                "prompt": "do not store token",
+                "delivery_policy": "owner_confirmation",
+                "delivery_targets": ["telegram token abc"],
+            },
+        )
+        listed = next(
+            item for item in client.get("/api/automations").json()["automations"] if item["id"] == created["id"]
+        )
+
+    assert created["delivery_policy"] == "allowlisted"
+    assert created["delivery_targets"] == ["desktop-main", "phone personal"]
+    assert created["delivery_target_count"] == 2
+    assert listed["delivery_targets"] == ["desktop-main", "phone personal"]
+    assert "private delivery prompt" not in str(listed)
+    assert unsafe_url.status_code == 422
+    assert unsafe_secret.status_code == 422
+
+
 def test_automation_owner_confirmation_uses_toolgate_request_without_raw_prompt():
     reset_state()
     app.state.pi = BlockedJobPi()

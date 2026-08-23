@@ -47,6 +47,8 @@ class JobInput(BaseModel):
     prompt: str = Field(min_length=1)
     deliver: str = "local"
     webhook_url: str | None = None
+    delivery_policy: str = "disabled"
+    delivery_targets: list[str] = Field(default_factory=list)
     agent_id: str = "agent_pi_operator"
     team_id: str | None = None
     timezone: str = "UTC"
@@ -1112,6 +1114,35 @@ def _sanitize_job_approval_policy(value: Any) -> str:
     return policy
 
 
+def _sanitize_delivery_policy(value: Any) -> str:
+    policy = str(value or "disabled").strip().lower()
+    if policy not in {"disabled", "owner_confirmation", "allowlisted"}:
+        raise HTTPException(422, "delivery_policy must be disabled, owner_confirmation, or allowlisted")
+    return policy
+
+
+def _sanitize_delivery_targets(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise HTTPException(422, "delivery_targets must be a list of safe labels")
+    result: list[str] = []
+    for value in values:
+        label = " ".join(str(value or "").strip().split())
+        if not label:
+            continue
+        lowered = label.lower()
+        if len(label) > 64:
+            raise HTTPException(422, "delivery target labels must be 64 characters or fewer")
+        if "://" in lowered or "@" in label or re.search(r"\b(token|secret|password|api[_-]?key|bearer)\b", lowered):
+            raise HTTPException(422, "delivery_targets must use labels only, not URLs, emails, phone numbers, tokens, or secrets")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _./:-]{0,63}", label):
+            raise HTTPException(422, "delivery target labels may contain letters, numbers, spaces, dots, slashes, colons, underscores, and hyphens")
+        if label not in result:
+            result.append(label)
+    return result[:12]
+
+
 def _sanitize_task_status(value: Any) -> str:
     status = str(value or "queued").strip().lower()
     allowed = {"queued", "in_progress", "waiting_approval", "blocked", "done", "cancelled"}
@@ -1271,6 +1302,9 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
         "agent_id": item.get("agent_id"),
         "team_id": item.get("team_id"),
         "deliver": item.get("deliver", "local"),
+        "delivery_policy": item.get("delivery_policy", "disabled"),
+        "delivery_targets": item.get("delivery_targets", []),
+        "delivery_target_count": len(item.get("delivery_targets") or []),
         "paused": item.get("paused", False),
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
@@ -1557,6 +1591,8 @@ def create_job(payload: JobInput):
     _validate_job_payload(payload.webhook_url)
     actor = _permission_context(payload.agent_id, payload.team_id)
     approval_policy = _sanitize_job_approval_policy(payload.approval_policy)
+    delivery_policy = _sanitize_delivery_policy(payload.delivery_policy)
+    delivery_targets = _sanitize_delivery_targets(payload.delivery_targets)
     required_tool_ids, required_memory_scopes = _validate_job_requirements(
         actor,
         payload.required_tool_ids,
@@ -1574,6 +1610,8 @@ def create_job(payload: JobInput):
         "required_tool_ids": required_tool_ids,
         "required_memory_scopes": required_memory_scopes,
         "approval_policy": approval_policy,
+        "delivery_policy": delivery_policy,
+        "delivery_targets": delivery_targets,
         "approval_status": "pending" if pending_approval else "not_required",
         "approval_request_id": None,
         "paused": pending_approval,
@@ -1630,12 +1668,16 @@ def update_job(job_id: str, payload: dict[str, Any]):
     )
     if "approval_policy" in payload:
         payload["approval_policy"] = _sanitize_job_approval_policy(payload.get("approval_policy"))
+    if "delivery_policy" in payload:
+        payload["delivery_policy"] = _sanitize_delivery_policy(payload.get("delivery_policy"))
+    if "delivery_targets" in payload:
+        payload["delivery_targets"] = _sanitize_delivery_targets(payload.get("delivery_targets"))
     payload = {
         **payload,
         "required_tool_ids": next_required_tools,
         "required_memory_scopes": next_required_memory,
     }
-    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes", "approval_policy"}})
+    app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url", "delivery_policy", "delivery_targets", "agent_id", "team_id", "timezone", "required_tool_ids", "required_memory_scopes", "approval_policy"}})
     app.state.jobs[job_id]["updated_at"] = now()
     app.state.jobs[job_id]["schedule_preview"] = schedule_preview
     if _job_requires_owner_approval(app.state.jobs[job_id]) and app.state.jobs[job_id].get("approval_status") != "approved":
