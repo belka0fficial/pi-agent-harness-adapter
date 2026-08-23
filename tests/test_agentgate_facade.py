@@ -72,6 +72,9 @@ class FakeGates:
             "authorization": authorization,
             "policy": {"usage_limits": usage_limits},
             "execution": {"type": "echo"},
+            "provider_url": "https://private.example/tool",
+            "credentials": {"api_key": "abc123"},
+            "raw_args": {"token": "abc123"},
         }
 
     def skills(self):
@@ -907,9 +910,29 @@ def test_tool_policy_update_is_limited_to_authorization_and_usage_limits(monkeyp
             "max_runtime_seconds": 10,
         },
     }
-    assert response.json()["tool"]["execution"] == {"type": "echo"}
+    body = response.json()
+    assert "tool" not in body
+    assert body["policy_summary"] == {
+        "tool_id": "echo",
+        "authorization": "owner_confirmation",
+        "usage_limits": {
+            "max_per_minute": 3,
+            "max_per_hour": 12,
+            "cooldown_seconds": 2,
+            "max_runtime_seconds": 10,
+        },
+        "policy_status": "saved",
+        "updated_at": body["policy_summary"]["updated_at"],
+    }
     assert "tool.policy_updated" in [item["event_type"] for item in activity]
-    assert "dangerous" not in str(activity)
+    combined = f"{body} {activity}".lower()
+    assert "dangerous" not in combined
+    assert "execution" not in combined
+    assert "raw_args" not in combined
+    assert "credentials" not in combined
+    assert "https://private.example" not in combined
+    assert "api_key" not in combined
+    assert "token" not in combined
 
 
 def test_team_membership_updates_agent_team_ids(monkeypatch, tmp_path):

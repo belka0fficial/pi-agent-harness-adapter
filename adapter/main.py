@@ -4475,11 +4475,12 @@ def agentgate_update_tool_policy(tool_id: str, payload: ToolPolicyInput):
     current = next((row for row in tools if str(row.get("id") or "") == tool_id), None)
     if not current:
         raise HTTPException(404, "tool not found")
-    updated = app.state.gates.update_tool_policy(
+    app.state.gates.update_tool_policy(
         tool_id,
         authorization=authorization,
         usage_limits=usage_limits,
     )
+    updated_at = now()
     _record_activity(
         "agent_pi_operator",
         event_type="tool.policy_updated",
@@ -4490,11 +4491,12 @@ def agentgate_update_tool_policy(tool_id: str, payload: ToolPolicyInput):
         ref_id=tool_id,
     )
     return {
-        "tool": updated,
         "policy_summary": {
             "tool_id": tool_id,
             "authorization": authorization,
             "usage_limits": usage_limits,
+            "policy_status": "saved",
+            "updated_at": updated_at,
         },
     }
 
