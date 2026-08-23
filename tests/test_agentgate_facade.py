@@ -2026,6 +2026,68 @@ def test_tool_draft_review_creates_toolgate_request(monkeypatch, tmp_path):
     assert refreshed[0]["review_state"] == "toolgate_approved"
 
 
+def test_tool_draft_package_proposal_requires_toolgate_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/tool-drafts",
+            json={
+                "title": "Create a safe helper",
+                "purpose": "Prepare a reviewed helper package.",
+                "proposed_tool_id": "Safe Helper",
+                "risk": "medium",
+            },
+        ).json()
+        blocked = client.post(f"/api/tool-drafts/{created['id']}/package-proposal")
+
+    assert blocked.status_code == 409
+    assert "approval" in blocked.text.lower()
+
+
+def test_tool_draft_package_proposal_is_metadata_only_after_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/tool-drafts",
+            json={
+                "title": "Create a safe helper",
+                "purpose": "Summarize local notes. Never include token=abc123 or https://private.example/path.",
+                "proposed_tool_id": "Safe Helper",
+                "risk": "medium",
+                "source_session_id": "sess-1",
+                "source_message_id": "u1",
+            },
+        ).json()
+        review = client.post(f"/api/tool-drafts/{created['id']}/toolgate-review").json()
+        app.state.gates.decide_approval(review["toolgate_request_id"], "approved")
+        proposal = client.post(f"/api/tool-drafts/{created['id']}/package-proposal").json()
+
+    assert proposal["status"] == "package_proposed"
+    assert proposal["review_state"] == "package_proposal_ready"
+    package = proposal["package_proposal"]
+    manifest = package["manifest"]
+    assert package["digest"]
+    assert manifest["schema_version"] == "agentgate.tool_package_proposal.v1"
+    assert manifest["proposed_tool_id"] == "safe.helper"
+    assert manifest["install_policy"] == "manual_toolgate_owned"
+    assert manifest["executable_included"] is False
+    assert manifest["raw_arguments_included"] is False
+    assert manifest["approval"]["toolgate_request_id"] == review["toolgate_request_id"]
+    assert manifest["approval"]["toolgate_status"] == "approved"
+    payload = str(proposal).lower()
+    assert "token=abc123" not in payload
+    assert "https://private.example" not in payload
+    assert "mg_" + "read_" not in payload
+    assert "tgx_" not in payload
+    assert "api_key" not in payload
+
+
 def test_chat_defaults_to_no_memory_side_effects():
     reset_state()
     pi = CapturingPi()

@@ -1032,7 +1032,8 @@ def _public_tool_draft(item: dict[str, Any]) -> dict[str, Any]:
                 toolgate_status = str(request.get("status") or toolgate_status or "pending")
                 item["toolgate_status"] = toolgate_status
                 if toolgate_status in {"approved", "rejected", "dismissed"}:
-                    item["review_state"] = f"toolgate_{'rejected' if toolgate_status == 'dismissed' else toolgate_status}"
+                    if item.get("status") != "package_proposed":
+                        item["review_state"] = f"toolgate_{'rejected' if toolgate_status == 'dismissed' else toolgate_status}"
                     item["updated_at"] = now()
                     _save_registry_item("tool_draft", item)
         except Exception:
@@ -1047,11 +1048,57 @@ def _public_tool_draft(item: dict[str, Any]) -> dict[str, Any]:
         "review_state": item.get("review_state") or "needs_owner_review",
         "toolgate_request_id": request_id,
         "toolgate_status": toolgate_status,
+        "package_proposal": item.get("package_proposal") if isinstance(item.get("package_proposal"), dict) else None,
         "source_session_id": item.get("source_session_id"),
         "source_message_id": item.get("source_message_id"),
         "source_role": item.get("source_role") or "selected",
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
+    }
+
+
+def _tool_draft_package_proposal(item: dict[str, Any]) -> dict[str, Any]:
+    proposed_tool_id = _sanitize_tool_id(item.get("proposed_tool_id") or item.get("title") or item["id"])
+    package_name = f"toolgate-tool-{proposed_tool_id.replace('.', '-')}"
+    approval = {
+        "toolgate_request_id": item.get("toolgate_request_id") or "",
+        "toolgate_status": item.get("toolgate_status") or "",
+    }
+    manifest = {
+        "schema_version": "agentgate.tool_package_proposal.v1",
+        "package_name": package_name,
+        "proposed_tool_id": proposed_tool_id,
+        "title": _redact_tool_draft_text(item.get("title") or "", limit=160),
+        "risk": _sanitize_risk(item.get("risk")),
+        "purpose_summary": _redact_tool_draft_text(item.get("purpose") or "", limit=800),
+        "source": {
+            "session_id": _safe_text(item.get("source_session_id"), limit=120),
+            "message_id": _safe_text(item.get("source_message_id"), limit=120),
+            "role": _safe_text(item.get("source_role"), limit=40) or "selected",
+        },
+        "approval": approval,
+        "install_policy": "manual_toolgate_owned",
+        "executable_included": False,
+        "raw_arguments_included": False,
+        "credentials_included": False,
+        "memory_contents_included": False,
+        "required_files": [
+            "README.md",
+            "toolgate.tool.json",
+            "tests/contract.md",
+        ],
+        "next_steps": [
+            "Create a ToolGate-owned tool package from this manifest.",
+            "Define inputs, outputs, and execution policy inside ToolGate.",
+            "Run ToolGate contract tests before enabling the tool.",
+            "Grant the resulting tool id to agents or teams through AgentGate only after review.",
+        ],
+    }
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest()
+    return {
+        "manifest": manifest,
+        "digest": digest,
+        "created_at": now(),
     }
 
 
@@ -4145,8 +4192,8 @@ def update_tool_draft(draft_id: str, payload: dict[str, Any]):
         item["risk"] = _sanitize_risk(payload.get("risk"))
     if "status" in payload:
         status = str(payload.get("status") or "").strip()
-        if status not in {"draft", "needs_toolgate_review", "rejected", "archived"}:
-            raise HTTPException(422, "status must be draft, needs_toolgate_review, rejected, or archived")
+        if status not in {"draft", "needs_toolgate_review", "package_proposed", "rejected", "archived"}:
+            raise HTTPException(422, "status must be draft, needs_toolgate_review, package_proposed, rejected, or archived")
         if status == "needs_toolgate_review":
             _create_tool_draft_review_request(item)
             return _public_tool_draft(item)
@@ -4181,6 +4228,33 @@ def request_tool_draft_toolgate_review(draft_id: str):
             "status": request.get("status") or item.get("toolgate_status") or "pending",
         },
     }
+
+
+@app.post("/api/tool-drafts/{draft_id}/package-proposal")
+def prepare_tool_draft_package_proposal(draft_id: str):
+    item = app.state.tool_drafts.get(draft_id)
+    if not item:
+        raise HTTPException(404, "tool draft not found")
+    public = _public_tool_draft(item)
+    toolgate_status = str(public.get("toolgate_status") or item.get("toolgate_status") or "")
+    if toolgate_status != "approved":
+        raise HTTPException(409, "ToolGate approval is required before preparing a package proposal")
+    proposal = _tool_draft_package_proposal(item)
+    item["package_proposal"] = proposal
+    item["status"] = "package_proposed"
+    item["review_state"] = "package_proposal_ready"
+    item["updated_at"] = now()
+    _save_registry_item("tool_draft", item)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="tool.package_proposal_prepared",
+        status="ready",
+        source="AgentGate",
+        summary=f"Tool package proposal prepared: {item.get('proposed_tool_id') or draft_id}",
+        ref_type="tool_draft",
+        ref_id=draft_id,
+    )
+    return _public_tool_draft(item)
 
 
 @app.delete("/api/tool-drafts/{draft_id}")
