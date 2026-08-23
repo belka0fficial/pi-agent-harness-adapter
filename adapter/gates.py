@@ -266,6 +266,35 @@ class GateClients:
         payload = self._request("toolgate", "/v2/tools")
         return payload if isinstance(payload, list) else payload.get("tools", payload.get("results", []))
 
+    def update_tool_policy(
+        self,
+        tool_id: str,
+        *,
+        authorization: str,
+        usage_limits: dict[str, int],
+    ) -> dict[str, Any]:
+        current = self._request("toolgate", f"/v2/tools/{tool_id}")
+        if not isinstance(current, dict) or not current.get("id"):
+            raise RuntimeError("toolgate tool was not found")
+        policy = {**(current.get("policy") or {})}
+        policy["usage_limits"] = usage_limits
+        payload = {
+            "id": current["id"],
+            "name": current.get("name"),
+            "description": current.get("description") or "",
+            "service_id": current.get("service_id"),
+            "category": current.get("category") or "controlled",
+            "inputs": current.get("inputs") or [],
+            "outputs": current.get("outputs") or [],
+            "execution": current.get("execution") or {},
+            "policy": policy,
+            "authorization": authorization,
+            "version": int(current.get("version") or 1),
+            "status": current.get("status") or "active",
+        }
+        result = self._request("toolgate", f"/v2/tools/{tool_id}", method="PUT", payload=payload)
+        return result if isinstance(result, dict) else {}
+
     def skills(self) -> list[dict[str, Any]]:
         payload = self._request("memorygate", "/skills")
         return payload if isinstance(payload, list) else payload.get("skills", payload.get("results", []))

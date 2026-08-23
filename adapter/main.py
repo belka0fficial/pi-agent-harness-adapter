@@ -60,6 +60,11 @@ class MemoryCandidateInput(BaseModel):
     approved: bool = False
 
 
+class ToolPolicyInput(BaseModel):
+    authorization: str = "owner_confirmation"
+    usage_limits: dict[str, int] = Field(default_factory=dict)
+
+
 class AgentInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     title: str = Field(default="Agent", max_length=120)
@@ -540,6 +545,28 @@ def _validate_job_requirements(actor: dict[str, Any], required_tool_ids: list[An
             detail.append(f"missing memory scopes: {', '.join(missing_memory)}")
         raise HTTPException(403, "; ".join(detail))
     return tools, memory_scopes
+
+
+def _sanitize_tool_policy(payload: ToolPolicyInput) -> tuple[str, dict[str, int]]:
+    authorization = payload.authorization.strip()
+    if authorization not in {"auto", "ai_review", "owner_confirmation", "blocked"}:
+        raise HTTPException(422, "unsupported tool authorization policy")
+    allowed_limits = {
+        "max_per_minute": (1, 120),
+        "max_per_hour": (1, 2000),
+        "cooldown_seconds": (0, 3600),
+        "max_runtime_seconds": (1, 600),
+    }
+    limits: dict[str, int] = {}
+    for key, value in payload.usage_limits.items():
+        if key not in allowed_limits:
+            raise HTTPException(422, f"unsupported usage limit: {key}")
+        minimum, maximum = allowed_limits[key]
+        number = int(value)
+        if number < minimum or number > maximum:
+            raise HTTPException(422, f"{key} must be between {minimum} and {maximum}")
+        limits[key] = number
+    return authorization, limits
 
 
 def _toolgate_scope_for_tool_id(tool_id: str) -> str:
@@ -1817,6 +1844,37 @@ def agentgate_tools(agent_id: str | None = None, team_id: str | None = None):
         "allowed_ids": allowed,
         "total": len(rows),
         "visible": len(visible),
+    }
+
+
+@app.patch("/api/tools/{tool_id}/policy")
+def agentgate_update_tool_policy(tool_id: str, payload: ToolPolicyInput):
+    authorization, usage_limits = _sanitize_tool_policy(payload)
+    tools = app.state.gates.tools()
+    current = next((row for row in tools if str(row.get("id") or "") == tool_id), None)
+    if not current:
+        raise HTTPException(404, "tool not found")
+    updated = app.state.gates.update_tool_policy(
+        tool_id,
+        authorization=authorization,
+        usage_limits=usage_limits,
+    )
+    _record_activity(
+        "agent_pi_operator",
+        event_type="tool.policy_updated",
+        status="saved",
+        source="ToolGate",
+        summary=f"Tool policy updated: {tool_id} now requires {authorization}",
+        ref_type="tool",
+        ref_id=tool_id,
+    )
+    return {
+        "tool": updated,
+        "policy_summary": {
+            "tool_id": tool_id,
+            "authorization": authorization,
+            "usage_limits": usage_limits,
+        },
     }
 
 

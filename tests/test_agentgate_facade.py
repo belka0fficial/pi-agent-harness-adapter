@@ -42,9 +42,36 @@ class FakeGates:
 
     def tools(self):
         return [
-            {"id": "echo", "name": "Echo", "description": "Test tool", "status": "active", "authorization": "auto"},
-            {"id": "danger.write", "name": "Danger Write", "description": "Should stay hidden unless granted", "status": "active", "authorization": "approval"},
+            {
+                "id": "echo",
+                "name": "Echo",
+                "description": "Test tool",
+                "status": "active",
+                "authorization": "auto",
+                "policy": {"usage_limits": {"max_per_minute": 12}},
+            },
+            {
+                "id": "danger.write",
+                "name": "Danger Write",
+                "description": "Should stay hidden unless granted",
+                "status": "active",
+                "authorization": "owner_confirmation",
+                "policy": {"usage_limits": {"max_per_minute": 1}},
+            },
         ]
+
+    def update_tool_policy(self, tool_id: str, *, authorization: str, usage_limits: dict[str, int]):
+        self.updated_tool_policy = {
+            "tool_id": tool_id,
+            "authorization": authorization,
+            "usage_limits": usage_limits,
+        }
+        return {
+            "id": tool_id,
+            "authorization": authorization,
+            "policy": {"usage_limits": usage_limits},
+            "execution": {"type": "echo"},
+        }
 
     def skills(self):
         return [
@@ -231,6 +258,48 @@ def test_tool_health_probe_checks_registry_and_toolgate_scope(monkeypatch, tmp_p
     assert denied.status_code == 403
     assert "tool.health_checked" in [item["event_type"] for item in activity]
     assert "danger.write" not in str(activity)
+
+
+def test_tool_policy_update_is_limited_to_authorization_and_usage_limits(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/api/tools/echo/policy",
+            json={
+                "authorization": "owner_confirmation",
+                "usage_limits": {
+                    "max_per_minute": 3,
+                    "max_per_hour": 12,
+                    "cooldown_seconds": 2,
+                    "max_runtime_seconds": 10,
+                },
+                "execution": {"type": "dangerous"},
+            },
+        )
+        invalid = client.patch(
+            "/api/tools/echo/policy",
+            json={"authorization": "auto", "usage_limits": {"raw_args": 1}},
+        )
+        activity = client.get("/api/activity").json()["activity"]
+
+    assert response.status_code == 200
+    assert invalid.status_code == 422
+    assert app.state.gates.updated_tool_policy == {
+        "tool_id": "echo",
+        "authorization": "owner_confirmation",
+        "usage_limits": {
+            "max_per_minute": 3,
+            "max_per_hour": 12,
+            "cooldown_seconds": 2,
+            "max_runtime_seconds": 10,
+        },
+    }
+    assert response.json()["tool"]["execution"] == {"type": "echo"}
+    assert "tool.policy_updated" in [item["event_type"] for item in activity]
+    assert "dangerous" not in str(activity)
 
 
 def test_team_membership_updates_agent_team_ids(monkeypatch, tmp_path):
