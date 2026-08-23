@@ -102,6 +102,19 @@ class TeamInput(BaseModel):
     skill_ids: list[str] = Field(default_factory=list)
 
 
+class TaskInput(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    summary: str = Field(default="", max_length=1200)
+    agent_id: str = "agent_pi_operator"
+    team_id: str | None = None
+    priority: str = "medium"
+    risk: str = "low"
+    required_tool_ids: list[str] = Field(default_factory=list)
+    required_memory_scopes: list[str] = Field(default_factory=list)
+    source_session_id: str | None = None
+    source_message_id: str | None = None
+
+
 TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
     "persona-development": {
         "id": "persona-development",
@@ -162,6 +175,7 @@ app = FastAPI(title="Pi Agent Harness Adapter", version="0.1.0")
 app.state.sessions = {}
 app.state.messages = {}
 app.state.jobs = {}
+app.state.tasks = {}
 app.state.active_runs = {}
 app.state.approval_runs = {}
 app.state.agents = {}
@@ -243,6 +257,7 @@ def _load_registry() -> None:
     app.state.agents = {}
     app.state.teams = {}
     app.state.jobs = {}
+    app.state.tasks = {}
     for row in rows:
         try:
             item = json.loads(row["data"])
@@ -254,6 +269,8 @@ def _load_registry() -> None:
             app.state.teams[row["id"]] = item
         elif row["kind"] == "job":
             app.state.jobs[row["id"]] = item
+        elif row["kind"] == "task":
+            app.state.tasks[row["id"]] = item
     _normalize_agent_model_defaults()
 
 
@@ -278,7 +295,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job"}:
+    if kind not in {"agent", "team", "job", "task"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry_conn() as conn:
         conn.execute(
@@ -294,7 +311,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job"}:
+    if kind not in {"agent", "team", "job", "task"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry_conn() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -862,6 +879,28 @@ def _sanitize_job_approval_policy(value: Any) -> str:
     return policy
 
 
+def _sanitize_task_status(value: Any) -> str:
+    status = str(value or "queued").strip().lower()
+    allowed = {"queued", "in_progress", "waiting_approval", "blocked", "done", "cancelled"}
+    if status not in allowed:
+        raise HTTPException(422, "status must be queued, in_progress, waiting_approval, blocked, done, or cancelled")
+    return status
+
+
+def _sanitize_priority(value: Any) -> str:
+    priority = str(value or "medium").strip().lower()
+    if priority not in {"low", "medium", "high"}:
+        raise HTTPException(422, "priority must be low, medium, or high")
+    return priority
+
+
+def _sanitize_risk(value: Any) -> str:
+    risk = str(value or "low").strip().lower()
+    if risk not in {"low", "medium", "high"}:
+        raise HTTPException(422, "risk must be low, medium, or high")
+    return risk
+
+
 def _job_requires_owner_approval(payload: JobInput | dict[str, Any]) -> bool:
     policy = _sanitize_job_approval_policy(
         payload.approval_policy if isinstance(payload, JobInput) else payload.get("approval_policy")
@@ -1012,6 +1051,28 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _public_task(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "summary": item.get("summary") or "",
+        "status": item.get("status") or "queued",
+        "priority": item.get("priority") or "medium",
+        "risk": item.get("risk") or "low",
+        "agent_id": item.get("agent_id"),
+        "team_id": item.get("team_id"),
+        "required_tool_ids": item.get("required_tool_ids", []),
+        "required_memory_scopes": item.get("required_memory_scopes", []),
+        "source": item.get("source") or "AgentGate",
+        "source_session_id": item.get("source_session_id"),
+        "source_message_id": item.get("source_message_id"),
+        "session_id": item.get("session_id"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "completed_at": item.get("completed_at"),
+    }
+
+
 def _public_agent_summary(agent_id: str) -> dict[str, Any]:
     agent = app.state.agents.get(agent_id) or {}
     return {
@@ -1071,6 +1132,11 @@ def _public_workroom(team_id: str) -> dict[str, Any]:
         for item in app.state.jobs.values()
         if item.get("team_id") == team_id
     ]
+    tasks = [
+        _public_task(item)
+        for item in app.state.tasks.values()
+        if item.get("team_id") == team_id
+    ]
     activity = _list_activity(team_id=team_id, limit=12)
     sessions = _team_sessions(team_id)
     return {
@@ -1101,6 +1167,7 @@ def _public_workroom(team_id: str) -> dict[str, Any]:
         },
         "sessions": sessions,
         "automations": jobs,
+        "tasks": tasks,
         "activity": activity,
         "pending_approvals": _team_pending_approval_count(team_id),
         "readiness": {
@@ -1108,6 +1175,7 @@ def _public_workroom(team_id: str) -> dict[str, Any]:
             "member_count": len(members),
             "session_count": len(sessions),
             "automation_count": len(jobs),
+            "task_count": len(tasks),
             "recent_activity_count": len(activity),
         },
     }
@@ -2044,6 +2112,168 @@ def create_workroom_session(team_id: str, payload: dict[str, Any] | None = None)
         ref_id=session_id,
     )
     return item
+
+
+@app.get("/api/tasks")
+def list_tasks(
+    agent_id: str | None = None,
+    team_id: str | None = None,
+    status: str | None = None,
+):
+    rows = []
+    for item in app.state.tasks.values():
+        if agent_id and item.get("agent_id") != agent_id:
+            continue
+        if team_id and item.get("team_id") != team_id:
+            continue
+        if status and item.get("status") != status:
+            continue
+        rows.append(_public_task(item))
+    rows.sort(key=lambda row: row.get("updated_at") or row.get("created_at") or "", reverse=True)
+    return {"tasks": rows}
+
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: str):
+    item = app.state.tasks.get(task_id)
+    if not item:
+        raise HTTPException(404, "task not found")
+    return _public_task(item)
+
+
+@app.post("/api/tasks")
+def create_task(payload: TaskInput):
+    actor = _permission_context(payload.agent_id, payload.team_id)
+    required_tool_ids, required_memory_scopes = _validate_job_requirements(
+        actor,
+        payload.required_tool_ids,
+        payload.required_memory_scopes,
+    )
+    task_id = f"task_{uuid.uuid4().hex[:12]}"
+    item = {
+        "id": task_id,
+        "title": _safe_text(payload.title, limit=160),
+        "summary": _safe_text(payload.summary, limit=1200),
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "status": "queued",
+        "priority": _sanitize_priority(payload.priority),
+        "risk": _sanitize_risk(payload.risk),
+        "required_tool_ids": required_tool_ids,
+        "required_memory_scopes": required_memory_scopes,
+        "source": "AgentGate",
+        "source_session_id": _safe_text(payload.source_session_id, limit=120),
+        "source_message_id": _safe_text(payload.source_message_id, limit=120),
+        "session_id": None,
+        "created_at": now(),
+        "updated_at": now(),
+        "completed_at": None,
+    }
+    app.state.tasks[task_id] = item
+    _save_registry_item("task", item)
+    _record_activity(
+        actor["agent_id"],
+        event_type="task.created",
+        status="queued",
+        source="AgentGate",
+        summary=f"Delegated task queued: {item['title']}",
+        team_id=actor["team_id"],
+        ref_type="task",
+        ref_id=task_id,
+    )
+    return _public_task(item)
+
+
+@app.patch("/api/tasks/{task_id}")
+def update_task(task_id: str, payload: dict[str, Any]):
+    item = app.state.tasks.get(task_id)
+    if not item:
+        raise HTTPException(404, "task not found")
+    if "agent_id" in payload or "team_id" in payload:
+        actor = _permission_context(
+            payload.get("agent_id") or item.get("agent_id"),
+            payload.get("team_id") if "team_id" in payload else item.get("team_id"),
+        )
+        item["agent_id"] = actor["agent_id"]
+        item["team_id"] = actor["team_id"]
+    else:
+        actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
+    if "title" in payload:
+        item["title"] = _safe_text(payload.get("title"), limit=160)
+    if "summary" in payload:
+        item["summary"] = _safe_text(payload.get("summary"), limit=1200)
+    if "status" in payload:
+        item["status"] = _sanitize_task_status(payload.get("status"))
+        item["completed_at"] = now() if item["status"] in {"done", "cancelled"} else None
+    if "priority" in payload:
+        item["priority"] = _sanitize_priority(payload.get("priority"))
+    if "risk" in payload:
+        item["risk"] = _sanitize_risk(payload.get("risk"))
+    if "required_tool_ids" in payload or "required_memory_scopes" in payload:
+        required_tool_ids, required_memory_scopes = _validate_job_requirements(
+            actor,
+            payload.get("required_tool_ids", item.get("required_tool_ids")),
+            payload.get("required_memory_scopes", item.get("required_memory_scopes")),
+        )
+        item["required_tool_ids"] = required_tool_ids
+        item["required_memory_scopes"] = required_memory_scopes
+    item["updated_at"] = now()
+    _save_registry_item("task", item)
+    _record_activity(
+        item.get("agent_id"),
+        event_type="task.updated",
+        status=item.get("status") or "queued",
+        source="AgentGate",
+        summary=f"Delegated task updated: {item.get('title') or task_id}",
+        team_id=item.get("team_id"),
+        ref_type="task",
+        ref_id=task_id,
+    )
+    return _public_task(item)
+
+
+@app.post("/api/tasks/{task_id}/session")
+def create_task_session(task_id: str):
+    item = app.state.tasks.get(task_id)
+    if not item:
+        raise HTTPException(404, "task not found")
+    actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
+    session_id = f"sess_{uuid.uuid4().hex[:12]}"
+    session = {
+        "id": session_id,
+        "session_id": session_id,
+        "title": f"Task: {item.get('title') or task_id}",
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    app.state.sessions[session_id] = session
+    app.state.messages[session_id] = []
+    item["session_id"] = session_id
+    item["status"] = "in_progress"
+    item["updated_at"] = now()
+    _save_registry_item("task", item)
+    _record_activity(
+        actor["agent_id"],
+        event_type="task.session_created",
+        status="in_progress",
+        source="AgentGate",
+        summary=f"Delegated task session opened: {item.get('title') or task_id}",
+        team_id=actor["team_id"],
+        ref_type="task",
+        ref_id=task_id,
+    )
+    return {"task": _public_task(item), "session": session}
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str):
+    if task_id not in app.state.tasks:
+        raise HTTPException(404, "task not found")
+    app.state.tasks.pop(task_id, None)
+    _delete_registry_item("task", task_id)
+    return {"deleted": True}
 
 
 @app.get("/v1/capabilities")

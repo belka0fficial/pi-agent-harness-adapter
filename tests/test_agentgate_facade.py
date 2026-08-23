@@ -959,6 +959,90 @@ def test_workroom_session_creation_validates_team_membership(monkeypatch, tmp_pa
     assert "workroom.session_created" in [item["event_type"] for item in activity]
 
 
+def test_delegated_task_queue_uses_safe_metadata_and_registry_grants(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        created = client.post(
+            "/api/tasks",
+            json={
+                "title": "Review workroom surface",
+                "summary": "Check the team room UI for safe metadata only.",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "priority": "high",
+                "risk": "medium",
+                "source_session_id": "sess-secret",
+                "source_message_id": "msg-secret",
+            },
+        )
+        task_id = created.json()["id"]
+        listed = client.get("/api/tasks?team_id=team_core").json()["tasks"]
+        workroom = client.get("/api/workrooms/team_core").json()
+        updated = client.patch(
+            f"/api/tasks/{task_id}",
+            json={"status": "done"},
+        )
+        activity = client.get("/api/activity?team_id=team_core").json()["activity"]
+
+    assert created.status_code == 200
+    assert created.json()["status"] == "queued"
+    assert created.json()["priority"] == "high"
+    assert created.json()["risk"] == "medium"
+    assert listed[0]["id"] == task_id
+    assert workroom["tasks"][0]["id"] == task_id
+    assert workroom["readiness"]["task_count"] == 1
+    assert updated.json()["status"] == "done"
+    assert updated.json()["completed_at"]
+    assert "task.created" in [item["event_type"] for item in activity]
+    assert "task.updated" in [item["event_type"] for item in activity]
+    assert "password" not in str(workroom).lower()
+    assert "api_key" not in str(workroom).lower()
+    assert "token" not in str(workroom).lower()
+
+
+def test_delegated_task_session_creation_and_membership_validation(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        task = client.post(
+            "/api/tasks",
+            json={
+                "title": "Open task room",
+                "summary": "Create a session but do not run Pi.",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+            },
+        ).json()
+        opened = client.post(f"/api/tasks/{task['id']}/session")
+        outsider = client.post(
+            "/api/agents",
+            json={"name": "Task Outsider", "purpose": "No core team access."},
+        ).json()
+        rejected = client.post(
+            "/api/tasks",
+            json={
+                "title": "Invalid delegated task",
+                "summary": "Should fail because the agent is not in the team.",
+                "agent_id": outsider["id"],
+                "team_id": "team_core",
+            },
+        )
+
+    assert opened.status_code == 200
+    assert opened.json()["task"]["status"] == "in_progress"
+    assert opened.json()["task"]["session_id"].startswith("sess_")
+    assert opened.json()["session"]["team_id"] == "team_core"
+    assert app.state.messages[opened.json()["session"]["id"]] == []
+    assert rejected.status_code == 403
+
+
 def test_chat_defaults_to_no_memory_side_effects():
     reset_state()
     pi = CapturingPi()
