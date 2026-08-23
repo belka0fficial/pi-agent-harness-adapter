@@ -1564,13 +1564,54 @@ def test_tool_draft_artifacts_are_metadata_only(monkeypatch, tmp_path):
     assert created["review_state"] == "needs_owner_review"
     assert listed[0]["id"] == created["id"]
     assert reviewed["status"] == "needs_toolgate_review"
-    assert reviewed["review_state"] == "ready_for_toolgate_review"
+    assert reviewed["review_state"] == "toolgate_pending"
+    assert reviewed["toolgate_status"] == "pending"
+    assert reviewed["toolgate_request_id"]
     assert deleted.status_code == 200
     payload = str({**created, **reviewed}).lower()
     assert "token=abc123" not in payload
     assert "raw command" not in payload
     assert "code" not in payload
     assert "args" not in payload
+
+
+def test_tool_draft_review_creates_toolgate_request(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/tool-drafts",
+            json={
+                "title": "Create a reviewed helper",
+                "purpose": "Summarize local files. Never include token=abc123 or https://private.example/path.",
+                "proposed_tool_id": "Reviewed Helper",
+                "risk": "high",
+                "source_session_id": "sess-1",
+                "source_message_id": "u1",
+            },
+        ).json()
+        review = client.post(f"/api/tool-drafts/{created['id']}/toolgate-review").json()
+        listed = client.get("/api/tool-drafts").json()["drafts"]
+        app.state.gates.decide_approval(review["toolgate_request_id"], "approved")
+        refreshed = client.get("/api/tool-drafts").json()["drafts"]
+
+    request = app.state.gates.requests[review["toolgate_request_id"]]
+    assert review["status"] == "needs_toolgate_review"
+    assert review["review_state"] == "toolgate_pending"
+    assert review["toolgate_status"] == "pending"
+    assert request["kind"] == "tool_draft_review"
+    assert request["severity"] == "critical"
+    assert request["payload"]["subject_type"] == "tool_draft"
+    assert request["payload"]["subject_id"] == created["id"]
+    assert request["payload"]["metadata_only"] is True
+    assert "purpose_digest" in request["payload"]
+    assert "token=abc123" not in str(request)
+    assert "https://private.example" not in str(request)
+    assert listed[0]["toolgate_request_id"] == review["toolgate_request_id"]
+    assert refreshed[0]["toolgate_status"] == "approved"
+    assert refreshed[0]["review_state"] == "toolgate_approved"
 
 
 def test_chat_defaults_to_no_memory_side_effects():
