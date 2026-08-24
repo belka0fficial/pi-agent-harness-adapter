@@ -2092,6 +2092,8 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         insight["controls"] = _workstream_approval_controls(detail)
     if ref_type == "task":
         insight["controls"] = _workstream_task_controls(detail)
+    if ref_type == "memory_candidate":
+        insight["controls"] = _workstream_memory_candidate_controls(detail)
     return insight
 
 
@@ -2287,6 +2289,68 @@ def _workstream_approval_controls(detail: dict[str, Any]) -> dict[str, Any]:
                 "Open Approvals to reject this ToolGate request."
                 if pending
                 else "This ToolGate request already has an owner decision."
+            ),
+        ),
+    }
+
+
+def _workstream_memory_candidate_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    status = str(detail.get("status") or "pending")
+    pending = available and status == "pending"
+    rejected = available and status == "rejected"
+    approved = available and status == "approved"
+    supported = pending or rejected or approved
+
+    if not available:
+        return {
+            "schema": "agentgate.memory_candidate_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "approve_memory": _workstream_control(False, "audit_only", "Memory candidate exists only in audit history."),
+            "reject_memory": _workstream_control(False, "audit_only", "Memory candidate exists only in audit history."),
+            "delete_candidate": _workstream_control(False, "audit_only", "Memory candidate exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.memory_candidate_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "approve_memory": _workstream_control(
+            pending,
+            "pending_owner_review" if pending else "already_approved" if approved else "already_rejected" if rejected else "unsupported_state",
+            (
+                "Open Memory review to write this candidate through MemoryGate."
+                if pending
+                else "This candidate is already stored in MemoryGate."
+                if approved
+                else "This candidate is in an unsupported review state."
+                if not supported
+                else "This candidate was rejected and cannot be approved."
+            ),
+        ),
+        "reject_memory": _workstream_control(
+            pending,
+            "pending_owner_review" if pending else "already_approved" if approved else "already_rejected" if rejected else "unsupported_state",
+            (
+                "Open Memory review to reject this candidate without writing memory."
+                if pending
+                else "This candidate is already stored in MemoryGate."
+                if approved
+                else "This candidate is in an unsupported review state."
+                if not supported
+                else "This candidate was already rejected."
+            ),
+        ),
+        "delete_candidate": _workstream_control(
+            pending or rejected,
+            "pending_or_rejected_record" if pending or rejected else "approved_audit_history" if approved else "unsupported_state",
+            (
+                "Open Memory review to delete this non-approved candidate record."
+                if pending or rejected
+                else "Approved memory candidates remain audit history."
+                if approved
+                else "This candidate is in an unsupported review state."
             ),
         ),
     }

@@ -3323,6 +3323,16 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert memory_body["detail"]["memory_type"] == "preference"
     assert memory_body["detail"]["confidence"] == "high"
     assert memory_body["insight"]["safety"]["memory_written"] is False
+    memory_controls = memory_body["insight"]["controls"]
+    assert memory_controls["schema"] == "agentgate.memory_candidate_controls.v1"
+    assert memory_controls["metadata_only"] is True
+    assert memory_controls["executes_from_drilldown"] is False
+    assert memory_controls["approve_memory"]["enabled"] is True
+    assert memory_controls["approve_memory"]["reason_code"] == "pending_owner_review"
+    assert memory_controls["reject_memory"]["enabled"] is True
+    assert memory_controls["reject_memory"]["reason_code"] == "pending_owner_review"
+    assert memory_controls["delete_candidate"]["enabled"] is True
+    assert memory_controls["delete_candidate"]["reason_code"] == "pending_or_rejected_record"
     assert "Open Memory review" in memory_body["insight"]["owner_next_step"]
     assert "text" not in memory_body["detail"]
     assert memory_body["safety"]["mode"] == "metadata_only"
@@ -3345,6 +3355,86 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert "orchestration_readiness" in team_body["detail"]
     assert "Open the Team workroom" in team_body["insight"]["owner_next_step"]
     assert team_body["safety"]["mode"] == "metadata_only"
+
+
+def test_workstream_memory_candidate_controls_are_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        pending = client.post(
+            "/api/memory/candidates",
+            json={
+                "text": "private memory token=memory-secret https://memory.example/path raw transcript",
+                "session_id": "sess-1",
+                "source_message_id": "a1",
+                "candidate_id": "memcand_control_pending",
+                "memory_type": "preference",
+                "confidence": "high",
+            },
+        )
+        assert pending.status_code == 200
+        pending_detail = client.get("/api/workstream/refs/memory_candidate/memcand_control_pending")
+        approved = client.post(
+            "/api/memory/candidates",
+            json={
+                "text": "approved private memory token=approved-secret https://approved.example/path",
+                "session_id": "sess-1",
+                "source_message_id": "a1",
+                "candidate_id": "memcand_control_approved",
+                "approved": True,
+            },
+        )
+        assert approved.status_code == 200
+        approved_detail = client.get("/api/workstream/refs/memory_candidate/memcand_control_approved")
+        rejected = client.post(
+            "/api/memory/candidates",
+            json={
+                "text": "rejected private memory token=rejected-secret https://rejected.example/path",
+                "session_id": "sess-1",
+                "source_message_id": "a1",
+                "candidate_id": "memcand_control_rejected",
+            },
+        )
+        assert rejected.status_code == 200
+        client.post("/api/memory/candidates/memcand_control_rejected/reject")
+        rejected_detail = client.get("/api/workstream/refs/memory_candidate/memcand_control_rejected")
+
+    assert pending_detail.status_code == 200
+    body = pending_detail.json()
+    controls = body["insight"]["controls"]
+    assert controls["schema"] == "agentgate.memory_candidate_controls.v1"
+    assert controls["metadata_only"] is True
+    assert controls["executes_from_drilldown"] is False
+    assert controls["approve_memory"]["enabled"] is True
+    assert controls["approve_memory"]["reason_code"] == "pending_owner_review"
+    assert controls["reject_memory"]["enabled"] is True
+    assert controls["reject_memory"]["reason_code"] == "pending_owner_review"
+    assert controls["delete_candidate"]["enabled"] is True
+    assert controls["delete_candidate"]["reason_code"] == "pending_or_rejected_record"
+    joined = json.dumps(body).lower()
+    for forbidden in [
+        "memory-secret",
+        "https://memory.example",
+        "raw transcript",
+        "private memory",
+        "/api/memory",
+        "/v2/",
+    ]:
+        assert forbidden not in joined
+    approved_controls = approved_detail.json()["insight"]["controls"]
+    assert approved_controls["approve_memory"]["enabled"] is False
+    assert approved_controls["approve_memory"]["reason_code"] == "already_approved"
+    assert approved_controls["reject_memory"]["enabled"] is False
+    assert approved_controls["delete_candidate"]["enabled"] is False
+    assert approved_controls["delete_candidate"]["reason_code"] == "approved_audit_history"
+    rejected_controls = rejected_detail.json()["insight"]["controls"]
+    assert rejected_controls["approve_memory"]["enabled"] is False
+    assert rejected_controls["approve_memory"]["reason_code"] == "already_rejected"
+    assert rejected_controls["reject_memory"]["enabled"] is False
+    assert rejected_controls["delete_candidate"]["enabled"] is True
+    assert rejected_controls["delete_candidate"]["reason_code"] == "pending_or_rejected_record"
 
 
 def test_workstream_job_controls_hide_raw_active_run_id(monkeypatch, tmp_path):
