@@ -339,6 +339,7 @@ def reset_state():
     app.state.character_sources = {}
     app.state.active_job_runs = {}
     app.state.approval_runs = {}
+    app.state.owner_sessions = {}
 
 
 def test_agentgate_facade_exposes_real_sessions_messages_and_jobs():
@@ -551,16 +552,116 @@ def test_owner_auth_session_validates_bearer_without_echoing_secret(monkeypatch)
         "status": "ok",
         "owner_authenticated": True,
         "auth_mode": "owner_bearer",
-        "token_storage": "browser_session",
+        "token_storage": "legacy_bearer",
         "metadata_only": True,
         "credentials_included": False,
         "token_included": False,
         "token_length_included": False,
+        "owner_token_included": False,
+        "csrf_required": False,
+        "csrf_token": None,
+        "session_expires_at": None,
     }
     assert rejected.status_code == 401
     combined = f"{accepted.text} {rejected.text}"
     assert owner_secret not in combined
     assert "wrong-token" not in combined
+
+
+def test_owner_auth_login_sets_http_only_session_cookie_without_echoing_secret(monkeypatch):
+    reset_state()
+    owner_secret = "login-owner-token-" + "e" * 32
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+
+    with TestClient(app) as client:
+        rejected = client.post("/api/auth/login", json={"owner_token": "wrong-token"})
+        accepted = client.post("/api/auth/login", json={"owner_token": owner_secret})
+        session = client.get("/api/auth/session")
+
+    assert rejected.status_code == 401
+    assert rejected.json() == {"detail": "owner authentication required"}
+    assert accepted.status_code == 200
+    assert session.status_code == 200
+    accepted_body = accepted.json()
+    session_body = session.json()
+    assert accepted_body["auth_mode"] == "owner_session"
+    assert accepted_body["token_storage"] == "http_only_cookie"
+    assert accepted_body["csrf_required"] is True
+    assert isinstance(accepted_body["csrf_token"], str)
+    assert len(accepted_body["csrf_token"]) >= 32
+    assert session_body["csrf_token"] == accepted_body["csrf_token"]
+    set_cookie = accepted.headers.get("set-cookie", "").lower()
+    assert "agentgate_owner_session=" in set_cookie
+    assert "httponly" in set_cookie
+    assert "samesite=lax" in set_cookie
+    combined = f"{rejected.text} {accepted.text} {session.text} {set_cookie}"
+    assert owner_secret not in combined
+    assert "wrong-token" not in combined
+
+
+def test_owner_session_requires_csrf_for_mutating_requests_but_allows_reads(monkeypatch):
+    reset_state()
+    owner_secret = "csrf-owner-token-" + "f" * 32
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+
+    with TestClient(app) as client:
+        login = client.post("/api/auth/login", json={"owner_token": owner_secret})
+        csrf_token = login.json()["csrf_token"]
+        read = client.get("/api/home")
+        blocked = client.post("/api/sessions", json={"title": "blocked"})
+        wrong = client.post("/api/sessions", json={"title": "wrong"}, headers={"X-AgentGate-CSRF": "wrong"})
+        accepted = client.post("/api/sessions", json={"title": "accepted"}, headers={"X-AgentGate-CSRF": csrf_token})
+
+    assert read.status_code == 200
+    assert blocked.status_code == 403
+    assert blocked.json() == {"detail": "owner csrf token required"}
+    assert wrong.status_code == 403
+    assert accepted.status_code == 200
+    assert accepted.json()["title"] == "accepted"
+    combined = f"{login.text} {read.text} {blocked.text} {wrong.text} {accepted.text}"
+    assert owner_secret not in combined
+
+
+def test_legacy_bearer_still_allows_mutating_requests_without_csrf(monkeypatch):
+    reset_state()
+    owner_secret = "legacy-owner-token-" + "g" * 32
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/api/sessions",
+            json={"title": "legacy cli"},
+            headers={"Authorization": f"Bearer {owner_secret}"},
+        )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["title"] == "legacy cli"
+    assert owner_secret not in accepted.text
+
+
+def test_owner_logout_removes_session_cookie_and_server_session(monkeypatch):
+    reset_state()
+    owner_secret = "logout-owner-token-" + "h" * 32
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+
+    with TestClient(app) as client:
+        login = client.post("/api/auth/login", json={"owner_token": owner_secret})
+        csrf_token = login.json()["csrf_token"]
+        assert len(app.state.owner_sessions) == 1
+        logout = client.post("/api/auth/logout", headers={"X-AgentGate-CSRF": csrf_token})
+        after = client.get("/api/auth/session")
+
+    assert logout.status_code == 200
+    assert logout.json()["owner_authenticated"] is False
+    assert len(app.state.owner_sessions) == 0
+    assert "agentgate_owner_session=" in logout.headers.get("set-cookie", "").lower()
+    assert after.status_code == 401
+    combined = f"{login.text} {logout.text} {after.text}"
+    assert owner_secret not in combined
 
 
 def test_agent_registry_persists_to_sqlite(monkeypatch, tmp_path):

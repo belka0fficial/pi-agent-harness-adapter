@@ -7,11 +7,12 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sqlite3
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -117,6 +118,10 @@ class ToolEchoDrillInput(BaseModel):
     team_id: str | None = None
     value: str = Field(default="agentgate-safe-drill", max_length=120)
     approval_request_id: str | None = None
+
+
+class OwnerLoginInput(BaseModel):
+    owner_token: str = Field(min_length=1)
 
 
 class ToolDraftInput(BaseModel):
@@ -393,6 +398,7 @@ app.state.character_sources = {}
 app.state.active_runs = {}
 app.state.active_job_runs = {}
 app.state.approval_runs = {}
+app.state.owner_sessions = {}
 app.state.agents = {}
 app.state.teams = {}
 app.state.scheduler = AsyncIOScheduler()
@@ -428,9 +434,91 @@ def _extract_owner_token(request: Request) -> str:
     return request.headers.get("x-agentgate-owner-token", "").strip()
 
 
+OWNER_SESSION_COOKIE = "agentgate_owner_session"
+OWNER_CSRF_HEADER = "x-agentgate-csrf"
+OWNER_SESSION_TTL = timedelta(hours=8)
+OWNER_AUTH_PUBLIC_PATHS = {"/health", "/health/detailed", "/api/auth/login"}
+OWNER_AUTH_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _owner_sessions() -> dict[str, dict[str, Any]]:
+    if not hasattr(app.state, "owner_sessions") or not isinstance(app.state.owner_sessions, dict):
+        app.state.owner_sessions = {}
+    return app.state.owner_sessions
+
+
+def _prune_owner_sessions() -> None:
+    current = datetime.now(UTC)
+    sessions = _owner_sessions()
+    expired = [
+        session_id
+        for session_id, record in sessions.items()
+        if record.get("expires_at") and record["expires_at"] <= current
+    ]
+    for session_id in expired:
+        sessions.pop(session_id, None)
+
+
+def _create_owner_session() -> tuple[str, dict[str, Any]]:
+    _prune_owner_sessions()
+    session_id = secrets.token_urlsafe(32)
+    record = {
+        "csrf_token": secrets.token_urlsafe(32),
+        "created_at": datetime.now(UTC),
+        "expires_at": datetime.now(UTC) + OWNER_SESSION_TTL,
+    }
+    _owner_sessions()[session_id] = record
+    return session_id, record
+
+
+def _active_owner_session(request: Request) -> tuple[str | None, dict[str, Any] | None]:
+    _prune_owner_sessions()
+    session_id = request.cookies.get(OWNER_SESSION_COOKIE)
+    if not session_id:
+        return None, None
+    record = _owner_sessions().get(session_id)
+    if not record:
+        return None, None
+    return session_id, record
+
+
+def _safe_owner_session_metadata(*, auth_mode: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
+    metadata = {
+        "status": "ok",
+        "owner_authenticated": True,
+        "auth_mode": auth_mode,
+        "token_storage": "http_only_cookie" if auth_mode == "owner_session" else "legacy_bearer",
+        "metadata_only": True,
+        "credentials_included": False,
+        "token_included": False,
+        "token_length_included": False,
+        "owner_token_included": False,
+        "csrf_required": auth_mode == "owner_session",
+        "csrf_token": None,
+        "session_expires_at": None,
+    }
+    if auth_mode == "owner_session" and record:
+        metadata["csrf_token"] = record.get("csrf_token")
+        expires_at = record.get("expires_at")
+        if isinstance(expires_at, datetime):
+            metadata["session_expires_at"] = expires_at.isoformat()
+    return metadata
+
+
+def _owner_cookie_kwargs(request: Request) -> dict[str, Any]:
+    return {
+        "key": OWNER_SESSION_COOKIE,
+        "httponly": True,
+        "samesite": "lax",
+        "secure": request.url.scheme == "https",
+        "path": "/",
+        "max_age": int(OWNER_SESSION_TTL.total_seconds()),
+    }
+
+
 @app.middleware("http")
 async def require_owner_token(request: Request, call_next):
-    if request.method == "OPTIONS" or request.url.path in {"/health", "/health/detailed"}:
+    if request.method == "OPTIONS" or request.url.path in OWNER_AUTH_PUBLIC_PATHS:
         return await call_next(request)
     expected = _owner_token()
     if not _testing_auth_bypass_enabled() and not expected:
@@ -443,8 +531,25 @@ async def require_owner_token(request: Request, call_next):
         )
     if expected and not _testing_auth_bypass_enabled():
         provided = _extract_owner_token(request)
-        if not provided or not hmac.compare_digest(provided, expected):
+        if provided and hmac.compare_digest(provided, expected):
+            request.state.owner_auth_mode = "owner_bearer"
+            request.state.owner_session = None
+            return await call_next(request)
+        session_id, session = _active_owner_session(request)
+        if session:
+            request.state.owner_auth_mode = "owner_session"
+            request.state.owner_session = session
+            request.state.owner_session_id = session_id
+            if request.method in OWNER_AUTH_MUTATING_METHODS:
+                provided_csrf = request.headers.get(OWNER_CSRF_HEADER, "")
+                expected_csrf = str(session.get("csrf_token") or "")
+                if not provided_csrf or not hmac.compare_digest(provided_csrf, expected_csrf):
+                    return JSONResponse({"detail": "owner csrf token required"}, status_code=403)
+            return await call_next(request)
+        else:
             return JSONResponse({"detail": "owner authentication required"}, status_code=401)
+    request.state.owner_auth_mode = "testing_bypass"
+    request.state.owner_session = None
     return await call_next(request)
 
 
@@ -4847,17 +4952,51 @@ def detailed_health():
 
 
 @app.get("/api/auth/session")
-def owner_auth_session():
-    return {
-        "status": "ok",
-        "owner_authenticated": True,
-        "auth_mode": "owner_bearer",
-        "token_storage": "browser_session",
-        "metadata_only": True,
-        "credentials_included": False,
-        "token_included": False,
-        "token_length_included": False,
-    }
+def owner_auth_session(request: Request):
+    auth_mode = getattr(request.state, "owner_auth_mode", "owner_bearer")
+    record = getattr(request.state, "owner_session", None)
+    if auth_mode == "owner_session" and record:
+        return _safe_owner_session_metadata(auth_mode="owner_session", record=record)
+    return _safe_owner_session_metadata(auth_mode="owner_bearer")
+
+
+@app.post("/api/auth/login")
+def owner_auth_login(payload: OwnerLoginInput, request: Request):
+    expected = _owner_token()
+    if not _testing_auth_bypass_enabled() and not expected:
+        return JSONResponse(
+            {
+                "detail": "owner authentication is not configured",
+                "status": "unavailable",
+            },
+            status_code=503,
+        )
+    if expected and not hmac.compare_digest(payload.owner_token, expected):
+        return JSONResponse({"detail": "owner authentication required"}, status_code=401)
+
+    session_id, record = _create_owner_session()
+    response = JSONResponse(_safe_owner_session_metadata(auth_mode="owner_session", record=record))
+    response.set_cookie(value=session_id, **_owner_cookie_kwargs(request))
+    return response
+
+
+@app.post("/api/auth/logout")
+def owner_auth_logout(request: Request):
+    session_id = getattr(request.state, "owner_session_id", None)
+    if session_id:
+        _owner_sessions().pop(session_id, None)
+    response = JSONResponse(
+        {
+            "status": "ok",
+            "owner_authenticated": False,
+            "metadata_only": True,
+            "credentials_included": False,
+            "token_included": False,
+            "csrf_token": None,
+        }
+    )
+    response.delete_cookie(OWNER_SESSION_COOKIE, path="/")
+    return response
 
 
 @app.post("/api/sessions")
