@@ -61,6 +61,14 @@ class JobInput(BaseModel):
     failure_policy: dict[str, Any] = Field(default_factory=dict)
 
 
+class NotificationChannelInput(BaseModel):
+    label: str = Field(min_length=1, max_length=64)
+    kind: str = "manual"
+    status: str = "needs_setup"
+    description: str = Field(default="", max_length=240)
+    requires_owner_confirmation: bool = True
+
+
 class MemoryCandidateInput(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     session_id: str | None = None
@@ -234,6 +242,7 @@ app.state.jobs = {}
 app.state.tasks = {}
 app.state.tool_drafts = {}
 app.state.model_route_proposals = {}
+app.state.notification_channels = {}
 app.state.active_runs = {}
 app.state.active_job_runs = {}
 app.state.approval_runs = {}
@@ -336,6 +345,7 @@ def _load_registry() -> None:
     app.state.tasks = {}
     app.state.tool_drafts = {}
     app.state.model_route_proposals = {}
+    app.state.notification_channels = {}
     app.state.memory_candidates = {}
     for row in rows:
         try:
@@ -354,6 +364,8 @@ def _load_registry() -> None:
             app.state.tool_drafts[row["id"]] = item
         elif row["kind"] == "model_route_proposal":
             app.state.model_route_proposals[row["id"]] = item
+        elif row["kind"] == "notification_channel":
+            app.state.notification_channels[row["id"]] = item
         elif row["kind"] == "memory_candidate":
             app.state.memory_candidates[row["id"]] = item
     _normalize_agent_model_defaults()
@@ -380,7 +392,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "model_route_proposal", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "model_route_proposal", "notification_channel", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -396,7 +408,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "notification_channel", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -1445,6 +1457,7 @@ def _ensure_registry_seeded() -> None:
             "updated_at": now(),
         }
         _save_registry_item("team", app.state.teams["team_core"])
+    _ensure_notification_channels_seeded()
 
 
 def _permission_context(agent_id: str | None, team_id: str | None = None) -> dict[str, Any]:
@@ -2402,6 +2415,78 @@ def _sanitize_delivery_policy(value: Any) -> str:
     return policy
 
 
+def _sanitize_notification_label(value: Any, *, field: str = "label") -> str:
+    label = " ".join(str(value or "").strip().split())
+    if not label:
+        raise HTTPException(422, f"{field} is required")
+    lowered = label.lower()
+    if len(label) > 64:
+        raise HTTPException(422, f"{field} must be 64 characters or fewer")
+    if (
+        "://" in lowered
+        or "@" in label
+        or re.search(r"\b(token|secret|password|api[_-]?key|bearer|webhook|url|endpoint)\b", lowered)
+        or re.fullmatch(r"[\d\s()+./-]{7,}", label)
+    ):
+        raise HTTPException(422, f"{field} must be a safe label, not a URL, email, phone number, token, or secret")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _./:-]{0,63}", label):
+        raise HTTPException(422, f"{field} may contain letters, numbers, spaces, dots, slashes, colons, underscores, and hyphens")
+    return label
+
+
+def _sanitize_notification_kind(value: Any) -> str:
+    kind = str(value or "manual").strip().lower().replace("-", "_")
+    if kind not in {"desktop", "mobile", "local_log", "manual"}:
+        raise HTTPException(422, "notification channel kind must be desktop, mobile, local_log, or manual")
+    return kind
+
+
+def _sanitize_notification_status(value: Any) -> str:
+    status = str(value or "needs_setup").strip().lower().replace("-", "_")
+    if status not in {"available", "needs_setup", "disabled"}:
+        raise HTTPException(422, "notification channel status must be available, needs_setup, or disabled")
+    return status
+
+
+def _public_notification_channel(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "label": item.get("label"),
+        "kind": item.get("kind", "manual"),
+        "status": item.get("status", "needs_setup"),
+        "description": _safe_summary(item.get("description") or "", limit=240),
+        "requires_owner_confirmation": bool(item.get("requires_owner_confirmation", True)),
+        "metadata_only": True,
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _ensure_notification_channels_seeded() -> None:
+    if getattr(app.state, "notification_channels", None) is None:
+        app.state.notification_channels = {}
+    if app.state.notification_channels:
+        return
+    created_at = now()
+    for label, kind, status, description in [
+        ("local dashboard inbox", "local_log", "available", "AgentGate dashboard-only notification placeholder."),
+        ("desktop-main", "desktop", "needs_setup", "Owner-defined desktop channel label; no sender configured."),
+        ("phone-personal", "mobile", "needs_setup", "Owner-defined mobile channel label; no phone number stored."),
+    ]:
+        item = {
+            "id": f"notify_{_slug(label)}",
+            "label": label,
+            "kind": kind,
+            "status": status,
+            "description": description,
+            "requires_owner_confirmation": True,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        app.state.notification_channels[item["id"]] = item
+        _save_registry_item("notification_channel", item)
+
+
 def _sanitize_delivery_targets(values: Any) -> list[str]:
     if values is None:
         return []
@@ -2412,13 +2497,7 @@ def _sanitize_delivery_targets(values: Any) -> list[str]:
         label = " ".join(str(value or "").strip().split())
         if not label:
             continue
-        lowered = label.lower()
-        if len(label) > 64:
-            raise HTTPException(422, "delivery target labels must be 64 characters or fewer")
-        if "://" in lowered or "@" in label or re.search(r"\b(token|secret|password|api[_-]?key|bearer)\b", lowered):
-            raise HTTPException(422, "delivery_targets must use labels only, not URLs, emails, phone numbers, tokens, or secrets")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _./:-]{0,63}", label):
-            raise HTTPException(422, "delivery target labels may contain letters, numbers, spaces, dots, slashes, colons, underscores, and hyphens")
+        _sanitize_notification_label(label, field="delivery target")
         if label not in result:
             result.append(label)
     return result[:12]
@@ -5000,7 +5079,58 @@ def agentgate_chat_messages(session_id: str):
 
 @app.get("/api/automations")
 def agentgate_automations():
+    _ensure_registry_seeded()
     return {"automations": [_public_job(item) for item in app.state.jobs.values()]}
+
+
+@app.get("/api/notification-channels")
+def list_notification_channels():
+    _ensure_registry_seeded()
+    rows = [_public_notification_channel(item) for item in app.state.notification_channels.values()]
+    rows.sort(key=lambda row: (row.get("kind") or "", row.get("label") or ""))
+    return {
+        "channels": rows,
+        "summary": {
+            "total": len(rows),
+            "available": sum(1 for row in rows if row.get("status") == "available"),
+            "needs_setup": sum(1 for row in rows if row.get("status") == "needs_setup"),
+            "disabled": sum(1 for row in rows if row.get("status") == "disabled"),
+            "metadata_only": True,
+        },
+    }
+
+
+@app.post("/api/notification-channels")
+def create_notification_channel(payload: NotificationChannelInput):
+    _ensure_registry_seeded()
+    label = _sanitize_notification_label(payload.label)
+    kind = _sanitize_notification_kind(payload.kind)
+    status = _sanitize_notification_status(payload.status)
+    if any(str(item.get("label") or "").lower() == label.lower() for item in app.state.notification_channels.values()):
+        raise HTTPException(409, "notification channel label already exists")
+    created_at = now()
+    item = {
+        "id": f"notify_{_slug(label)}",
+        "label": label,
+        "kind": kind,
+        "status": status,
+        "description": _safe_summary(payload.description, limit=240),
+        "requires_owner_confirmation": bool(payload.requires_owner_confirmation),
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    app.state.notification_channels[item["id"]] = item
+    _save_registry_item("notification_channel", item)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="notification.channel.created",
+        status="metadata_only",
+        source="AgentGate",
+        summary=f"Notification channel label created: {label}",
+        ref_type="notification_channel",
+        ref_id=item["id"],
+    )
+    return _public_notification_channel(item)
 
 
 @app.get("/api/home")

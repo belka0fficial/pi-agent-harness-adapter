@@ -82,12 +82,16 @@ Current adapter behavior:
 - `GET /api/jobs`
   - AgentGate accepts either a list or `{ "jobs": [...] }`.
 - `POST /api/jobs`
-  - Request fields currently used by UI: `name`, `schedule`, `prompt`, `deliver`.
+  - Request fields currently used by UI: `name`, `schedule`, `timezone`, `prompt`, `agent_id`, `team_id`, `deliver`, `required_tool_ids`, `required_memory_scopes`, `approval_policy`, `delivery_policy`, `delivery_targets`, `failure_policy`.
 - `PATCH /api/jobs/{job_id}`
 - `DELETE /api/jobs/{job_id}`
 - `POST /api/jobs/{job_id}/pause`
 - `POST /api/jobs/{job_id}/resume`
 - `POST /api/jobs/{job_id}/run`
+- `GET /api/notification-channels`
+  - Returns metadata-only delivery labels for automation planning. Responses must not include URLs, phone numbers, webhook targets, credentials, or provider secrets.
+- `POST /api/notification-channels`
+  - Creates a metadata-only label with `label`, `kind`, `status`, `description`, and `requires_owner_confirmation`. Real external delivery remains out of scope until ToolGate owns a sender integration.
 
 Job fields rendered by AgentGate:
 
@@ -99,6 +103,12 @@ Job fields rendered by AgentGate:
 - `paused`
 - `next_run_at`
 - `last_run_at`
+- `approval_policy`, `approval_status`, `approval_reasons`, `approval_request_id`
+- `required_tool_ids`, `required_memory_scopes`
+- `delivery_policy`, `delivery_targets`, `delivery_target_count`
+- `failure_policy`, `failure_policy_status`
+
+Delivery target labels are public metadata. The adapter rejects URLs, emails, phone-number-like strings, webhook labels, and secret-like words before saving them.
 
 ## Pi Adapter Notes
 

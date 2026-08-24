@@ -278,6 +278,7 @@ def reset_state():
     app.state.agents = {}
     app.state.teams = {}
     app.state.tool_drafts = {}
+    app.state.notification_channels = {}
     app.state.memory_candidates = {}
     app.state.active_job_runs = {}
     app.state.approval_runs = {}
@@ -2631,6 +2632,16 @@ def test_automation_delivery_policy_stores_safe_metadata_only():
                 "delivery_targets": ["telegram token abc"],
             },
         )
+        unsafe_phone = client.post(
+            "/api/jobs",
+            json={
+                "name": "Bad Phone Delivery",
+                "schedule": "0 12 * * *",
+                "prompt": "do not store phone",
+                "delivery_policy": "owner_confirmation",
+                "delivery_targets": ["+1 555 010 1234"],
+            },
+        )
         listed = next(
             item for item in client.get("/api/automations").json()["automations"] if item["id"] == created["id"]
         )
@@ -2646,6 +2657,61 @@ def test_automation_delivery_policy_stores_safe_metadata_only():
     assert "private delivery prompt" not in str(listed)
     assert unsafe_url.status_code == 422
     assert unsafe_secret.status_code == 422
+    assert unsafe_phone.status_code == 422
+
+
+def test_notification_channels_are_metadata_only_and_reject_sensitive_targets(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    with TestClient(app) as client:
+        seeded = client.get("/api/notification-channels").json()
+        created = client.post(
+            "/api/notification-channels",
+            json={
+                "label": "workstation speakers",
+                "kind": "desktop",
+                "status": "needs_setup",
+                "description": "safe label only",
+                "requires_owner_confirmation": True,
+            },
+        ).json()
+        duplicate = client.post(
+            "/api/notification-channels",
+            json={"label": "workstation speakers", "kind": "desktop"},
+        )
+        unsafe_url = client.post(
+            "/api/notification-channels",
+            json={"label": "https://private.invalid/hook", "kind": "manual"},
+        )
+        unsafe_email = client.post(
+            "/api/notification-channels",
+            json={"label": "owner@example.invalid", "kind": "mobile"},
+        )
+        unsafe_phone = client.post(
+            "/api/notification-channels",
+            json={"label": "+1 555 010 9999", "kind": "mobile"},
+        )
+        unsafe_secret = client.post(
+            "/api/notification-channels",
+            json={"label": "telegram bearer token", "kind": "manual"},
+        )
+        listed = client.get("/api/notification-channels").json()
+
+    assert seeded["summary"]["metadata_only"] is True
+    assert {row["label"] for row in seeded["channels"]} >= {"local dashboard inbox", "desktop-main", "phone-personal"}
+    assert created["label"] == "workstation speakers"
+    assert created["metadata_only"] is True
+    assert "endpoint" not in created
+    assert "url" not in created
+    assert "token" not in str(created).lower()
+    assert any(row["label"] == "workstation speakers" for row in listed["channels"])
+    assert duplicate.status_code == 409
+    assert unsafe_url.status_code == 422
+    assert unsafe_email.status_code == 422
+    assert unsafe_phone.status_code == 422
+    assert unsafe_secret.status_code == 422
+    assert "https://private.invalid" not in str(listed)
 
 
 def test_automation_auto_policy_requires_toolgate_for_tools_memory_and_delivery(monkeypatch, tmp_path):
