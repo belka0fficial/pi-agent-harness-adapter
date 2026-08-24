@@ -8374,6 +8374,44 @@ def _verification_snapshot() -> dict[str, Any]:
         },
     ))
 
+    teams = list(app.state.teams.values())
+    multi_member_teams = [
+        team
+        for team in teams
+        if len(_clean_list(team.get("member_agent_ids") if isinstance(team, dict) else [])) >= 2
+    ]
+    reviewed_count = 0
+    toolgate_required_count = 0
+    invalid_orchestrator_count = 0
+    review_needed_count = 0
+    for team in multi_member_teams:
+        member_ids = _clean_list(team.get("member_agent_ids"))
+        orchestrator_id = str(team.get("orchestrator_agent_id") or "").strip()
+        policy = _safe_orchestrator_policy(team.get("orchestrator_policy"))
+        has_valid_orchestrator = bool(orchestrator_id and orchestrator_id in member_ids and orchestrator_id in app.state.agents)
+        is_reviewed = policy.get("review_status") == "owner_reviewed"
+        is_toolgate_required = policy.get("approval_mode") == "toolgate_required"
+        reviewed_count += 1 if is_reviewed else 0
+        toolgate_required_count += 1 if is_toolgate_required else 0
+        invalid_orchestrator_count += 0 if has_valid_orchestrator else 1
+        review_needed_count += 0 if (has_valid_orchestrator and is_reviewed and is_toolgate_required) else 1
+    checks.append(_verification_check(
+        "team-execution-policy-boundary",
+        "Team execution policy boundary",
+        "pass" if review_needed_count == 0 else "warn",
+        "Multi-member teams are ready for reviewed ToolGate-bound execution." if review_needed_count == 0 else "Some multi-member teams need owner-reviewed ToolGate-bound policy before group execution.",
+        source="AgentGate Teams",
+        severity="warning" if review_needed_count else "info",
+        detail={
+            "total_teams": len(teams),
+            "multi_member_teams": len(multi_member_teams),
+            "owner_reviewed": reviewed_count,
+            "toolgate_required": toolgate_required_count,
+            "invalid_orchestrator": invalid_orchestrator_count,
+            "review_needed": review_needed_count,
+        },
+    ))
+
     aux = _auxiliary_routes_payload(probe_routes=False)
     aux_safety = aux.get("safety", {})
     aux_safe = bool(aux_safety.get("metadata_only")) and not bool(aux_safety.get("execution_enabled")) and not bool(aux_safety.get("automatic_prompt_routing"))

@@ -1604,6 +1604,7 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
         "service-health",
         "listener-scope",
         "access-boundaries",
+        "team-execution-policy-boundary",
         "auxiliary-model-routes",
         "model-provider-metadata",
         "automation-approval-boundary",
@@ -1616,6 +1617,63 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
         re.I,
     )
     assert not forbidden.search(str(snapshot))
+
+
+def test_verification_snapshot_reports_team_execution_policy_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        agent = client.post(
+            "/api/agents",
+            json={
+                "name": "Snapshot Team Agent",
+                "purpose": "Participate in policy snapshot checks.",
+            },
+        ).json()
+        client.post(
+            "/api/teams",
+            json={
+                "name": "Snapshot Reviewed Team",
+                "purpose": "Reviewed group execution boundary.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", agent["id"]],
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                },
+            },
+        )
+        client.post(
+            "/api/teams",
+            json={
+                "name": "Snapshot Pending Team",
+                "purpose": "Private marker must not appear in verification details.",
+                "orchestrator_agent_id": agent["id"],
+                "member_agent_ids": ["agent_pi_operator", agent["id"]],
+                "orchestrator_policy": {
+                    "approval_mode": "metadata_only",
+                    "review_status": "unreviewed",
+                    "escalation_summary": "Private marker stays out of counts.",
+                },
+            },
+        )
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "team-execution-policy-boundary")
+    assert check["status"] == "warn"
+    assert check["severity"] == "warning"
+    assert check["detail"] == {
+        "total_teams": 3,
+        "multi_member_teams": 2,
+        "owner_reviewed": 1,
+        "toolgate_required": 1,
+        "invalid_orchestrator": 0,
+        "review_needed": 1,
+    }
+    assert "Private marker" not in str(check)
+    assert "Snapshot Pending Team" not in str(check)
 
 
 def test_system_access_boundary_repair_syncs_native_gate_contexts_without_keys(monkeypatch, tmp_path):
