@@ -1723,7 +1723,7 @@ def _object_workstream_events() -> list[dict[str, Any]]:
             status=item.get("mode") or ("group" if len(item.get("participant_agent_ids") or []) > 1 else "direct"),
             source="AgentGate",
             summary=(
-                f"Chat session: {item.get('title') or session_id} · "
+                f"Chat session metadata: {item.get('mode') or 'direct'} · "
                 f"{len(messages)} message{'s' if len(messages) != 1 else ''}"
             ),
             agent_id=item.get("agent_id"),
@@ -1870,18 +1870,31 @@ def _safe_session_detail(session_id: str) -> dict[str, Any]:
     item = app.state.sessions.get(session_id)
     if not item:
         raise HTTPException(404, "workstream reference not found")
-    public = _public_session(item)
+    title = str(item.get("title") or "")
+    messages = list(app.state.messages.get(session_id, []))
+    role_counts: dict[str, int] = {}
+    for message in messages:
+        role = _safe_summary(message.get("role") or "unknown", limit=40) or "unknown"
+        role_counts[role] = role_counts.get(role, 0) + 1
+    participants = _clean_list(item.get("participant_agent_ids") or [item.get("agent_id") or "agent_pi_operator"])
     return {
-        "id": public.get("id") or session_id,
-        "title": _redact_audit_text(public.get("title") or "Chat session", limit=160),
-        "mode": public.get("mode"),
-        "agent_id": public.get("agent_id"),
-        "team_id": public.get("team_id"),
-        "participant_count": len(public.get("participant_agent_ids") or []),
-        "message_count": len(app.state.messages.get(session_id, [])),
-        "current_speaker_id": public.get("current_speaker_id"),
-        "created_at": public.get("created_at"),
-        "updated_at": public.get("updated_at"),
+        "schema": "agentgate.session_ref_detail.v1",
+        "id": item.get("id") or session_id,
+        "mode": _safe_summary(item.get("mode") or ("group" if len(participants) > 1 else "direct"), limit=40),
+        "title_present": bool(title),
+        "title_digest": hashlib.sha256(title.encode("utf-8")).hexdigest() if title else "",
+        "title_chars": len(title),
+        "agent_ref_present": bool(item.get("agent_id")),
+        "team_ref_present": bool(item.get("team_id")),
+        "participant_count": len(participants),
+        "message_count": len(messages),
+        "message_role_counts": role_counts,
+        "current_speaker_present": bool(item.get("current_speaker_id") or item.get("agent_id")),
+        "active_run_present": bool(app.state.active_runs.get(session_id)),
+        "parent_session_present": bool(item.get("parent_session_id")),
+        "task_ref_present": bool(item.get("task_id")),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
     }
 
 
@@ -2092,6 +2105,8 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         insight["controls"] = _workstream_approval_controls(detail)
     if ref_type == "task":
         insight["controls"] = _workstream_task_controls(detail)
+    if ref_type == "session":
+        insight["controls"] = _workstream_session_controls(detail)
     if ref_type == "tool_draft":
         insight["controls"] = _workstream_tool_draft_controls(detail)
     if ref_type == "app_workspace":
@@ -2265,6 +2280,72 @@ def _workstream_task_controls(detail: dict[str, Any]) -> dict[str, Any]:
         "executes_from_drilldown": False,
         "checkpoint_review": checkpoint_review,
         "open_scoped_room": open_room,
+    }
+
+
+def _workstream_session_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    message_count = int(detail.get("message_count") or 0)
+    participant_count = int(detail.get("participant_count") or 0)
+    active_run = bool(detail.get("active_run_present"))
+    parent_session = bool(detail.get("parent_session_present"))
+
+    if not available:
+        return {
+            "schema": "agentgate.session_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "chat_continuity": _workstream_control(False, "audit_only", "Session exists only in audit history."),
+            "session_stop_boundary": _workstream_control(False, "audit_only", "Session exists only in audit history."),
+            "fork_boundary": _workstream_control(False, "audit_only", "Session exists only in audit history."),
+            "group_boundary": _workstream_control(False, "audit_only", "Session exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.session_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "chat_continuity": _workstream_control(
+            True,
+            "open_chat",
+            "Open Chat to inspect visible messages or continue the room.",
+        ),
+        "session_stop_boundary": _workstream_control(
+            active_run,
+            "active_run_present" if active_run else "no_active_run",
+            (
+                "Open Chat to stop the currently tracked active run."
+                if active_run
+                else "No active run is tracked for this session."
+            ),
+        ),
+        "fork_boundary": _workstream_control(
+            message_count > 0,
+            "messages_present" if message_count > 0 else "empty_room",
+            (
+                "Open Chat to fork from visible conversation history."
+                if message_count > 0
+                else "This session has no visible messages to fork from."
+            ),
+        ),
+        "group_boundary": _workstream_control(
+            participant_count > 1,
+            "group_room" if participant_count > 1 else "direct_room",
+            (
+                "Open Chat to review group-room turn controls and team policy state."
+                if participant_count > 1
+                else "This is a direct room, not a group session."
+            ),
+        ),
+        "parent_boundary": _workstream_control(
+            parent_session,
+            "forked_session" if parent_session else "root_session",
+            (
+                "Open Chat to review this forked session's visible history."
+                if parent_session
+                else "This session has no parent fork marker."
+            ),
+        ),
     }
 
 

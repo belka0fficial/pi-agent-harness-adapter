@@ -3402,6 +3402,66 @@ def test_workstream_approval_ref_is_metadata_only(monkeypatch, tmp_path):
     assert "raw tool arguments" not in joined.lower()
 
 
+def test_session_workstream_detail_is_digest_count_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/sessions",
+            json={
+                "title": "private room token=session-title-secret https://session.example/path",
+            },
+        )
+        assert created.status_code == 200
+        session_id = created.json()["id"]
+        chat = client.post(
+            f"/api/sessions/{session_id}/chat/stream",
+            json={"input": "session prompt token=session-secret https://session.example/prompt"},
+        )
+        assert chat.status_code == 200
+        app.state.active_runs[session_id] = "run_session_secret_123"
+        drilldown = client.get(f"/api/workstream/refs/session/{session_id}")
+        workstream = client.get("/api/workstream?limit=50")
+        app.state.active_runs.pop(session_id, None)
+
+    assert drilldown.status_code == 200
+    detail = drilldown.json()["detail"]
+    assert detail["schema"] == "agentgate.session_ref_detail.v1"
+    assert detail["id"] == session_id
+    assert detail["title_present"] is True
+    assert detail["title_digest"]
+    assert detail["title_chars"] > 0
+    assert detail["message_count"] == 2
+    assert detail["message_role_counts"]["user"] == 1
+    assert detail["message_role_counts"]["assistant"] == 1
+    assert detail["active_run_present"] is True
+    assert "title" not in detail
+    assert "agent_id" not in detail
+    assert "team_id" not in detail
+    assert "current_speaker_id" not in detail
+    assert drilldown.json()["insight"]["controls"]["schema"] == "agentgate.session_controls.v1"
+    assert drilldown.json()["insight"]["controls"]["executes_from_drilldown"] is False
+    assert drilldown.json()["insight"]["controls"]["session_stop_boundary"]["enabled"] is True
+    joined = json.dumps({"drilldown": drilldown.json(), "workstream": workstream.json()}).lower()
+    for forbidden in [
+        "session-title-secret",
+        "session-secret",
+        "https://session.example",
+        "private room token",
+        "session prompt token",
+        "run_session_secret_123",
+        "current_speaker_id",
+        "participant_agent_ids",
+        "\"content\":",
+        "/api/sessions",
+        "/v1/runs",
+    ]:
+        assert forbidden not in joined
+
+
 def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
