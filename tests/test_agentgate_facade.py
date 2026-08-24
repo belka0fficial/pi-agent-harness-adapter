@@ -2715,9 +2715,19 @@ def test_automation_delivery_policy_stores_safe_metadata_only():
                 "schedule": "0 9 * * *",
                 "prompt": "private delivery prompt",
                 "delivery_policy": "allowlisted",
-                "delivery_targets": ["desktop-main", "phone personal"],
+                "delivery_targets": ["desktop-main", "phone-personal"],
             },
         ).json()
+        unknown_label = client.post(
+            "/api/jobs",
+            json={
+                "name": "Unknown Delivery",
+                "schedule": "0 9 * * *",
+                "prompt": "do not store endpoint",
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["kitchen display"],
+            },
+        )
         unsafe_url = client.post(
             "/api/jobs",
             json={
@@ -2753,14 +2763,16 @@ def test_automation_delivery_policy_stores_safe_metadata_only():
         )
 
     assert created["delivery_policy"] == "allowlisted"
-    assert created["delivery_targets"] == ["desktop-main", "phone personal"]
+    assert created["delivery_targets"] == ["desktop-main", "phone-personal"]
     assert created["delivery_target_count"] == 2
     assert created["approval_status"] == "pending"
     assert created["paused"] is True
     assert "delivery_policy" in created["approval_reasons"]
     assert "delivery_targets" in created["approval_reasons"]
-    assert listed["delivery_targets"] == ["desktop-main", "phone personal"]
+    assert listed["delivery_targets"] == ["desktop-main", "phone-personal"]
     assert "private delivery prompt" not in str(listed)
+    assert unknown_label.status_code == 422
+    assert "configured" in unknown_label.text
     assert unsafe_url.status_code == 422
     assert unsafe_secret.status_code == 422
     assert unsafe_phone.status_code == 422
@@ -2802,6 +2814,38 @@ def test_notification_channels_are_metadata_only_and_reject_sensitive_targets(mo
             "/api/notification-channels",
             json={"label": "telegram bearer token", "kind": "manual"},
         )
+        unsafe_description = client.post(
+            "/api/notification-channels",
+            json={
+                "label": "safe desktop label",
+                "kind": "desktop",
+                "description": "send to https://private.invalid/hook",
+            },
+        )
+        updated = client.patch(
+            f"/api/notification-channels/{created['id']}",
+            json={
+                "label": "workstation alerts",
+                "kind": "desktop",
+                "status": "available",
+                "description": "safe updated label only",
+            },
+        ).json()
+        created_job = client.post(
+            "/api/jobs",
+            json={
+                "name": "Uses Workstation Alerts",
+                "schedule": "0 9 * * *",
+                "prompt": "private delivery prompt",
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["workstation alerts"],
+            },
+        ).json()
+        disable_in_use = client.patch(
+            f"/api/notification-channels/{created['id']}",
+            json={"status": "disabled"},
+        )
+        delete_in_use = client.delete(f"/api/notification-channels/{created['id']}")
         listed = client.get("/api/notification-channels").json()
 
     assert seeded["summary"]["metadata_only"] is True
@@ -2811,12 +2855,21 @@ def test_notification_channels_are_metadata_only_and_reject_sensitive_targets(mo
     assert "endpoint" not in created
     assert "url" not in created
     assert "token" not in str(created).lower()
-    assert any(row["label"] == "workstation speakers" for row in listed["channels"])
+    assert updated["label"] == "workstation alerts"
+    assert updated["status"] == "available"
+    assert created_job["delivery_targets"] == ["workstation alerts"]
+    assert disable_in_use.status_code == 409
+    assert disable_in_use.json()["detail"]["job_count"] == 1
+    assert delete_in_use.status_code == 409
+    assert delete_in_use.json()["detail"]["job_ids"] == [created_job["id"]]
+    assert any(row["label"] == "workstation alerts" for row in listed["channels"])
+    assert not any(row["label"] == "workstation speakers" for row in listed["channels"])
     assert duplicate.status_code == 409
     assert unsafe_url.status_code == 422
     assert unsafe_email.status_code == 422
     assert unsafe_phone.status_code == 422
     assert unsafe_secret.status_code == 422
+    assert unsafe_description.status_code == 422
     assert "https://private.invalid" not in str(listed)
 
 

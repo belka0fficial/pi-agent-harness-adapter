@@ -69,6 +69,14 @@ class NotificationChannelInput(BaseModel):
     requires_owner_confirmation: bool = True
 
 
+class NotificationChannelUpdateInput(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=64)
+    kind: str | None = None
+    status: str | None = None
+    description: str | None = Field(default=None, max_length=240)
+    requires_owner_confirmation: bool | None = None
+
+
 class AccessBoundaryRepairInput(BaseModel):
     agent_id: str | None = None
     team_id: str | None = None
@@ -2722,10 +2730,23 @@ def _sanitize_notification_label(value: Any, *, field: str = "label") -> str:
         or re.search(r"\b(token|secret|password|api[_-]?key|bearer|webhook|url|endpoint)\b", lowered)
         or re.fullmatch(r"[\d\s()+./-]{7,}", label)
     ):
-        raise HTTPException(422, f"{field} must be a safe label, not a URL, email, phone number, token, or secret")
+        raise HTTPException(422, f"{field} must be a safe label, not private connection details")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _./:-]{0,63}", label):
         raise HTTPException(422, f"{field} may contain letters, numbers, spaces, dots, slashes, colons, underscores, and hyphens")
     return label
+
+
+def _sanitize_notification_description(value: Any) -> str:
+    text = _safe_summary(value or "", limit=240)
+    lowered = text.lower()
+    if (
+        "://" in lowered
+        or re.search(r"\S+@\S+", text)
+        or re.search(r"\b(token|secret|password|api[_-]?key|bearer|webhook|url|endpoint)\b", lowered)
+        or re.search(r"\+?\d[\d\s()./-]{6,}\d", text)
+    ):
+        raise HTTPException(422, "description must not contain private connection details")
+    return text
 
 
 def _sanitize_notification_kind(value: Any) -> str:
@@ -2795,6 +2816,46 @@ def _sanitize_delivery_targets(values: Any) -> list[str]:
         if label not in result:
             result.append(label)
     return result[:12]
+
+
+def _notification_channel_by_label(label: str) -> dict[str, Any] | None:
+    normalized = str(label or "").strip().lower()
+    for item in app.state.notification_channels.values():
+        if str(item.get("label") or "").strip().lower() == normalized:
+            return item
+    return None
+
+
+def _notification_channel_in_use(label: str) -> bool:
+    return bool(_notification_channel_usage(label))
+
+
+def _notification_channel_usage(label: str) -> list[str]:
+    normalized = str(label or "").strip().lower()
+    if not normalized:
+        return []
+    job_ids: list[str] = []
+    for item in app.state.jobs.values():
+        targets = [str(value or "").strip().lower() for value in item.get("delivery_targets") or []]
+        if normalized in targets:
+            job_ids.append(str(item.get("id") or item.get("job_id") or "job"))
+    return sorted(job_ids)
+
+
+def _validate_delivery_targets_against_channels(policy: str, targets: list[str]) -> list[str]:
+    _ensure_notification_channels_seeded()
+    if targets and policy == "disabled":
+        raise HTTPException(422, "delivery targets require owner_confirmation or allowlisted delivery policy")
+    blocked = []
+    for label in targets:
+        channel = _notification_channel_by_label(label)
+        if not channel:
+            blocked.append(f"{label}:unknown")
+        elif channel.get("status") == "disabled":
+            blocked.append(f"{label}:disabled")
+    if blocked:
+        raise HTTPException(422, f"delivery targets must reference configured non-disabled channel labels: {', '.join(blocked[:6])}")
+    return targets
 
 
 def _sanitize_task_status(value: Any) -> str:
@@ -3355,6 +3416,7 @@ def create_job(payload: JobInput):
     approval_policy = _sanitize_job_approval_policy(payload.approval_policy)
     delivery_policy = _sanitize_delivery_policy(payload.delivery_policy)
     delivery_targets = _sanitize_delivery_targets(payload.delivery_targets)
+    delivery_targets = _validate_delivery_targets_against_channels(delivery_policy, delivery_targets)
     failure_policy = _sanitize_failure_policy(payload.failure_policy)
     required_tool_ids, required_memory_scopes = _validate_job_requirements(
         actor,
@@ -3445,6 +3507,9 @@ def update_job(job_id: str, payload: dict[str, Any]):
         payload["delivery_policy"] = _sanitize_delivery_policy(payload.get("delivery_policy"))
     if "delivery_targets" in payload:
         payload["delivery_targets"] = _sanitize_delivery_targets(payload.get("delivery_targets"))
+    next_delivery_policy = payload.get("delivery_policy", app.state.jobs[job_id].get("delivery_policy", "disabled"))
+    next_delivery_targets = payload.get("delivery_targets", app.state.jobs[job_id].get("delivery_targets") or [])
+    payload["delivery_targets"] = _validate_delivery_targets_against_channels(next_delivery_policy, next_delivery_targets)
     if "failure_policy" in payload:
         payload["failure_policy"] = _sanitize_failure_policy(payload.get("failure_policy"))
     payload = {
@@ -5408,7 +5473,7 @@ def create_notification_channel(payload: NotificationChannelInput):
         "label": label,
         "kind": kind,
         "status": status,
-        "description": _safe_summary(payload.description, limit=240),
+        "description": _sanitize_notification_description(payload.description),
         "requires_owner_confirmation": bool(payload.requires_owner_confirmation),
         "created_at": created_at,
         "updated_at": created_at,
@@ -5425,6 +5490,75 @@ def create_notification_channel(payload: NotificationChannelInput):
         ref_id=item["id"],
     )
     return _public_notification_channel(item)
+
+
+@app.patch("/api/notification-channels/{channel_id}")
+def update_notification_channel(channel_id: str, payload: NotificationChannelUpdateInput):
+    _ensure_registry_seeded()
+    if channel_id not in app.state.notification_channels:
+        raise HTTPException(404, "notification channel not found")
+    item = app.state.notification_channels[channel_id]
+    next_label = item.get("label")
+    if payload.label is not None:
+        next_label = _sanitize_notification_label(payload.label)
+        if next_label.lower() != str(item.get("label") or "").lower():
+            usage = _notification_channel_usage(str(item.get("label") or ""))
+            if usage:
+                raise HTTPException(409, {"message": "notification channel label is used by existing jobs", "job_count": len(usage), "job_ids": usage[:12]})
+            if any(
+                other_id != channel_id and str(other.get("label") or "").lower() == next_label.lower()
+                for other_id, other in app.state.notification_channels.items()
+            ):
+                raise HTTPException(409, "notification channel label already exists")
+            item["label"] = next_label
+    if payload.kind is not None:
+        item["kind"] = _sanitize_notification_kind(payload.kind)
+    if payload.status is not None:
+        next_status = _sanitize_notification_status(payload.status)
+        usage = _notification_channel_usage(str(item.get("label") or ""))
+        if next_status == "disabled" and usage:
+            raise HTTPException(409, {"message": "notification channel is used by existing jobs", "job_count": len(usage), "job_ids": usage[:12]})
+        item["status"] = next_status
+    if payload.description is not None:
+        item["description"] = _sanitize_notification_description(payload.description)
+    if payload.requires_owner_confirmation is not None:
+        item["requires_owner_confirmation"] = bool(payload.requires_owner_confirmation)
+    item["updated_at"] = now()
+    app.state.notification_channels[channel_id] = item
+    _save_registry_item("notification_channel", item)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="notification.channel.updated",
+        status="metadata_only",
+        source="AgentGate",
+        summary=f"Notification channel label updated: {item.get('label')}",
+        ref_type="notification_channel",
+        ref_id=channel_id,
+    )
+    return _public_notification_channel(item)
+
+
+@app.delete("/api/notification-channels/{channel_id}")
+def delete_notification_channel(channel_id: str):
+    _ensure_registry_seeded()
+    if channel_id not in app.state.notification_channels:
+        raise HTTPException(404, "notification channel not found")
+    item = app.state.notification_channels[channel_id]
+    usage = _notification_channel_usage(str(item.get("label") or ""))
+    if usage:
+        raise HTTPException(409, {"message": "notification channel is used by existing jobs", "job_count": len(usage), "job_ids": usage[:12]})
+    app.state.notification_channels.pop(channel_id)
+    _delete_registry_item("notification_channel", channel_id)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="notification.channel.deleted",
+        status="metadata_only",
+        source="AgentGate",
+        summary=f"Notification channel label deleted: {item.get('label')}",
+        ref_type="notification_channel",
+        ref_id=channel_id,
+    )
+    return {"deleted": True, "metadata_only": True}
 
 
 @app.get("/api/home")
