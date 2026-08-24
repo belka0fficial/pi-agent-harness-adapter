@@ -1918,9 +1918,15 @@ def _safe_workstream_task_detail(task_id: str) -> dict[str, Any]:
     return {
         **public,
         "title": _redact_handoff_text(public.get("title") or "Task", limit=160),
-        "summary": _redact_handoff_text(public.get("summary") or "", limit=260),
-        "checkpoint_note": _redact_handoff_text(public.get("checkpoint_note") or "", limit=220),
-        "execution_summary": _redact_handoff_text(public.get("execution_summary") or "", limit=260),
+        "summary": "Stored server-side",
+        "summary_digest": _task_summary_digest(item),
+        "summary_chars": len(str(item.get("summary") or "")),
+        "checkpoint_note": "Stored server-side" if item.get("checkpoint_note") else "",
+        "checkpoint_note_digest": hashlib.sha256(str(item.get("checkpoint_note") or "").encode("utf-8")).hexdigest(),
+        "checkpoint_note_chars": len(str(item.get("checkpoint_note") or "")),
+        "execution_summary": "Stored server-side" if item.get("execution_summary") else "",
+        "execution_summary_digest": hashlib.sha256(str(item.get("execution_summary") or "").encode("utf-8")).hexdigest(),
+        "execution_summary_chars": len(str(item.get("execution_summary") or "")),
         "execution_history": [],
         "history": safe_history,
     }
@@ -2037,6 +2043,8 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
     }
     if ref_type == "job":
         insight["controls"] = _workstream_job_controls(ref_id, detail)
+    if ref_type == "task":
+        insight["controls"] = _workstream_task_controls(detail)
     return insight
 
 
@@ -2118,6 +2126,84 @@ def _workstream_job_controls(job_id: str, detail: dict[str, Any]) -> dict[str, A
             "active_run" if running else "no_active_run",
             "Stops the currently tracked active run." if running else "No active run is tracked for this job.",
         ),
+    }
+
+
+def _workstream_task_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    owner_checkpoint = bool(detail.get("owner_checkpoint"))
+    checkpoint_status = str(detail.get("checkpoint_status") or "not_required")
+    approval_status = str(detail.get("checkpoint_approval_status") or "")
+    blocked_dependencies = detail.get("blocked_dependencies") or []
+    approval_pending = approval_status == "pending"
+    checkpoint_ready = not owner_checkpoint or checkpoint_status == "approved"
+    dependencies_ready = not bool(blocked_dependencies)
+
+    if not available:
+        return {
+            "schema": "agentgate.task_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "checkpoint_review": _workstream_control(False, "audit_only", "Task exists only in audit history."),
+            "open_scoped_room": _workstream_control(False, "audit_only", "Task exists only in audit history."),
+        }
+
+    if not owner_checkpoint:
+        checkpoint_review = _workstream_control(
+            False,
+            "checkpoint_not_required",
+            "Task does not require an owner checkpoint.",
+        )
+    elif checkpoint_status == "approved":
+        checkpoint_review = _workstream_control(
+            False,
+            "checkpoint_already_approved",
+            "ToolGate already approved this task checkpoint.",
+        )
+    elif approval_pending:
+        checkpoint_review = _workstream_control(
+            False,
+            "review_already_pending",
+            "ToolGate already has a pending checkpoint review request.",
+        )
+    else:
+        checkpoint_review = _workstream_control(
+            True,
+            "ready_for_review",
+            "Queue a ToolGate owner checkpoint review from the Tasks screen.",
+        )
+
+    if not dependencies_ready:
+        open_room = _workstream_control(
+            False,
+            "dependencies_blocked",
+            "One or more delegated task dependencies are not done.",
+        )
+    elif checkpoint_ready:
+        open_room = _workstream_control(
+            True,
+            "ready_no_checkpoint" if not owner_checkpoint else "checkpoint_approved",
+            "Open a scoped task room from the Tasks screen.",
+        )
+    elif checkpoint_status == "rejected":
+        open_room = _workstream_control(
+            False,
+            "checkpoint_rejected",
+            "ToolGate rejected this task checkpoint.",
+        )
+    else:
+        open_room = _workstream_control(
+            False,
+            "checkpoint_pending",
+            "Owner checkpoint approval is required before opening a scoped task room.",
+        )
+
+    return {
+        "schema": "agentgate.task_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "checkpoint_review": checkpoint_review,
+        "open_scoped_room": open_room,
     }
 
 

@@ -3227,9 +3227,19 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     task_body = task_detail.json()
     assert task_body["ref_type"] == "task"
     assert task_body["detail"]["title"] == "Safe task title"
+    assert task_body["detail"]["summary"] == "Stored server-side"
+    assert "summary_digest" in task_body["detail"]
     assert "task-secret" not in json.dumps(task_body).lower()
     assert task_body["insight"]["safety"]["actions_executed"] is False
     assert "Open Tasks" in task_body["insight"]["owner_next_step"]
+    task_controls = task_body["insight"]["controls"]
+    assert task_controls["schema"] == "agentgate.task_controls.v1"
+    assert task_controls["metadata_only"] is True
+    assert task_controls["executes_from_drilldown"] is False
+    assert task_controls["checkpoint_review"]["enabled"] is False
+    assert task_controls["checkpoint_review"]["reason_code"] == "checkpoint_not_required"
+    assert task_controls["open_scoped_room"]["enabled"] is True
+    assert task_controls["open_scoped_room"]["reason_code"] == "ready_no_checkpoint"
     memory_body = memory_detail.json()
     assert memory_body["ref_type"] == "memory_candidate"
     assert memory_body["detail"]["memory_type"] == "preference"
@@ -3293,6 +3303,48 @@ def test_workstream_job_controls_hide_raw_active_run_id(monkeypatch, tmp_path):
     assert "job-secret" not in joined
     assert "https://job.example" not in joined
     assert "private job prompt" not in joined
+
+
+def test_workstream_task_controls_are_metadata_only_for_owner_checkpoint(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/api/tasks",
+            json={
+                "title": "Owner checkpoint proof",
+                "summary": "private task summary token=task-secret https://task.example/path",
+                "owner_checkpoint": True,
+                "checkpoint_note": "checkpoint note password=note-secret https://note.example/path",
+            },
+        ).json()
+        detail = client.get(f"/api/workstream/refs/task/{task['id']}")
+
+    assert detail.status_code == 200
+    body = detail.json()
+    controls = body["insight"]["controls"]
+    assert controls["schema"] == "agentgate.task_controls.v1"
+    assert controls["metadata_only"] is True
+    assert controls["executes_from_drilldown"] is False
+    assert controls["checkpoint_review"]["enabled"] is True
+    assert controls["checkpoint_review"]["reason_code"] == "ready_for_review"
+    assert controls["open_scoped_room"]["enabled"] is False
+    assert controls["open_scoped_room"]["reason_code"] == "checkpoint_pending"
+    joined = json.dumps(body).lower()
+    assert "task-secret" not in joined
+    assert "note-secret" not in joined
+    assert "https://task.example" not in joined
+    assert "https://note.example" not in joined
+    assert body["detail"]["summary"] == "Stored server-side"
+    assert body["detail"]["checkpoint_note"] == "Stored server-side"
+    assert body["detail"]["summary_chars"] > 0
+    assert body["detail"]["checkpoint_note_chars"] > 0
+    assert body["detail"]["summary_digest"] != body["detail"]["checkpoint_note_digest"]
+    assert "/api/tasks" not in joined
+    assert "private task summary" not in joined
+    assert "checkpoint note password" not in joined
 
 
 def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
