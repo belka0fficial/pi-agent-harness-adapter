@@ -148,6 +148,28 @@ class CharacterSourceInput(BaseModel):
     review_checklist: list[str] = Field(default_factory=list)
 
 
+class SidecarRuntimeInput(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    runtime_kind: str = "voice"
+    status: str = "planned"
+    health_status: str = "not_installed"
+    owner_review_status: str = "unreviewed"
+    local_only: bool = True
+    capabilities: list[str] = Field(default_factory=list)
+    description: str = Field(default="", max_length=500)
+
+
+class SidecarRuntimeUpdateInput(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=80)
+    runtime_kind: str | None = None
+    status: str | None = None
+    health_status: str | None = None
+    owner_review_status: str | None = None
+    local_only: bool | None = None
+    capabilities: list[str] | None = None
+    description: str | None = Field(default=None, max_length=500)
+
+
 class ModelRouteProbeInput(BaseModel):
     provider: str = Field(default="", max_length=120)
     model: str = Field(default="", max_length=160)
@@ -395,6 +417,7 @@ app.state.auxiliary_model_routes = {}
 app.state.notification_channels = {}
 app.state.notification_deliveries = {}
 app.state.character_sources = {}
+app.state.sidecar_runtimes = {}
 app.state.active_runs = {}
 app.state.active_job_runs = {}
 app.state.approval_runs = {}
@@ -621,6 +644,7 @@ def _load_registry() -> None:
     app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
     app.state.character_sources = {}
+    app.state.sidecar_runtimes = {}
     for row in rows:
         try:
             item = json.loads(row["data"])
@@ -654,6 +678,8 @@ def _load_registry() -> None:
             app.state.memory_candidates[row["id"]] = item
         elif row["kind"] == "character_source":
             app.state.character_sources[row["id"]] = item
+        elif row["kind"] == "sidecar_runtime":
+            app.state.sidecar_runtimes[row["id"]] = item
     _normalize_agent_model_defaults()
 
 
@@ -678,7 +704,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "auxiliary_model_route", "notification_channel", "notification_delivery", "memory_candidate", "character_source"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "auxiliary_model_route", "notification_channel", "notification_delivery", "memory_candidate", "character_source", "sidecar_runtime"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -694,7 +720,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "notification_delivery", "memory_candidate", "character_source", "auxiliary_model_route"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "notification_delivery", "memory_candidate", "character_source", "sidecar_runtime", "auxiliary_model_route"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -748,6 +774,11 @@ AGENT_EXPRESSION_CALL_MODES = {"disabled", "push_to_talk", "owner_started"}
 AGENT_EXPRESSION_DEVICE_POLICIES = {"disabled", "owner_started", "push_to_talk"}
 AGENT_EXPRESSION_ANALYSIS_MODES = {"disabled", "metadata_only", "owner_started"}
 AGENT_EXPRESSION_IDLE_ANIMATION = {"disabled", "static", "subtle"}
+
+SIDECAR_RUNTIME_KINDS = {"voice", "stt", "tts", "avatar", "expression", "bridge", "other"}
+SIDECAR_RUNTIME_STATUSES = {"planned", "needs_setup", "installed", "disabled", "blocked"}
+SIDECAR_RUNTIME_HEALTH = {"not_installed", "unknown", "manual_ok", "manual_fail", "loopback_ready"}
+SIDECAR_RUNTIME_REVIEW = {"unreviewed", "needs_review", "owner_reviewed", "blocked"}
 
 AGENT_PROFILE_PROVENANCE_FIELDS = {
     "origin_mode": 40,
@@ -860,6 +891,84 @@ def _redact_profile_metadata_text(value: Any, *, limit: int) -> str:
     text = re.sub(r"(?i)\bbearer\s+\S+", "bearer [redacted]", text)
     text = re.sub(r"https?://\S+", "[redacted-url]", text)
     return text[:limit]
+
+
+def _reject_sidecar_private_detail(value: Any, field: str) -> str:
+    text = _redact_profile_metadata_text(value, limit=500)
+    if re.search(r"\[redacted-url\]|\[redacted\]", text, re.IGNORECASE):
+        raise HTTPException(422, f"{field} must not contain URLs, credentials, samples, or paths")
+    if re.search(r"(?<!\w)(?:/home|/app|/tmp|/var|/etc|/usr|~)/\S+", text):
+        raise HTTPException(422, f"{field} must not contain host paths")
+    if re.search(r"(?i)\b(port|endpoint|webhook|socket|sample|asset|file|path|voiceprint)\s*[:=]", text):
+        raise HTTPException(422, f"{field} must stay metadata-only")
+    return text
+
+
+def _safe_sidecar_runtime_payload(payload: SidecarRuntimeInput | SidecarRuntimeUpdateInput | dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = payload.model_dump(exclude_unset=True) if isinstance(payload, BaseModel) else dict(payload)
+    current = dict(existing or {})
+    label = _reject_sidecar_private_detail(source.get("label", current.get("label", "")), "label")[:80]
+    if not label:
+        raise HTTPException(422, "label is required")
+    runtime_kind = _safe_text(source.get("runtime_kind", current.get("runtime_kind", "other")), limit=40)
+    if runtime_kind not in SIDECAR_RUNTIME_KINDS:
+        runtime_kind = "other"
+    status = _safe_text(source.get("status", current.get("status", "planned")), limit=40)
+    if status not in SIDECAR_RUNTIME_STATUSES:
+        status = "needs_setup"
+    health_status = _safe_text(source.get("health_status", current.get("health_status", "not_installed")), limit=40)
+    if health_status not in SIDECAR_RUNTIME_HEALTH:
+        health_status = "unknown"
+    owner_review_status = _safe_text(source.get("owner_review_status", current.get("owner_review_status", "unreviewed")), limit=40)
+    if owner_review_status not in SIDECAR_RUNTIME_REVIEW:
+        owner_review_status = "unreviewed"
+    description = _reject_sidecar_private_detail(source.get("description", current.get("description", "")), "description")[:500]
+    capabilities = [
+        _reject_sidecar_private_detail(item, "capabilities")[:80]
+        for item in _safe_profile_list(source.get("capabilities", current.get("capabilities", [])), limit=8, item_limit=80)
+    ]
+    local_only = source.get("local_only", current.get("local_only", True))
+    if local_only is not True:
+        raise HTTPException(422, "sidecar runtimes must remain local-only for this proof-of-concept")
+    return {
+        "label": label,
+        "runtime_kind": runtime_kind,
+        "status": status,
+        "health_status": health_status,
+        "owner_review_status": owner_review_status,
+        "local_only": True,
+        "capabilities": capabilities,
+        "description": description,
+    }
+
+
+def _public_sidecar_runtime(item: dict[str, Any]) -> dict[str, Any]:
+    safe = _safe_sidecar_runtime_payload(item)
+    ready = (
+        safe["status"] == "installed"
+        and safe["health_status"] in {"manual_ok", "loopback_ready"}
+        and safe["owner_review_status"] == "owner_reviewed"
+    )
+    return {
+        "id": item.get("id"),
+        **safe,
+        "runtime_ready": ready,
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "safety": {
+            "metadata_only": True,
+            "local_only": True,
+            "execution_enabled": False,
+            "start_stop_supported": False,
+            "media_included": False,
+            "assets_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "host_paths_included": False,
+            "ports_included": False,
+            "raw_config_included": False,
+        },
+    }
 
 
 def _safe_profile_provenance(value: Any) -> dict[str, Any]:
@@ -1023,6 +1132,13 @@ def _public_agent(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str,
 def _sidecar_readiness_row(item: dict[str, Any]) -> dict[str, Any]:
     expression = _safe_expression_profile(item.get("expression_profile"))
     provenance = _safe_profile_provenance(item.get("profile_provenance"))
+    runtime_by_label = {
+        str(runtime.get("label") or "").casefold(): _public_sidecar_runtime(runtime)
+        for runtime in getattr(app.state, "sidecar_runtimes", {}).values()
+        if str(runtime.get("label") or "").strip()
+    }
+    voice_runtime = runtime_by_label.get(str(expression.get("voice_sidecar") or "").casefold())
+    avatar_runtime = runtime_by_label.get(str(expression.get("avatar_sidecar") or "").casefold())
     readiness = _agent_profile_readiness({
         **item,
         "expression_profile": expression,
@@ -1045,6 +1161,9 @@ def _sidecar_readiness_row(item: dict[str, Any]) -> dict[str, Any]:
         "camera_policy": expression.get("camera_policy") or "disabled",
         "expression_analysis": expression.get("expression_analysis") or "disabled",
         "idle_animation": expression.get("idle_animation") or "disabled",
+        "voice_runtime_status": voice_runtime.get("status") if voice_runtime else "unregistered",
+        "avatar_runtime_status": avatar_runtime.get("status") if avatar_runtime else "unregistered",
+        "runtime_ready": bool((voice_runtime and voice_runtime.get("runtime_ready")) or (avatar_runtime and avatar_runtime.get("runtime_ready"))),
         "readiness": {
             "score": readiness["score"],
             "ready": readiness["ready"],
@@ -1053,6 +1172,19 @@ def _sidecar_readiness_row(item: dict[str, Any]) -> dict[str, Any]:
         },
         "risk_notes": readiness["risk_notes"],
         "review_needed": review_needed,
+    }
+
+
+def _sidecar_runtime_summary() -> dict[str, Any]:
+    runtimes = [_public_sidecar_runtime(item) for item in getattr(app.state, "sidecar_runtimes", {}).values()]
+    return {
+        "total": len(runtimes),
+        "ready": sum(1 for item in runtimes if item["runtime_ready"]),
+        "installed": sum(1 for item in runtimes if item["status"] == "installed"),
+        "needs_review": sum(1 for item in runtimes if item["owner_review_status"] != "owner_reviewed"),
+        "blocked": sum(1 for item in runtimes if item["status"] == "blocked" or item["owner_review_status"] == "blocked"),
+        "local_only": all(item["local_only"] for item in runtimes),
+        "execution_enabled": False,
     }
 
 
@@ -8107,6 +8239,7 @@ def sidecar_readiness():
             "blocked": sum(1 for row in rows if "asset_review_pending" in row["risk_notes"]),
             "risk_notes": sum(len(row["risk_notes"]) for row in rows),
         },
+        "runtime_summary": _sidecar_runtime_summary(),
         "agents": rows,
         "safety": {
             "mode": "metadata_only",
@@ -8118,6 +8251,88 @@ def sidecar_readiness():
             "provider_urls_included": False,
             "host_paths_included": False,
         },
+    }
+
+
+@app.get("/api/sidecars/runtimes")
+def list_sidecar_runtimes():
+    _ensure_registry_seeded()
+    runtimes = [
+        _public_sidecar_runtime(item)
+        for item in sorted(app.state.sidecar_runtimes.values(), key=lambda row: row.get("label", ""))
+    ]
+    return {
+        "runtimes": runtimes,
+        "summary": _sidecar_runtime_summary(),
+        "safety": {
+            "metadata_only": True,
+            "local_only": True,
+            "execution_enabled": False,
+            "start_stop_supported": False,
+            "media_included": False,
+            "assets_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "host_paths_included": False,
+            "ports_included": False,
+            "raw_config_included": False,
+        },
+    }
+
+
+@app.post("/api/sidecars/runtimes")
+def create_sidecar_runtime(payload: SidecarRuntimeInput):
+    _ensure_registry_seeded()
+    safe = _safe_sidecar_runtime_payload(payload)
+    if any(str(item.get("label") or "").casefold() == safe["label"].casefold() for item in app.state.sidecar_runtimes.values()):
+        raise HTTPException(409, "sidecar runtime label already exists")
+    item = {
+        "id": f"sidecar_{_slug(safe['label'])}_{uuid.uuid4().hex[:8]}",
+        **safe,
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    app.state.sidecar_runtimes[item["id"]] = item
+    _save_registry_item("sidecar_runtime", item)
+    return _public_sidecar_runtime(item)
+
+
+@app.patch("/api/sidecars/runtimes/{runtime_id}")
+def update_sidecar_runtime(runtime_id: str, payload: SidecarRuntimeUpdateInput):
+    _ensure_registry_seeded()
+    item = app.state.sidecar_runtimes.get(runtime_id)
+    if not item:
+        raise HTTPException(404, "sidecar runtime not found")
+    safe = _safe_sidecar_runtime_payload(payload, existing=item)
+    if any(
+        other_id != runtime_id and str(other.get("label") or "").casefold() == safe["label"].casefold()
+        for other_id, other in app.state.sidecar_runtimes.items()
+    ):
+        raise HTTPException(409, "sidecar runtime label already exists")
+    updated = {
+        **item,
+        **safe,
+        "updated_at": now(),
+    }
+    app.state.sidecar_runtimes[runtime_id] = updated
+    _save_registry_item("sidecar_runtime", updated)
+    return _public_sidecar_runtime(updated)
+
+
+@app.delete("/api/sidecars/runtimes/{runtime_id}")
+def delete_sidecar_runtime(runtime_id: str):
+    _ensure_registry_seeded()
+    item = app.state.sidecar_runtimes.pop(runtime_id, None)
+    if not item:
+        raise HTTPException(404, "sidecar runtime not found")
+    _delete_registry_item("sidecar_runtime", runtime_id)
+    return {
+        "deleted": True,
+        "id": runtime_id,
+        "metadata_only": True,
+        "execution_stopped": False,
+        "files_removed": False,
+        "media_removed": False,
     }
 
 

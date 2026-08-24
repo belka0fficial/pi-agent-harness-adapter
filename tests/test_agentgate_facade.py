@@ -337,6 +337,7 @@ def reset_state():
     app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
     app.state.character_sources = {}
+    app.state.sidecar_runtimes = {}
     app.state.active_job_runs = {}
     app.state.approval_runs = {}
     app.state.owner_sessions = {}
@@ -1899,6 +1900,9 @@ def test_sidecar_readiness_is_metadata_only_agent_projection(monkeypatch, tmp_pa
         "camera_policy": "owner_started",
         "expression_analysis": "metadata_only",
         "idle_animation": "subtle",
+        "voice_runtime_status": "unregistered",
+        "avatar_runtime_status": "unregistered",
+        "runtime_ready": False,
         "readiness": row["readiness"],
         "risk_notes": row["risk_notes"],
         "review_needed": True,
@@ -1923,6 +1927,99 @@ def test_sidecar_readiness_is_metadata_only_agent_projection(monkeypatch, tmp_pa
         "primary_model",
     ]:
         assert forbidden not in joined
+
+
+def test_sidecar_runtime_registry_is_dormant_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/sidecars/runtimes",
+            json={
+                "label": "Local narrator",
+                "runtime_kind": "tts",
+                "status": "installed",
+                "health_status": "manual_ok",
+                "owner_review_status": "owner_reviewed",
+                "local_only": True,
+                "capabilities": ["read aloud", "short replies"],
+                "description": "Owner-reviewed local-only TTS presenter.",
+            },
+        )
+        listed = client.get("/api/sidecars/runtimes")
+        updated = client.patch(
+            f"/api/sidecars/runtimes/{created.json()['id']}",
+            json={
+                "status": "disabled",
+                "health_status": "unknown",
+                "description": "Dormant until the runtime is installed manually.",
+            },
+        )
+        deleted = client.delete(f"/api/sidecars/runtimes/{created.json()['id']}")
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body["runtime_kind"] == "tts"
+    assert body["runtime_ready"] is True
+    assert body["safety"] == {
+        "metadata_only": True,
+        "local_only": True,
+        "execution_enabled": False,
+        "start_stop_supported": False,
+        "media_included": False,
+        "assets_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
+        "ports_included": False,
+        "raw_config_included": False,
+    }
+    assert listed.status_code == 200
+    assert listed.json()["summary"]["total"] == 1
+    assert listed.json()["summary"]["ready"] == 1
+    assert listed.json()["safety"]["execution_enabled"] is False
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "disabled"
+    assert updated.json()["runtime_ready"] is False
+    assert deleted.status_code == 200
+    assert deleted.json() == {
+        "deleted": True,
+        "id": body["id"],
+        "metadata_only": True,
+        "execution_stopped": False,
+        "files_removed": False,
+        "media_removed": False,
+    }
+    joined = json.dumps([body, listed.json(), updated.json(), deleted.json()]).lower()
+    for forbidden in ["start_enabled", "stop_enabled", "install_enabled", "provider_url=", "endpoint=", "port:", "/home", "token=", "secret="]:
+        assert forbidden not in joined
+
+
+def test_sidecar_runtime_registry_rejects_private_runtime_details(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    unsafe_payloads = [
+        {"label": "https://voice.example/private", "runtime_kind": "tts"},
+        {"label": "Local voice", "description": "endpoint=http://127.0.0.1:9000 token=abc123"},
+        {"label": "Local avatar", "capabilities": ["asset=/home/private/avatar.glb"]},
+        {"label": "Remote bridge", "local_only": False},
+    ]
+
+    with TestClient(app) as client:
+        responses = [client.post("/api/sidecars/runtimes", json=payload) for payload in unsafe_payloads]
+        listed = client.get("/api/sidecars/runtimes")
+
+    assert [response.status_code for response in responses] == [422, 422, 422, 422]
+    assert listed.status_code == 200
+    assert listed.json()["summary"]["total"] == 0
+    joined = " ".join(response.text for response in responses).lower()
+    assert "abc123" not in joined
+    assert "voice.example" not in joined
+    assert "/home/private" not in joined
 
 
 def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path):
