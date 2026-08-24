@@ -4910,6 +4910,11 @@ def test_open_loop_radar_uses_only_safe_workstream_metadata(monkeypatch, tmp_pat
     assert body["schema"] == "agentgate.open_loops.v1"
     assert body["summary"]["total"] >= 2
     assert body["summary"]["needs_approval"] == 1
+    assert body["summary"]["by_status"]["needs-approval"] == 1
+    assert body["summary"]["by_target_path"]["/approvals"] == 1
+    assert body["summary"]["by_target_path"]["/memory"] >= 1
+    assert body["summary"]["by_source_kind"]["toolgate-approval"] == 1
+    assert body["summary"]["warning_count"] == body["summary"]["total"]
     assert body["safety"]["metadata_only"] is True
     assert body["safety"]["actions_executed"] is False
     assert body["safety"]["approvals_decided"] is False

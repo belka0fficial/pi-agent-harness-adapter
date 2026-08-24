@@ -2540,6 +2540,23 @@ def _open_loops(limit: int = 12) -> dict[str, Any]:
     priority_rank = {"high": 3, "medium": 2, "low": 1}
     loops.sort(key=lambda item: (bool(item.get("approval_required")), priority_rank.get(str(item.get("priority")), 0)), reverse=True)
     loops = loops[:limit]
+
+    def counts_for(key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in loops:
+            value = _safe_summary(item.get(key) or "unknown", limit=80)
+            counts[value] = counts.get(value, 0) + 1
+        return counts
+
+    source_counts: dict[str, int] = {}
+    target_counts: dict[str, int] = {}
+    for item in loops:
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        source_kind = _safe_summary(source.get("kind") or "unknown", limit=80)
+        source_counts[source_kind] = source_counts.get(source_kind, 0) + 1
+        target = _safe_summary(item.get("target_path") or "/", limit=80)
+        target_counts[target] = target_counts.get(target, 0) + 1
+
     return {
         "schema": "agentgate.open_loops.v1",
         "loops": loops,
@@ -2547,6 +2564,11 @@ def _open_loops(limit: int = 12) -> dict[str, Any]:
             "total": len(loops),
             "needs_approval": len([item for item in loops if item.get("approval_required") is True]),
             "owner_review": len([item for item in loops if item.get("approval_required") is not True]),
+            "by_priority": counts_for("priority"),
+            "by_status": counts_for("status"),
+            "by_source_kind": source_counts,
+            "by_target_path": target_counts,
+            "warning_count": len(loops),
         },
         "safety": {
             "metadata_only": True,
