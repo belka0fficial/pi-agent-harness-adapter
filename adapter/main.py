@@ -3741,7 +3741,7 @@ def model_gateway_candidates():
             "models_visible": False,
             "risk": "external",
             "policy": "low_risk_only",
-            "setup_hint": "Set FREE_LLM_API_KEY server-side after configuring FreeLLMAPI, then restart the adapter.",
+            "setup_hint": "Set the FreeLLMAPI gateway key server-side after configuring the gateway, then restart the adapter.",
         },
         "candidates": [],
         "candidate_count": 0,
