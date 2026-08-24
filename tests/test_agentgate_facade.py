@@ -2683,6 +2683,103 @@ def test_verification_snapshot_warns_on_capability_grant_drift_without_ids(monke
     assert "danger.write" not in visible
 
 
+def test_capability_grant_review_applies_tool_grant_only_after_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    owner_secret = "c" * 40
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+    reset_state()
+
+    with TestClient(app) as client:
+        csrf_token = client.post("/api/auth/login", json={"owner_token": owner_secret}).json()["csrf_token"]
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = []
+        queued = client.post(
+            "/api/capability-grants/review",
+            json={
+                "target": "agent",
+                "target_id": "agent_pi_operator",
+                "kind": "tool",
+                "action": "grant",
+                "capability_ids": ["approval.test-echo"],
+            },
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+        assert queued.status_code == 200
+        payload = queued.json()
+        request = app.state.gates.requests[payload["approval_request_id"]]
+
+        assert payload["status"] == "pending_approval"
+        assert payload["metadata_only"] is True
+        assert payload["safety"]["applies_on_approval_only"] is True
+        assert app.state.agents["agent_pi_operator"]["tool_ids"] == []
+        assert request["kind"] == "capability_grant_change"
+        assert request["payload"]["subject_type"] == "capability_grant"
+        assert request["payload"]["raw_arguments_included"] is False
+        assert request["payload"]["credentials_included"] is False
+        assert request["payload"]["next_ids"] == ["approval.test-echo"]
+
+        decided = client.post(
+            f"/api/approvals/{payload['approval_request_id']}/decision",
+            json={"decision": "approved"},
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+
+    assert decided.status_code == 200
+    assert decided.json()["capability_grant_status"] == "applied"
+    assert app.state.agents["agent_pi_operator"]["tool_ids"] == ["approval.test-echo"]
+    assert app.state.gates.synced_toolgate_scope_history[-1] == ["tool:approval.test-echo"]
+    visible = json.dumps(payload).lower() + json.dumps(request).lower() + decided.text.lower()
+    assert "token=" not in visible
+    assert "password" not in visible
+    assert "raw_args" not in visible
+
+
+def test_capability_grant_review_rejects_without_mutation_and_blocks_wildcards(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    owner_secret = "d" * 40
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+    reset_state()
+
+    with TestClient(app) as client:
+        csrf_token = client.post("/api/auth/login", json={"owner_token": owner_secret}).json()["csrf_token"]
+        main._ensure_registry_seeded()
+        app.state.teams["team_core"]["skill_ids"] = ["skill-1"]
+        queued = client.post(
+            "/api/capability-grants/review",
+            json={
+                "target": "team",
+                "target_id": "team_core",
+                "kind": "skill",
+                "action": "revoke",
+                "capability_ids": ["skill-1"],
+            },
+            headers={"X-AgentGate-CSRF": csrf_token},
+        ).json()
+        rejected = client.post(
+            f"/api/approvals/{queued['approval_request_id']}/decision",
+            json={"decision": "rejected"},
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+        wildcard = client.post(
+            "/api/capability-grants/review",
+            json={
+                "target": "agent",
+                "target_id": "agent_pi_operator",
+                "kind": "tool",
+                "action": "grant",
+                "capability_ids": ["*"],
+            },
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["capability_grant_status"] == "rejected"
+    assert app.state.teams["team_core"]["skill_ids"] == ["skill-1"]
+    assert wildcard.status_code == 422
+
+
 def test_verification_snapshot_reports_notification_delivery_boundary(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

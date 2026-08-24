@@ -120,6 +120,16 @@ class ToolEchoDrillInput(BaseModel):
     approval_request_id: str | None = None
 
 
+class CapabilityGrantReviewInput(BaseModel):
+    target: str = Field(pattern="^(agent|team)$")
+    target_id: str = Field(min_length=1, max_length=120)
+    kind: str = Field(pattern="^(tool|skill)$")
+    action: str = Field(pattern="^(grant|revoke)$")
+    capability_ids: list[str] = Field(min_length=1, max_length=64)
+    requested_by_agent_id: str = "agent_pi_operator"
+    requested_by_team_id: str | None = None
+
+
 class OwnerLoginInput(BaseModel):
     owner_token: str = Field(min_length=1)
 
@@ -4156,6 +4166,184 @@ def _clean_list(values: list[Any] | None) -> list[str]:
             result.append(value)
             seen.add(value)
     return result
+
+
+def _clean_capability_ids(values: list[Any] | None, *, allow_empty: bool = False) -> list[str]:
+    result = _clean_list(values)
+    if any(item in {"*", "tool:*", "skill:*"} for item in result):
+        raise HTTPException(422, "wildcard capability grants require manual registry review")
+    if not result and not allow_empty:
+        raise HTTPException(422, "at least one capability id is required")
+    return sorted(result)
+
+
+def _capability_grant_key(kind: str) -> str:
+    if kind == "tool":
+        return "tool_ids"
+    if kind == "skill":
+        return "skill_ids"
+    raise HTTPException(422, "capability kind must be tool or skill")
+
+
+def _capability_grant_record(target: str, target_id: str) -> dict[str, Any]:
+    if target == "agent":
+        item = app.state.agents.get(target_id)
+        if not item:
+            raise HTTPException(404, "agent not found")
+        return item
+    if target == "team":
+        item = app.state.teams.get(target_id)
+        if not item:
+            raise HTTPException(404, "team not found")
+        return item
+    raise HTTPException(422, "target must be agent or team")
+
+
+def _capability_grant_next_ids(
+    *,
+    current: list[str],
+    requested: list[str],
+    action: str,
+) -> list[str]:
+    requested_set = set(requested)
+    if action == "grant":
+        return sorted(set(current) | requested_set)
+    if action == "revoke":
+        return [item for item in current if item not in requested_set]
+    raise HTTPException(422, "action must be grant or revoke")
+
+
+def _create_capability_grant_approval_request(payload: CapabilityGrantReviewInput) -> dict[str, Any]:
+    _ensure_registry_seeded()
+    target = _safe_text(payload.target, limit=20)
+    kind = _safe_text(payload.kind, limit=20)
+    action = _safe_text(payload.action, limit=20)
+    target_id = _safe_text(payload.target_id, limit=120)
+    key = _capability_grant_key(kind)
+    item = _capability_grant_record(target, target_id)
+    current = _clean_capability_ids(item.get(key) or [], allow_empty=True)
+    requested = _clean_capability_ids(payload.capability_ids)
+    next_ids = _capability_grant_next_ids(
+        current=current,
+        requested=requested,
+        action=action,
+    )
+    actor = _permission_context(
+        _safe_text(payload.requested_by_agent_id, limit=120) or "agent_pi_operator",
+        _safe_text(payload.requested_by_team_id, limit=120) or None,
+    )
+    request_payload = {
+        "subject_type": "capability_grant",
+        "subject_id": target_id,
+        "target": target,
+        "target_id": target_id,
+        "kind": kind,
+        "action": action,
+        "capability_ids": requested,
+        "capability_count": len(requested),
+        "current_count": len(current),
+        "next_count": len(next_ids),
+        "next_ids": next_ids,
+        "next_ids_digest": _job_prompt_digest("\n".join(next_ids)),
+        "requested_by_agent_id": actor["agent_id"],
+        "requested_by_team_id": actor.get("team_id"),
+        "metadata_only": True,
+        "raw_arguments_included": False,
+        "memory_contents_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
+        "applies_on_approval_only": True,
+    }
+    request = app.state.gates.create_admin_request(
+        kind="capability_grant_change",
+        title=f"Review {kind} {action} for {target}: {target_id}",
+        details=(
+            f"Owner review requested for a metadata-only {kind} capability {action}. "
+            f"Target: {target} {target_id}. "
+            f"Capabilities: {', '.join(requested[:8])}. "
+            f"Grant count changes {len(current)} -> {len(next_ids)}. "
+            "No tool execution, raw tool arguments, prompts, memory contents, credentials, provider URLs, or host paths were sent."
+        ),
+        payload=request_payload,
+        severity="warning" if action == "grant" else "info",
+    )
+    _record_activity(
+        actor["agent_id"],
+        event_type="capability_grant.review_requested",
+        status="pending",
+        source="ToolGate",
+        summary=f"{kind} {action} queued for {target}: {target_id}",
+        team_id=target_id if target == "team" else actor.get("team_id"),
+        ref_type="capability_grant",
+        ref_id=str(request.get("id") or ""),
+    )
+    return {
+        "status": "pending_approval",
+        "requires_approval": True,
+        "approval_request_id": _safe_text(request.get("id"), limit=120),
+        "target": target,
+        "target_id": target_id,
+        "kind": kind,
+        "action": action,
+        "capability_count": len(requested),
+        "current_count": len(current),
+        "next_count": len(next_ids),
+        "metadata_only": True,
+        "safety": {
+            "toolgate_approval_queued": True,
+            "applies_on_approval_only": True,
+            "raw_arguments_included": False,
+            "memory_contents_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "host_paths_included": False,
+        },
+    }
+
+
+def _apply_capability_grant_approval_request(result: dict[str, Any], decision: str) -> None:
+    request_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    target = str(request_payload.get("target") or "")
+    target_id = str(request_payload.get("target_id") or request_payload.get("subject_id") or "")
+    kind = str(request_payload.get("kind") or "")
+    key = _capability_grant_key(kind)
+    item = _capability_grant_record(target, target_id)
+    result["capability_grant_status"] = "rejected"
+    if decision != "approved":
+        _record_activity(
+            target_id if target == "agent" else item.get("orchestrator_agent_id") or "agent_pi_operator",
+            event_type="capability_grant.rejected",
+            status="rejected",
+            source="ToolGate",
+            summary=f"{kind} capability change rejected for {target}: {target_id}",
+            team_id=target_id if target == "team" else None,
+            ref_type="capability_grant",
+            ref_id=str(result.get("id") or ""),
+        )
+        return
+    next_ids = _clean_capability_ids(request_payload.get("next_ids") or [])
+    item[key] = next_ids
+    item["updated_at"] = now()
+    if target == "agent":
+        app.state.agents[target_id] = item
+    if target == "team":
+        app.state.teams[target_id] = item
+    _save_registry_item(target, item)
+    if kind == "tool":
+        _sync_toolgate_execution_scopes()
+    result["capability_grant_status"] = "applied"
+    result["capability_grant_applied_count"] = len(next_ids)
+    _record_activity(
+        target_id if target == "agent" else item.get("orchestrator_agent_id") or "agent_pi_operator",
+        event_type="capability_grant.approved",
+        status="approved",
+        source="ToolGate",
+        summary=f"{kind} capability change applied for {target}: {target_id}",
+        team_id=target_id if target == "team" else None,
+        ref_type="capability_grant",
+        ref_id=str(result.get("id") or ""),
+    )
 
 
 def _validate_job_requirements(actor: dict[str, Any], required_tool_ids: list[Any] | None, required_memory_scopes: list[Any] | None) -> tuple[list[str], list[str]]:
@@ -9334,6 +9522,11 @@ def update_team(team_id: str, payload: dict[str, Any]):
     return _public_team(item, activity_limit=10)
 
 
+@app.post("/api/capability-grants/review")
+def request_capability_grant_review(payload: CapabilityGrantReviewInput):
+    return _create_capability_grant_approval_request(payload)
+
+
 @app.post("/api/teams/{team_id}/policy-review")
 def request_team_policy_review(team_id: str, payload: TeamPolicyReviewInput | None = None):
     request = _create_team_policy_review_request(team_id, payload)
@@ -11074,6 +11267,8 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
         _apply_model_route_request(result, decision)
     if result.get("kind") == "app_preview_promotion_review" and request_payload.get("subject_type") == "app_preview_proposal":
         _apply_app_preview_promotion_approval_request(result, decision)
+    if result.get("kind") == "capability_grant_change" and request_payload.get("subject_type") == "capability_grant":
+        _apply_capability_grant_approval_request(result, decision)
     if result.get("kind") == "team_policy_review" and request_payload.get("subject_type") == "team_policy":
         _apply_team_policy_review_request(result, decision)
     if result.get("kind") == "task_checkpoint_review" and request_payload.get("subject_type") == "task_checkpoint":
