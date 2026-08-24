@@ -27,14 +27,32 @@ app.state.jobs = {}
 app.state.pi = PiClient()
 
 
+def _legacy_scheduler_enabled() -> bool:
+    return os.environ.get("AGENTGATE_ENABLE_LEGACY_SCHEDULER", "").strip().lower() == "contract_tests"
+
+
+def _require_legacy_scheduler_enabled() -> None:
+    if not _legacy_scheduler_enabled():
+        raise HTTPException(
+            410,
+            {
+                "message": "Legacy scheduler is disabled. Use adapter.main and AgentGate Automations.",
+                "legacy_scheduler": "disabled",
+                "supported_runtime": "adapter.main",
+            },
+        )
+
+
 @app.on_event("startup")
 def start_scheduler():
-    app.state.scheduler.start(paused=False)
+    if _legacy_scheduler_enabled() and not app.state.scheduler.running:
+        app.state.scheduler.start(paused=False)
 
 
 @app.on_event("shutdown")
 def stop_scheduler():
-    app.state.scheduler.shutdown(wait=False)
+    if app.state.scheduler.running:
+        app.state.scheduler.shutdown(wait=False)
 
 
 def now() -> str:
@@ -59,7 +77,7 @@ async def run_job(job_id: str):
     result = {
         "job_id": job_id,
         "status": status,
-        "output_summary": _summarize_job_output(output),
+        "output_summary": _summarize_job_output(output, prompt=item.get("prompt")),
         "output_chars": len(output),
         "error": error,
         "completed_at": now(),
@@ -114,20 +132,52 @@ def _webhooks_enabled() -> bool:
     return os.environ.get("AGENTGATE_ENABLE_JOB_WEBHOOKS", "").strip().lower() in {"1", "true", "yes"}
 
 
-def _summarize_job_output(output: str) -> str:
+def _summarize_job_output(output: str, *, prompt: str | None = None) -> str:
     text = " ".join(str(output or "").split())
     if not text:
         return ""
+    prompt_text = " ".join(str(prompt or "").split())
+    if prompt_text:
+        text = text.replace(prompt_text, "[redacted prompt]")
     return text[:160] + ("..." if len(text) > 160 else "")
+
+
+def _public_job(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "job_id": item.get("job_id") or item.get("id"),
+        "name": item.get("name"),
+        "schedule": item.get("schedule"),
+        "deliver": item.get("deliver", "local"),
+        "paused": bool(item.get("paused")),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "last_run_at": item.get("last_run_at"),
+        "next_run_at": item.get("next_run_at"),
+        "last_result": item.get("last_result"),
+        "legacy_scheduler": "contract_tests",
+        "supported_runtime": "adapter.main",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "legacy_scheduler": "contract_tests" if _legacy_scheduler_enabled() else "disabled",
+        "supported_runtime": "adapter.main",
+    }
 
 
 @app.get("/api/jobs")
 def list_jobs():
-    return {"jobs": list(app.state.jobs.values())}
+    _require_legacy_scheduler_enabled()
+    return {"jobs": [_public_job(item) for item in app.state.jobs.values()]}
 
 
 @app.post("/api/jobs")
 def create_job(payload: JobInput):
+    _require_legacy_scheduler_enabled()
     if payload.webhook_url and not _webhooks_enabled():
         raise HTTPException(422, "job webhooks are disabled for this legacy scheduler")
     job_id = f"job_{uuid.uuid4().hex[:12]}"
@@ -136,11 +186,12 @@ def create_job(payload: JobInput):
     _sync_scheduler(job_id)
     scheduled = app.state.scheduler.get_job(job_id)
     item["next_run_at"] = scheduled.next_run_time.isoformat() if scheduled and scheduled.next_run_time else None
-    return item
+    return _public_job(item)
 
 
 @app.patch("/api/jobs/{job_id}")
 def update_job(job_id: str, payload: dict[str, Any]):
+    _require_legacy_scheduler_enabled()
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
     if payload.get("webhook_url") and not _webhooks_enabled():
@@ -148,11 +199,12 @@ def update_job(job_id: str, payload: dict[str, Any]):
     app.state.jobs[job_id].update({key: value for key, value in payload.items() if key in {"name", "schedule", "prompt", "deliver", "webhook_url"}})
     app.state.jobs[job_id]["updated_at"] = now()
     _sync_scheduler(job_id)
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
 
 
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: str):
+    _require_legacy_scheduler_enabled()
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
     if app.state.scheduler.get_job(job_id):
@@ -163,25 +215,28 @@ def delete_job(job_id: str):
 
 @app.post("/api/jobs/{job_id}/pause")
 def pause_job(job_id: str):
+    _require_legacy_scheduler_enabled()
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
     app.state.jobs[job_id]["paused"] = True
     _sync_scheduler(job_id)
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
 
 
 @app.post("/api/jobs/{job_id}/resume")
 def resume_job(job_id: str):
+    _require_legacy_scheduler_enabled()
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
     app.state.jobs[job_id]["paused"] = False
     _sync_scheduler(job_id)
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
 
 
 @app.post("/api/jobs/{job_id}/run")
 async def run_now(job_id: str):
+    _require_legacy_scheduler_enabled()
     if job_id not in app.state.jobs:
         raise HTTPException(404, "job not found")
     await run_job(job_id)
-    return app.state.jobs[job_id]
+    return _public_job(app.state.jobs[job_id])
