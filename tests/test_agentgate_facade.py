@@ -1996,6 +1996,92 @@ def test_verification_snapshot_reports_missing_gateway_key_as_safe_warning(monke
     assert "authorization" not in visible
 
 
+def test_verification_snapshot_reports_notification_delivery_boundary(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "e" * 40)
+    reset_state()
+    app.state.pi = LocalNotificationPi()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Snapshot Local Notify",
+                "schedule": "0 9 * * *",
+                "prompt": "private prompt token=secret-value https://private.invalid/hook",
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["local dashboard inbox"],
+            },
+        ).json()
+        client.post(
+            f"/api/approvals/{created['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        )
+        client.post(f"/api/jobs/{created['id']}/resume")
+        client.post(f"/api/jobs/{created['id']}/run")
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "notification-delivery-boundary")
+    assert check["status"] == "pass"
+    assert check["detail"]["channel_count"] >= 3
+    assert check["detail"]["local_log_available"] >= 1
+    assert check["detail"]["delivery_count"] >= 1
+    assert check["detail"]["local_delivery_count"] >= 1
+    assert check["detail"]["nonlocal_delivery_records"] == 0
+    assert check["detail"]["suspicious_external_deliveries"] == 0
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["external_sender_configured"] is False
+    assert check["detail"]["external_delivery_enabled"] is False
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    visible = json.dumps(check).lower()
+    assert "private prompt" not in visible
+    assert "secret-value" not in visible
+    assert "https://private.invalid" not in visible
+
+
+def test_verification_snapshot_warns_on_available_nonlocal_notification_channel(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "f" * 40)
+    reset_state()
+
+    with TestClient(app) as client:
+        channel = client.post(
+            "/api/notification-channels",
+            json={
+                "label": "studio desktop",
+                "kind": "desktop",
+                "status": "available",
+                "description": "safe label only",
+            },
+        ).json()
+        queued = client.post(
+            f"/api/notification-channels/{channel['id']}/setup-approval",
+            json={"summary": "safe desktop readiness label"},
+        ).json()
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "notification-delivery-boundary")
+    assert check["status"] == "warn"
+    assert check["severity"] == "warning"
+    assert check["detail"]["external_channels_marked_available"] == 1
+    assert check["detail"]["pending_setup_reviews"] == 1
+    assert check["detail"]["nonlocal_delivery_records"] == 0
+    assert check["detail"]["suspicious_external_deliveries"] == 0
+    assert check["detail"]["external_sender_configured"] is False
+    assert check["detail"]["external_delivery_enabled"] is False
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    assert queued["approval_status"] == "pending"
+    visible = json.dumps(check).lower()
+    assert "studio desktop" not in visible
+    assert "safe desktop readiness label" not in visible
+    assert "https://" not in visible
+    assert "token=" not in visible
+
+
 def test_verification_snapshot_reports_team_execution_policy_counts(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

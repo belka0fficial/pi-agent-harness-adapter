@@ -5360,6 +5360,56 @@ def _record_notification_test_delivery(item: dict[str, Any], *, status: str, sum
     return _public_notification_delivery(delivery)
 
 
+def _notification_delivery_boundary_summary() -> dict[str, Any]:
+    _ensure_notification_channels_seeded()
+    channels = list(app.state.notification_channels.values())
+    deliveries = list(app.state.notification_deliveries.values())
+    nonlocal_channels = [
+        item for item in channels if str(item.get("kind") or "manual") != "local_log"
+    ]
+    external_available = [
+        item for item in nonlocal_channels if str(item.get("status") or "needs_setup") == "available"
+    ]
+    pending_setup = [
+        item for item in channels if str(item.get("test_send_approval_status") or "") == "pending"
+    ]
+    local_deliveries = [
+        item for item in deliveries if str(item.get("channel_kind") or "local_log") == "local_log"
+    ]
+    nonlocal_deliveries = [
+        item for item in deliveries if str(item.get("channel_kind") or "local_log") != "local_log"
+    ]
+    suspicious_external_deliveries = [
+        item
+        for item in nonlocal_deliveries
+        if bool(item.get("external_delivery")) or str(item.get("status") or "") == "delivered"
+    ]
+    warning_count = len(external_available) + len(suspicious_external_deliveries)
+    return {
+        "channel_count": len(channels),
+        "local_log_channels": sum(1 for item in channels if str(item.get("kind") or "manual") == "local_log"),
+        "local_log_available": sum(
+            1
+            for item in channels
+            if str(item.get("kind") or "manual") == "local_log"
+            and str(item.get("status") or "needs_setup") == "available"
+        ),
+        "external_channel_labels": len(nonlocal_channels),
+        "external_channels_marked_available": len(external_available),
+        "pending_setup_reviews": len(pending_setup),
+        "delivery_count": len(deliveries),
+        "local_delivery_count": len(local_deliveries),
+        "nonlocal_delivery_records": len(nonlocal_deliveries),
+        "suspicious_external_deliveries": len(suspicious_external_deliveries),
+        "warning_count": warning_count,
+        "metadata_only": True,
+        "external_sender_configured": False,
+        "external_delivery_enabled": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+    }
+
+
 def _apply_notification_test_send_approval_request(result: dict[str, Any], decision: str) -> None:
     payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
     channel_id = str(payload.get("subject_id") or "")
@@ -9565,6 +9615,22 @@ def _verification_snapshot() -> dict[str, Any]:
             "job_count": len(jobs),
             "pending_risky_jobs": len(risky_jobs),
         },
+    ))
+
+    notification_boundary = _notification_delivery_boundary_summary()
+    notification_warning_count = int(notification_boundary.get("warning_count") or 0)
+    checks.append(_verification_check(
+        "notification-delivery-boundary",
+        "Notification delivery boundary",
+        "pass" if notification_warning_count == 0 else "warn",
+        (
+            "Notification delivery remains local-only metadata; external senders are not configured."
+            if notification_warning_count == 0
+            else "Notification channel or delivery metadata needs owner review before any external sender integration."
+        ),
+        source="AgentGate Automations",
+        severity="warning" if notification_warning_count else "info",
+        detail=notification_boundary,
     ))
 
     backup = _safe_backup_summary(system)
