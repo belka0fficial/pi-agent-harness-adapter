@@ -2462,6 +2462,97 @@ def test_verification_snapshot_reports_notification_delivery_boundary(monkeypatc
     assert "https://private.invalid" not in visible
 
 
+def test_verification_snapshot_reports_sidecar_runtime_boundary(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "i" * 40)
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/sidecars/runtimes",
+            json={
+                "label": "Local narrator",
+                "runtime_kind": "tts",
+                "status": "installed",
+                "health_status": "manual_ok",
+                "owner_review_status": "owner_reviewed",
+                "local_only": True,
+                "capabilities": ["read aloud"],
+                "description": "Owner-reviewed local-only presenter.",
+            },
+        )
+        assert created.status_code == 200
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "sidecar-runtime-boundary")
+    assert check["status"] == "pass"
+    assert check["detail"]["runtime_count"] == 1
+    assert check["detail"]["ready_count"] == 1
+    assert check["detail"]["installed_count"] == 1
+    assert check["detail"]["warning_count"] == 0
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["local_only"] is True
+    assert check["detail"]["execution_enabled"] is False
+    assert check["detail"]["start_stop_supported"] is False
+    assert check["detail"]["install_supported"] is False
+    assert check["detail"]["probe_supported"] is False
+    assert check["detail"]["media_included"] is False
+    assert check["detail"]["assets_included"] is False
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    assert check["detail"]["host_paths_included"] is False
+    assert check["detail"]["ports_included"] is False
+    assert check["detail"]["raw_config_included"] is False
+    visible = json.dumps(check).lower()
+    assert "local narrator" not in visible
+    assert "read aloud" not in visible
+    assert "owner-reviewed" not in visible
+
+
+def test_verification_snapshot_warns_on_unsafe_sidecar_runtime_without_leaking_values(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "j" * 40)
+    reset_state()
+
+    with TestClient(app) as client:
+        app.state.sidecar_runtimes = {
+            "unsafe-runtime": {
+                "id": "unsafe-runtime",
+                "label": "Unsafe runtime https://private.invalid/voice",
+                "runtime_kind": "tts",
+                "status": "installed",
+                "health_status": "manual_ok",
+                "owner_review_status": "owner_reviewed",
+                "local_only": False,
+                "capabilities": ["asset=/home/private/avatar.glb"],
+                "description": "endpoint=http://127.0.0.1:9999 token=secret-value",
+                "created_at": main.now(),
+                "updated_at": main.now(),
+            }
+        }
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "sidecar-runtime-boundary")
+    assert check["status"] == "warn"
+    assert check["severity"] == "warning"
+    assert check["detail"]["runtime_count"] == 1
+    assert check["detail"]["public_runtime_count"] == 0
+    assert check["detail"]["unsafe_record_count"] == 1
+    assert check["detail"]["nonlocal_claims"] == 1
+    assert check["detail"]["warning_count"] >= 2
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["execution_enabled"] is False
+    visible = json.dumps(check).lower()
+    assert "unsafe runtime" not in visible
+    assert "private.invalid" not in visible
+    assert "127.0.0.1:9999" not in visible
+    assert "secret-value" not in visible
+    assert "/home/private" not in visible
+    assert "avatar.glb" not in visible
+
+
 def test_verification_snapshot_warns_on_available_nonlocal_notification_channel(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

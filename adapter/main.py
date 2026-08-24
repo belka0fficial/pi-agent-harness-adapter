@@ -1188,6 +1188,68 @@ def _sidecar_runtime_summary() -> dict[str, Any]:
     }
 
 
+def _sidecar_runtime_boundary_summary() -> dict[str, Any]:
+    raw_runtimes = list(getattr(app.state, "sidecar_runtimes", {}).values())
+    public_runtimes: list[dict[str, Any]] = []
+    unsafe_records = 0
+    for item in raw_runtimes:
+        try:
+            public_runtimes.append(_public_sidecar_runtime(item))
+        except HTTPException:
+            unsafe_records += 1
+    safety_flags = [
+        item.get("safety", {}) if isinstance(item.get("safety"), dict) else {}
+        for item in public_runtimes
+    ]
+    nonlocal_claims = sum(1 for item in raw_runtimes if item.get("local_only") is not True)
+    warning_count = unsafe_records + nonlocal_claims
+    if any(bool(flags.get("execution_enabled")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("start_stop_supported")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("media_included")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("assets_included")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("credentials_included")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("provider_urls_included")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("host_paths_included")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("ports_included")) for flags in safety_flags):
+        warning_count += 1
+    if any(bool(flags.get("raw_config_included")) for flags in safety_flags):
+        warning_count += 1
+    return {
+        "runtime_count": len(raw_runtimes),
+        "public_runtime_count": len(public_runtimes),
+        "ready_count": sum(1 for item in public_runtimes if item.get("runtime_ready")),
+        "installed_count": sum(1 for item in public_runtimes if item.get("status") == "installed"),
+        "needs_review_count": sum(1 for item in public_runtimes if item.get("owner_review_status") != "owner_reviewed"),
+        "blocked_count": sum(1 for item in public_runtimes if item.get("status") == "blocked" or item.get("owner_review_status") == "blocked"),
+        "unsafe_record_count": unsafe_records,
+        "nonlocal_claims": nonlocal_claims,
+        "warning_count": warning_count,
+        "metadata_only": True,
+        "local_only": nonlocal_claims == 0,
+        "execution_enabled": False,
+        "start_stop_supported": False,
+        "install_supported": False,
+        "probe_supported": False,
+        "media_included": False,
+        "assets_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
+        "ports_included": False,
+        "raw_config_included": False,
+        "prompts_included": False,
+        "memory_contents_included": False,
+        "tool_arguments_included": False,
+    }
+
+
 def _safe_orchestrator_policy(value: Any) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     result: dict[str, Any] = {}
@@ -10196,6 +10258,22 @@ def _verification_snapshot() -> dict[str, Any]:
         source="AgentGate Automations",
         severity="warning" if notification_warning_count else "info",
         detail=notification_boundary,
+    ))
+
+    sidecar_boundary = _sidecar_runtime_boundary_summary()
+    sidecar_warning_count = int(sidecar_boundary.get("warning_count") or 0)
+    checks.append(_verification_check(
+        "sidecar-runtime-boundary",
+        "Sidecar runtime boundary",
+        "pass" if sidecar_warning_count == 0 else "warn",
+        (
+            "Sidecar runtimes remain dormant local-only metadata with no execution, media, credentials, URLs, paths, ports, or raw config exposed."
+            if sidecar_warning_count == 0
+            else "Sidecar runtime metadata needs owner review before any voice/avatar runtime integration."
+        ),
+        source="AgentGate Character",
+        severity="warning" if sidecar_warning_count else "info",
+        detail=sidecar_boundary,
     ))
 
     backup = _safe_backup_summary(system)
