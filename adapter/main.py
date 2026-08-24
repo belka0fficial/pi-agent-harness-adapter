@@ -412,6 +412,45 @@ TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
     },
 }
 
+AGENT_ROLE_TEMPLATES: dict[str, dict[str, Any]] = {
+    "critic-reviewer": {
+        "name": "Aquinas Critic",
+        "title": "Critic and design reviewer",
+        "purpose": (
+            "Challenge AgentGate product, architecture, security, and UX decisions "
+            "before implementation; explain tradeoffs and suggest simpler safer alternatives."
+        ),
+        "mode": "professional",
+        "soul": (
+            "Be constructive but skeptical. Ask why this design exists, what can fail, "
+            "what is overbuilt, and what owner-facing experience would be clearer. "
+            "Do not execute actions; produce review notes for the orchestrator."
+        ),
+        "voice": "Calm, precise, direct, and evidence-first.",
+        "personality": ["skeptical", "constructive", "security-aware", "ux-sensitive"],
+        "appearance": {"mode": "clean", "style": "minimal reviewer card"},
+        "story": "A review specialist for pressure-testing AgentGate decisions before they ship.",
+    },
+    "dashboard-tester": {
+        "name": "Button Tester",
+        "title": "QA and safety tester",
+        "purpose": (
+            "Exercise AgentGate dashboard flows, verify safe metadata boundaries, "
+            "check health and port assumptions, and report reproducible bugs without destructive actions."
+        ),
+        "mode": "professional",
+        "soul": (
+            "Test like a careful owner would: click the obvious paths, try harmless bad inputs, "
+            "check visible safety promises, and report exact reproduction steps. "
+            "Never run destructive commands or bypass ToolGate approval."
+        ),
+        "voice": "Short, practical, and bug-report oriented.",
+        "personality": ["methodical", "curious", "boundary-focused", "reproducible"],
+        "appearance": {"mode": "clean", "style": "compact QA operator card"},
+        "story": "A dashboard tester for finding broken buttons, unsafe display states, and missing verification affordances.",
+    },
+}
+
 
 DATA_DIR = Path(os.environ.get("ADAPTER_DATA_DIR", "/app/data"))
 REGISTRY_DB = DATA_DIR / "registry.sqlite3"
@@ -9352,6 +9391,88 @@ def delete_agent(agent_id: str):
 def list_teams():
     _ensure_registry_seeded()
     return {"teams": [_public_team(item, activity_limit=3) for item in app.state.teams.values()]}
+
+
+@app.get("/api/agent-templates")
+def list_agent_templates():
+    _ensure_registry_seeded()
+    existing_slugs = {
+        _slug(item.get("name") or "") for item in app.state.agents.values()
+    }
+    templates = []
+    for template_id, template in AGENT_ROLE_TEMPLATES.items():
+        templates.append({
+            "id": template_id,
+            **template,
+            "tool_ids": [],
+            "skill_ids": [],
+            "memory_scopes": [],
+            "already_created": _slug(template["name"]) in existing_slugs,
+            "safety": {
+                "metadata_only": True,
+                "tools_granted": False,
+                "skills_granted": False,
+                "memory_granted": False,
+                "actions_executed": False,
+                "credentials_included": False,
+                "provider_urls_included": False,
+                "host_paths_included": False,
+            },
+        })
+    return {"templates": templates}
+
+
+@app.post("/api/agent-templates/{template_id}/create")
+def create_agent_from_template(template_id: str):
+    _ensure_registry_seeded()
+    template = AGENT_ROLE_TEMPLATES.get(template_id)
+    if not template:
+        raise HTTPException(404, "agent template not found")
+    agent_input = AgentInput(
+        name=template["name"],
+        title=template["title"],
+        purpose=template["purpose"],
+        mode=template["mode"],
+        soul=template["soul"],
+        voice=template["voice"],
+        personality=list(template.get("personality") or []),
+        appearance=dict(template.get("appearance") or {}),
+        story=template["story"],
+        profile_provenance={
+            "origin_mode": "repo_template",
+            "review_status": "owner_reviewed",
+            "source_type": "agentgate_template",
+            "source_confidence": "owner_verified",
+            "usage_policy": "private_operational_template",
+            "asset_review_status": "approved_metadata",
+            "source_labels": ["agentgate role template"],
+            "notes_summary": "Repo-defined local role shell; no access granted by template creation.",
+            "review_checklist": [
+                "No tools granted",
+                "No memory scopes granted",
+                "No credentials stored",
+            ],
+        },
+        primary_provider=os.environ.get("PI_PROVIDER", "openai-codex"),
+        primary_model=os.environ.get("PI_MODEL", ""),
+        fallback_provider="",
+        fallback_model="",
+        tool_ids=[],
+        skill_ids=[],
+        memory_scopes=[],
+        team_ids=[],
+    )
+    item = create_agent(agent_input)
+    _record_activity(
+        item.get("id"),
+        event_type="agent.template_created",
+        status="created",
+        source="AgentGate",
+        summary=f"Agent role template created: {item.get('name')}",
+        ref_type="agent_template",
+        ref_id=template_id,
+    )
+    return item
 
 
 @app.get("/api/team-templates")

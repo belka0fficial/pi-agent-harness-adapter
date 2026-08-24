@@ -894,6 +894,43 @@ def test_registry_export_import_is_metadata_only(monkeypatch, tmp_path):
     assert team["id"] in restored["team_ids"]
 
 
+def test_agent_role_templates_create_no_grant_worker_shells(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        templates = client.get("/api/agent-templates").json()
+        critic = client.post("/api/agent-templates/critic-reviewer/create").json()
+        tester = client.post("/api/agent-templates/dashboard-tester/create").json()
+        after = client.get("/api/agent-templates").json()
+
+    assert {item["id"] for item in templates["templates"]} == {
+        "critic-reviewer",
+        "dashboard-tester",
+    }
+    assert all(item["safety"]["metadata_only"] is True for item in templates["templates"])
+    assert all(item["safety"]["tools_granted"] is False for item in templates["templates"])
+    assert all(item["safety"]["memory_granted"] is False for item in templates["templates"])
+    assert critic["tool_ids"] == []
+    assert critic["skill_ids"] == []
+    assert critic["memory_scopes"] == []
+    assert tester["tool_ids"] == []
+    assert tester["skill_ids"] == []
+    assert tester["memory_scopes"] == []
+    assert critic["profile_provenance"]["origin_mode"] == "repo_template"
+    assert tester["profile_provenance"]["origin_mode"] == "repo_template"
+    seeded = {item["id"]: item["already_created"] for item in after["templates"]}
+    assert seeded == {"critic-reviewer": True, "dashboard-tester": True}
+    combined = f"{templates} {critic} {tester} {after}".lower()
+    assert "tgx_" not in combined
+    assert "mg_read_" not in combined
+    assert "token=" not in combined
+    assert "api_key" not in combined
+    assert "https://" not in combined
+    assert "/home/" not in combined
+
+
 def test_app_workspace_registry_create_list_patch_delete(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
