@@ -108,6 +108,14 @@ class ModelRoutePlanInput(BaseModel):
     fallback_model: str = Field(default="", max_length=160)
 
 
+class ModelRouteSaveInput(BaseModel):
+    primary_provider: str = Field(default="", max_length=120)
+    primary_model: str = Field(default="", max_length=160)
+    fallback_provider: str = Field(default="", max_length=120)
+    fallback_model: str = Field(default="", max_length=160)
+    reason: str = Field(default="", max_length=500)
+
+
 class AgentInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     title: str = Field(default="Agent", max_length=120)
@@ -225,6 +233,7 @@ app.state.messages = {}
 app.state.jobs = {}
 app.state.tasks = {}
 app.state.tool_drafts = {}
+app.state.model_route_proposals = {}
 app.state.active_runs = {}
 app.state.active_job_runs = {}
 app.state.approval_runs = {}
@@ -326,6 +335,7 @@ def _load_registry() -> None:
     app.state.jobs = {}
     app.state.tasks = {}
     app.state.tool_drafts = {}
+    app.state.model_route_proposals = {}
     app.state.memory_candidates = {}
     for row in rows:
         try:
@@ -342,6 +352,8 @@ def _load_registry() -> None:
             app.state.tasks[row["id"]] = item
         elif row["kind"] == "tool_draft":
             app.state.tool_drafts[row["id"]] = item
+        elif row["kind"] == "model_route_proposal":
+            app.state.model_route_proposals[row["id"]] = item
         elif row["kind"] == "memory_candidate":
             app.state.memory_candidates[row["id"]] = item
     _normalize_agent_model_defaults()
@@ -368,7 +380,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "model_route_proposal", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -3959,6 +3971,206 @@ def _fallback_policy(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[
     }
 
 
+MODEL_ROUTE_FIELDS = {
+    "primary_provider",
+    "primary_model",
+    "fallback_provider",
+    "fallback_model",
+}
+
+
+def _route_values_from_payload(agent: dict[str, Any], payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        "primary_provider": _safe_text(payload.get("primary_provider", agent.get("primary_provider") or ""), limit=120),
+        "primary_model": _safe_text(payload.get("primary_model", agent.get("primary_model") or ""), limit=160),
+        "fallback_provider": _safe_text(payload.get("fallback_provider", agent.get("fallback_provider") or ""), limit=120),
+        "fallback_model": _safe_text(payload.get("fallback_model", agent.get("fallback_model") or ""), limit=160),
+    }
+
+
+def _route_fields_changed(agent: dict[str, Any], route: dict[str, str]) -> bool:
+    return any(str(agent.get(field) or "") != route.get(field, "") for field in MODEL_ROUTE_FIELDS)
+
+
+def _route_plan_for_agent(agent_id: str, route: dict[str, str]) -> dict[str, Any]:
+    return model_route_plan(ModelRoutePlanInput(agent_id=agent_id, **route))
+
+
+def _route_change_risk(plan: dict[str, Any]) -> dict[str, Any]:
+    reasons: list[str] = []
+    for route in plan.get("routes", []):
+        label = str(route.get("label") or "route")
+        provider = str(route.get("provider") or "")
+        model = str(route.get("model") or "")
+        if not provider and not model:
+            continue
+        status = str(route.get("status") or "")
+        risk = str(route.get("risk") or "")
+        policy = str(route.get("policy") or "")
+        if risk == "external":
+            reasons.append(f"{label} route uses an external provider")
+        if status in {"auth_required", "not_visible"}:
+            reasons.append(f"{label} route is {status}")
+        if policy in {"low_risk_only", "blocked"}:
+            reasons.append(f"{label} route policy is {policy}")
+    return {
+        "requires_approval": bool(reasons),
+        "reasons": list(dict.fromkeys(reasons))[:6],
+    }
+
+
+def _safe_route_change_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "model.route_change.v1",
+        "routes": [
+            {
+                "label": route.get("label"),
+                "provider": route.get("provider"),
+                "model": route.get("model"),
+                "status": route.get("status"),
+                "risk": route.get("risk"),
+                "policy": route.get("policy"),
+            }
+            for route in plan.get("routes", [])
+        ],
+        "fallback_policy": {
+            "status": (plan.get("fallback_policy") or {}).get("status"),
+            "automatic_fallback": False,
+            "blocked_reasons": list((plan.get("fallback_policy") or {}).get("blocked_reasons") or [])[:6],
+        },
+        "safe_metadata_only": True,
+        "credentials_included": False,
+        "raw_prompts_included": False,
+        "upstream_details_included": False,
+    }
+
+
+def _route_digest(agent_id: str, route: dict[str, str]) -> str:
+    canonical = json.dumps(
+        {"agent_id": agent_id, "route": route},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _apply_model_route(agent_id: str, route: dict[str, str], *, source: str, request_id: str | None = None) -> dict[str, Any]:
+    item = app.state.agents.get(agent_id)
+    if not item:
+        raise HTTPException(404, "agent not found")
+    item.update(route)
+    item["updated_at"] = now()
+    _save_registry_item("agent", item)
+    _record_activity(
+        agent_id,
+        event_type="model.route_updated",
+        status="applied",
+        source=source,
+        summary=f"Model route updated for {item.get('name') or agent_id}",
+        team_id=(item.get("team_ids") or [None])[0],
+        ref_type="approval" if request_id else "agent",
+        ref_id=request_id or agent_id,
+    )
+    return _public_agent(item, activity_limit=10)
+
+
+def _create_model_route_request(agent_id: str, route: dict[str, str], plan: dict[str, Any], risk: dict[str, Any], reason: str = "") -> dict[str, Any]:
+    route_digest = _route_digest(agent_id, route)
+    existing = [
+        item for item in app.state.model_route_proposals.values()
+        if item.get("agent_id") == agent_id and item.get("status") == "pending"
+    ]
+    for item in existing:
+        try:
+            request = app.state.gates.request_status(str(item.get("toolgate_request_id") or ""))
+        except Exception:
+            request = None
+        if request and str(request.get("status") or "") == "pending" and item.get("route_digest") == route_digest:
+            return {"proposal": item, "request": request}
+    agent = app.state.agents.get(agent_id) or {}
+    proposal_id = f"modelroute_{uuid.uuid4().hex[:12]}"
+    payload = {
+        "subject_type": "model_route",
+        "subject_id": proposal_id,
+        "action": "apply_agent_model_route",
+        "agent_id": agent_id,
+        "route": route,
+        "route_digest": route_digest,
+        "route_summary": _safe_route_change_summary(plan),
+        "approval_reasons": risk["reasons"],
+        "owner_reason_digest": _job_prompt_digest(reason or ""),
+        "metadata_only": True,
+    }
+    request = app.state.gates.create_admin_request(
+        kind="model_route_change",
+        title=f"Approve model route change: {agent.get('name') or agent_id}",
+        details=(
+            "Owner approval required before AgentGate saves this risky model route. "
+            "Only provider/model labels, readiness/risk metadata, and a reason digest were sent; "
+            "provider URLs, credentials, prompts, memory contents, and tool arguments stay server-side."
+        ),
+        payload=payload,
+        severity="warning",
+    )
+    item = {
+        "id": proposal_id,
+        "agent_id": agent_id,
+        "route": route,
+        "route_digest": route_digest,
+        "route_summary": payload["route_summary"],
+        "approval_reasons": risk["reasons"],
+        "toolgate_request_id": request.get("id"),
+        "status": str(request.get("status") or "pending"),
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    app.state.model_route_proposals[proposal_id] = item
+    _save_registry_item("model_route_proposal", item)
+    _record_activity(
+        agent_id,
+        event_type="model.route_approval_requested",
+        status="pending",
+        source="ToolGate",
+        summary=f"Model route change queued for owner approval: {agent.get('name') or agent_id}",
+        team_id=(agent.get("team_ids") or [None])[0],
+        ref_type="approval",
+        ref_id=str(request.get("id") or ""),
+    )
+    return {"proposal": item, "request": request}
+
+
+def _apply_model_route_request(result: dict[str, Any], decision: str) -> None:
+    request_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    proposal_id = str(request_payload.get("subject_id") or "")
+    proposal = app.state.model_route_proposals.get(proposal_id)
+    if not proposal:
+        return
+    if decision == "approved":
+        route = proposal.get("route") if isinstance(proposal.get("route"), dict) else {}
+        if proposal.get("route_digest") != request_payload.get("route_digest"):
+            proposal["status"] = "digest_mismatch"
+            proposal["updated_at"] = now()
+            app.state.model_route_proposals[proposal_id] = proposal
+            _save_registry_item("model_route_proposal", proposal)
+            result["model_route_status"] = "digest_mismatch"
+            return
+        _apply_model_route(
+            str(proposal.get("agent_id") or ""),
+            route,
+            source="ToolGate",
+            request_id=str(result.get("id") or proposal.get("toolgate_request_id") or ""),
+        )
+        proposal["status"] = "approved"
+        result["model_route_status"] = "applied"
+    else:
+        proposal["status"] = "rejected"
+        result["model_route_status"] = "rejected"
+    proposal["updated_at"] = now()
+    app.state.model_route_proposals[proposal_id] = proposal
+    _save_registry_item("model_route_proposal", proposal)
+
+
 @app.post("/api/model/route-plan")
 def model_route_plan(payload: ModelRoutePlanInput):
     _ensure_registry_seeded()
@@ -3979,6 +4191,49 @@ def model_route_plan(payload: ModelRoutePlanInput):
         "secrets_included": False,
         "raw_prompts_included": False,
         "automatic_fallback_enabled": False,
+    }
+
+
+@app.post("/api/model/routes/{agent_id}/save")
+def save_model_route(agent_id: str, payload: ModelRouteSaveInput):
+    _ensure_registry_seeded()
+    agent = app.state.agents.get(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    route = _route_values_from_payload(agent, payload.model_dump())
+    plan = _route_plan_for_agent(agent_id, route)
+    risk = _route_change_risk(plan)
+    if not _route_fields_changed(agent, route):
+        return {
+            "status": "unchanged",
+            "agent": _public_agent(agent, activity_limit=10),
+            "route_plan": plan,
+            "requires_approval": False,
+            "safe_metadata_only": True,
+        }
+    if risk["requires_approval"]:
+        created = _create_model_route_request(agent_id, route, plan, risk, payload.reason)
+        proposal = created["proposal"]
+        request = created["request"]
+        return {
+            "status": "pending_approval",
+            "request_id": request.get("id") or proposal.get("toolgate_request_id"),
+            "proposal_id": proposal.get("id"),
+            "approval_reasons": risk["reasons"],
+            "route_summary": proposal.get("route_summary"),
+            "requires_approval": True,
+            "safe_metadata_only": True,
+            "credentials_included": False,
+            "raw_prompts_included": False,
+            "upstream_details_included": False,
+        }
+    agent_payload = _apply_model_route(agent_id, route, source="AgentGate")
+    return {
+        "status": "applied",
+        "agent": agent_payload,
+        "route_plan": plan,
+        "requires_approval": False,
+        "safe_metadata_only": True,
     }
 
 
@@ -4125,6 +4380,19 @@ def update_agent(agent_id: str, payload: dict[str, Any]):
     if not item:
         raise HTTPException(404, "agent not found")
     allowed = set(AgentInput.model_fields) | {"status"}
+    if MODEL_ROUTE_FIELDS & set(payload):
+        route = _route_values_from_payload(item, payload)
+        if _route_fields_changed(item, route):
+            risk = _route_change_risk(_route_plan_for_agent(agent_id, route))
+            if risk["requires_approval"]:
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "MODEL_ROUTE_APPROVAL_REQUIRED",
+                        "message": "Use /api/model/routes/{agent_id}/save so ToolGate can approve risky model routes.",
+                        "approval_reasons": risk["reasons"],
+                    },
+                )
     item.update(_sanitize_agent_profile({key: value for key, value in payload.items() if key in allowed}))
     item["updated_at"] = now()
     _save_registry_item("agent", item)
@@ -4846,6 +5114,8 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
                 job["updated_at"] = now()
                 _save_registry_item("job", job)
                 result["automation_status"] = "rejected"
+    if result.get("kind") == "model_route_change" and request_payload.get("subject_type") == "model_route":
+        _apply_model_route_request(result, decision)
     _record_activity(
         "agent_pi_operator",
         event_type="approval.decided",

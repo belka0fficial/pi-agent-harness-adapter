@@ -435,6 +435,139 @@ def test_model_route_plan_disables_empty_fallback(monkeypatch, tmp_path):
     assert payload["fallback_policy"]["automatic_fallback"] is False
 
 
+class ModelRouteGates:
+    def __init__(self):
+        self.requests = {}
+
+    def create_admin_request(self, *, kind: str, title: str, details: str, payload: dict, severity: str = "warning"):
+        request_id = f"req-{len(self.requests) + 1}"
+        record = {
+            "id": request_id,
+            "kind": kind,
+            "title": title,
+            "details": details,
+            "payload": payload,
+            "severity": severity,
+            "status": "pending",
+        }
+        self.requests[request_id] = record
+        return record
+
+    def request_status(self, request_id: str):
+        return self.requests.get(request_id)
+
+    def decide_approval(self, request_id: str, decision: str):
+        record = {**self.requests[request_id], "status": decision, "decision": {"actor": "admin"}}
+        self.requests[request_id] = record
+        return record
+
+
+def _prepare_model_route_test(monkeypatch, tmp_path):
+    class Result:
+        stdout = (
+            "provider      model                context  max-out  thinking  images\n"
+            "openai-codex  gpt-5.6-luna         272K     128K     yes       yes\n"
+            "openai-codex  gpt-5.6-sol          272K     128K     yes       yes\n"
+            "openrouter    stealth/ox-alpha     128K     16K      yes       no\n"
+        )
+
+    monkeypatch.setattr("adapter.main.subprocess.run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr("adapter.main.model_providers", lambda: {"providers": [
+        {"id": "openai-codex", "name": "Pi adapter", "status": "ok", "configured": True, "models_visible": True},
+        {"id": "openrouter", "name": "OpenRouter", "status": "ok", "configured": True, "models_visible": True},
+    ]})
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    app.state.agents = {}
+    app.state.teams = {}
+    app.state.model_route_proposals = {}
+    app.state.approval_runs = {}
+    app.state.gates = ModelRouteGates()
+    main._ensure_registry_seeded()
+
+
+def test_model_route_save_requires_toolgate_approval_for_external_route(monkeypatch, tmp_path):
+    _prepare_model_route_test(monkeypatch, tmp_path)
+    original_fallback = app.state.agents["agent_pi_operator"].get("fallback_model", "")
+    with TestClient(app) as client:
+        response = client.post("/api/model/routes/agent_pi_operator/save", json={
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-luna",
+            "fallback_provider": "openrouter",
+            "fallback_model": "stealth/ox-alpha",
+            "reason": "try helper route without secrets api_key=abc http://private.invalid",
+        })
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "pending_approval"
+    assert payload["requires_approval"] is True
+    assert payload["request_id"] == "req-1"
+    assert app.state.agents["agent_pi_operator"].get("fallback_model", "") == original_fallback
+    request = app.state.gates.requests["req-1"]
+    assert request["kind"] == "model_route_change"
+    assert request["payload"]["subject_type"] == "model_route"
+    assert request["payload"]["route_digest"]
+    assert "external provider" in " ".join(request["payload"]["approval_reasons"])
+    forbidden = str(request).lower()
+    assert "api_key=abc" not in forbidden
+    assert "private.invalid" not in forbidden
+    assert "base_url" not in forbidden
+    assert "provider_url" not in forbidden
+
+
+def test_model_route_approval_applies_pending_route_and_rejection_does_not(monkeypatch, tmp_path):
+    _prepare_model_route_test(monkeypatch, tmp_path)
+    with TestClient(app) as client:
+        pending = client.post("/api/model/routes/agent_pi_operator/save", json={
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-luna",
+            "fallback_provider": "openrouter",
+            "fallback_model": "stealth/ox-alpha",
+        }).json()
+        decision = client.post(f"/api/approvals/{pending['request_id']}/decision", json={"decision": "approved"})
+
+    assert decision.status_code == 200
+    assert decision.json()["model_route_status"] == "applied"
+    assert app.state.agents["agent_pi_operator"]["fallback_provider"] == "openrouter"
+    assert app.state.agents["agent_pi_operator"]["fallback_model"] == "stealth/ox-alpha"
+
+    _prepare_model_route_test(monkeypatch, tmp_path / "reject")
+    with TestClient(app) as client:
+        pending = client.post("/api/model/routes/agent_pi_operator/save", json={
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-luna",
+            "fallback_provider": "openrouter",
+            "fallback_model": "stealth/ox-alpha",
+        }).json()
+        decision = client.post(f"/api/approvals/{pending['request_id']}/decision", json={"decision": "rejected"})
+
+    assert decision.status_code == 200
+    assert decision.json()["model_route_status"] == "rejected"
+    assert app.state.agents["agent_pi_operator"].get("fallback_provider", "") != "openrouter"
+
+
+def test_agent_patch_cannot_bypass_external_model_route_approval(monkeypatch, tmp_path):
+    _prepare_model_route_test(monkeypatch, tmp_path)
+    with TestClient(app) as client:
+        denied = client.patch("/api/agents/agent_pi_operator", json={
+            "fallback_provider": "openrouter",
+            "fallback_model": "stealth/ox-alpha",
+        })
+        safe = client.post("/api/model/routes/agent_pi_operator/save", json={
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-sol",
+            "fallback_provider": "",
+            "fallback_model": "",
+        })
+
+    assert denied.status_code == 409
+    assert denied.json()["detail"]["code"] == "MODEL_ROUTE_APPROVAL_REQUIRED"
+    assert safe.status_code == 200
+    assert safe.json()["status"] == "applied"
+    assert app.state.agents["agent_pi_operator"]["primary_model"] == "gpt-5.6-sol"
+
+
 def test_freellmapi_provider_status_uses_health_and_redacts_urls(monkeypatch):
     class Response:
         def __init__(self, status_code, payload):
