@@ -74,6 +74,7 @@ class AccessBoundaryRepairInput(BaseModel):
     team_id: str | None = None
     scope: str = "all"
     dry_run: bool = False
+    cleanup_orphans: bool = False
 
 
 class MemoryCandidateInput(BaseModel):
@@ -1943,6 +1944,91 @@ def _label_matches_memory_context(label: Any, agent_id: str, team_id: str | None
     return normalized == f"agentgate:{memory_actor_id}"
 
 
+def _agentgate_label_context(label: Any) -> dict[str, str | None] | None:
+    text = " ".join(str(label or "").strip().split())
+    lowered = text.lower()
+    if not lowered.startswith("agentgate:"):
+        return None
+    rest = text.split(":", 1)[1].strip()
+    if not rest:
+        return None
+    agent_id, _, team_id = rest.partition("@")
+    agent_id = agent_id.strip()
+    team_id = team_id.strip()
+    if not agent_id:
+        return None
+    return {
+        "agent_id": agent_id,
+        "team_id": team_id or None,
+        "canonical": f"agentgate:{agent_id.lower()}@{team_id.lower()}" if team_id else f"agentgate:{agent_id.lower()}",
+    }
+
+
+def _expected_agentgate_native_labels(kind: str) -> set[str]:
+    expected: set[str] = set()
+    for agent_id in app.state.agents:
+        contexts = _expected_toolgate_contexts_for_actor(agent_id) if kind == "toolgate" else _expected_memory_contexts_for_actor(agent_id)
+        for context in contexts:
+            if not context.get("scopes"):
+                continue
+            team_id = str(context.get("team_id") or "").strip()
+            expected.add(f"agentgate:{agent_id.lower()}@{team_id.lower()}" if team_id else f"agentgate:{agent_id.lower()}")
+    return expected
+
+
+def _native_access_orphans(toolgate_keys: list[dict[str, Any]], memorygate_keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    expected_toolgate = _expected_agentgate_native_labels("toolgate")
+    expected_memorygate = _expected_agentgate_native_labels("memorygate")
+    rows: list[dict[str, Any]] = []
+    toolgate_label_counts: dict[str, int] = {}
+    memorygate_label_counts: dict[str, int] = {}
+    for key in toolgate_keys:
+        context = _agentgate_label_context(key.get("name") or key.get("label"))
+        if context and str(key.get("status") or "active") == "active":
+            toolgate_label_counts[str(context["canonical"])] = toolgate_label_counts.get(str(context["canonical"]), 0) + 1
+    for key in memorygate_keys:
+        context = _agentgate_label_context(key.get("label"))
+        if context and not bool(key.get("revoked")):
+            memorygate_label_counts[str(context["canonical"])] = memorygate_label_counts.get(str(context["canonical"]), 0) + 1
+    for key in toolgate_keys:
+        label = key.get("name") or key.get("label")
+        context = _agentgate_label_context(label)
+        status = str(key.get("status") or "active")
+        if not context or status != "active" or context["canonical"] in expected_toolgate:
+            continue
+        duplicate = toolgate_label_counts.get(str(context["canonical"]), 0) > 1
+        rows.append({
+            "gate": "toolgate",
+            "key_id": str(key.get("id") or ""),
+            "label": _safe_summary(label or "AgentGate key", limit=120),
+            "agent_id": context["agent_id"],
+            "team_id": context["team_id"],
+            "status": "unsafe_to_touch" if duplicate else "orphaned",
+            "safe_to_cleanup": not duplicate,
+            "reason": "duplicate AgentGate-owned ToolGate labels require manual review" if duplicate else "AgentGate-owned ToolGate key has no matching registry tool context",
+        })
+    for key in memorygate_keys:
+        label = key.get("label")
+        context = _agentgate_label_context(label)
+        if not context or bool(key.get("revoked")) or context["canonical"] in expected_memorygate:
+            continue
+        duplicate = memorygate_label_counts.get(str(context["canonical"]), 0) > 1
+        mismatched_actor = str(key.get("agent_id") or "") != _memory_actor_id(str(context["agent_id"]), context["team_id"])
+        unsafe = duplicate or mismatched_actor
+        rows.append({
+            "gate": "memorygate",
+            "key_id": str(key.get("id") or ""),
+            "label": _safe_summary(label or "AgentGate key", limit=120),
+            "agent_id": context["agent_id"],
+            "team_id": context["team_id"],
+            "status": "unsafe_to_touch" if unsafe else "orphaned",
+            "safe_to_cleanup": not unsafe,
+            "reason": "duplicate or mismatched AgentGate-owned MemoryGate key requires manual review" if unsafe else "AgentGate-owned MemoryGate key has no matching registry memory context",
+        })
+    rows.sort(key=lambda row: (row["gate"], row["label"]))
+    return rows
+
+
 def _native_access_boundaries() -> dict[str, Any]:
     _ensure_registry_seeded()
     try:
@@ -1960,6 +2046,7 @@ def _native_access_boundaries() -> dict[str, Any]:
     rows = []
     toolgate_context_rows = []
     memorygate_context_rows = []
+    orphan_rows = _native_access_orphans(toolgate_keys, memorygate_keys)
     for agent_id, agent in sorted(app.state.agents.items()):
         expected_tool_scopes = _expected_toolgate_scopes_for_actor(agent_id)
         expected_tool_contexts = _expected_toolgate_contexts_for_actor(agent_id)
@@ -2134,10 +2221,16 @@ def _native_access_boundaries() -> dict[str, Any]:
             "memorygate_contexts_drift": sum(1 for row in memorygate_context_rows if row["status"] != "ready"),
             "toolgate_inventory": "ok" if toolgate_available else "unavailable",
             "memorygate_inventory": "ok" if memorygate_available else "unavailable",
+            "orphaned_keys": sum(1 for row in orphan_rows if row["status"] == "orphaned"),
+            "unsafe_to_touch": sum(1 for row in orphan_rows if row["status"] == "unsafe_to_touch"),
         },
         "agents": rows,
         "toolgate_contexts": toolgate_context_rows,
         "memorygate_contexts": memorygate_context_rows,
+        "orphaned_keys": [
+            {key: value for key, value in row.items() if key != "key_id"}
+            for row in orphan_rows
+        ],
     }
 
 
@@ -2311,6 +2404,74 @@ def _repair_native_access_boundaries(payload: AccessBoundaryRepairInput | None =
             "errors": repaired["errors"][:6],
         },
         "contexts": context_rows[:40],
+    }
+
+
+def _cleanup_native_access_orphans(payload: AccessBoundaryRepairInput | None = None) -> dict[str, Any]:
+    _ensure_registry_seeded()
+    payload = payload or AccessBoundaryRepairInput(dry_run=True)
+    scope = str(payload.scope or "all").strip().lower().replace("-", "_")
+    if scope not in {"all", "toolgate", "memorygate"}:
+        raise HTTPException(422, "scope must be all, toolgate, or memorygate")
+    try:
+        toolgate_keys = app.state.gates.toolgate_agent_keys()
+        memorygate_keys = app.state.gates.memorygate_agent_keys()
+    except (RuntimeError, AttributeError) as exc:
+        raise HTTPException(503, "gate key inventory unavailable") from exc
+    candidates = [
+        row for row in _native_access_orphans(toolgate_keys, memorygate_keys)
+        if row.get("safe_to_cleanup")
+        and (scope == "all" or row.get("gate") == scope)
+        and (not payload.agent_id or row.get("agent_id") == payload.agent_id)
+        and (not payload.team_id or row.get("team_id") == payload.team_id)
+    ]
+    cleaned = 0
+    errors: list[str] = []
+    for row in candidates:
+        if payload.dry_run:
+            continue
+        try:
+            if row["gate"] == "toolgate":
+                app.state.gates.revoke_toolgate_agent_key(str(row.get("key_id") or ""))
+                app.state.gates.forget_toolgate_agent_execution_key(str(row["agent_id"]), team_id=row.get("team_id"))
+            elif row["gate"] == "memorygate":
+                app.state.gates.revoke_memorygate_agent_key(str(row.get("key_id") or ""))
+                app.state.gates.forget_memorygate_agent_read_key(str(row["agent_id"]), team_id=row.get("team_id"))
+            cleaned += 1
+        except (RuntimeError, AttributeError) as exc:
+            errors.append(_safe_summary(f"{row['gate']} orphan cleanup failed for {row['label']}: {exc}", limit=140))
+    if not payload.dry_run:
+        _record_activity(
+            "agent_pi_operator",
+            event_type="access_boundaries.orphan_cleanup",
+            status="completed" if not errors else "partial",
+            source="AgentGate",
+            summary=f"Access boundary orphan cleanup revoked {cleaned} AgentGate-owned native key records",
+            ref_type="system",
+            ref_id="access_boundaries",
+        )
+    fresh_orphans = _native_access_orphans(
+        app.state.gates.toolgate_agent_keys(),
+        app.state.gates.memorygate_agent_keys(),
+    ) if not payload.dry_run else _native_access_orphans(toolgate_keys, memorygate_keys)
+    return {
+        "status": "dry_run" if payload.dry_run else "ok" if not errors else "partial",
+        "dry_run": bool(payload.dry_run),
+        "metadata_only": True,
+        "safe_metadata_only": True,
+        "credentials_included": False,
+        "summary": {
+            "orphaned": sum(1 for row in fresh_orphans if row["status"] == "orphaned"),
+            "unsafe_to_touch": sum(1 for row in fresh_orphans if row["status"] == "unsafe_to_touch"),
+            "would_clean": len(candidates) if payload.dry_run else 0,
+            "cleaned": cleaned,
+            "failed": len(errors),
+        },
+        "orphans": [
+            {key: value for key, value in row.items() if key != "key_id"}
+            for row in fresh_orphans[:40]
+        ],
+        "errors": errors[:6],
     }
 
 
@@ -5328,6 +5489,11 @@ def agentgate_system():
 @app.post("/api/system/access-boundaries/repair")
 def repair_agentgate_access_boundaries(payload: AccessBoundaryRepairInput | None = None):
     return _repair_native_access_boundaries(payload)
+
+
+@app.post("/api/system/access-boundaries/orphans/cleanup")
+def cleanup_agentgate_access_boundary_orphans(payload: AccessBoundaryRepairInput | None = None):
+    return _cleanup_native_access_orphans(payload)
 
 
 @app.get("/api/approvals")

@@ -231,6 +231,14 @@ class FakeGates:
             if key != agent_id and not key.startswith(prefix)
         }
 
+    def revoke_toolgate_agent_key(self, key_id: str):
+        self.revoked_toolgate_key_ids = [*getattr(self, "revoked_toolgate_key_ids", []), key_id]
+        self.toolgate_keys = [
+            {**row, "status": "revoked"} if row.get("id") == key_id else row
+            for row in getattr(self, "toolgate_keys", [])
+        ]
+        return {"ok": True}
+
     def memorygate_agent_keys(self):
         return getattr(self, "memorygate_keys", [])
 
@@ -268,6 +276,14 @@ class FakeGates:
             for item in getattr(self, "memorygate_private_keys", set())
             if item != agent_id and not item.startswith(prefix)
         }
+
+    def revoke_memorygate_agent_key(self, key_id: str):
+        self.revoked_memorygate_key_ids = [*getattr(self, "revoked_memorygate_key_ids", []), key_id]
+        self.memorygate_keys = [
+            {**row, "revoked": True} if row.get("id") == key_id else row
+            for row in getattr(self, "memorygate_keys", [])
+        ]
+        return {"status": "ok"}
 
 
 def reset_state():
@@ -704,6 +720,59 @@ def test_system_access_boundary_repair_syncs_native_gate_contexts_without_keys(m
     assert app.state.gates.memorygate_private_keys
     assert not any(
         word in str(repaired).lower()
+        for word in ["tgx_", "mg_read_", "api_key", "password", "secret", "bearer"]
+    )
+
+
+def test_system_access_boundary_orphan_cleanup_is_metadata_only_and_conservative(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.gates.toolgate_keys = [
+        {"id": "tg-orphan", "name": "AgentGate:agent_old", "status": "active", "scopes": ["tool:old"]},
+        {"id": "tg-dup-1", "name": "AgentGate:agent_duplicate", "status": "active", "scopes": ["tool:a"]},
+        {"id": "tg-dup-2", "name": "AgentGate:agent_duplicate", "status": "active", "scopes": ["tool:b"]},
+        {"id": "tg-bootstrap", "name": "AgentGate Pi", "status": "active", "scopes": ["tool:*"]},
+    ]
+    app.state.gates.memorygate_keys = [
+        {"id": "mg-orphan", "label": "AgentGate:agent_old", "agent_id": "agent_old", "revoked": False},
+        {"id": "mg-unsafe", "label": "AgentGate:agent_bad", "agent_id": "other_actor", "revoked": False},
+        {"id": "mg-revoked", "label": "AgentGate:agent_revoked", "agent_id": "agent_revoked", "revoked": True},
+    ]
+    app.state.gates.toolgate_private_keys = {"agent_old": "tgx_fake_private_key_agent_old_1234567890"}
+    app.state.gates.memorygate_private_keys = {"agent_old"}
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        system = client.get("/api/system").json()["access_boundaries"]
+        dry = client.post(
+            "/api/system/access-boundaries/orphans/cleanup",
+            json={"scope": "all", "dry_run": True},
+        ).json()
+        dry_revoked_toolgate = getattr(app.state.gates, "revoked_toolgate_key_ids", [])
+        dry_revoked_memorygate = getattr(app.state.gates, "revoked_memorygate_key_ids", [])
+        live = client.post(
+            "/api/system/access-boundaries/orphans/cleanup",
+            json={"scope": "all", "dry_run": False},
+        ).json()
+        after = client.get("/api/system").json()["access_boundaries"]
+
+    assert system["summary"]["orphaned_keys"] == 2
+    assert system["summary"]["unsafe_to_touch"] == 3
+    assert all("key_id" not in row for row in system["orphaned_keys"])
+    assert not any(row["label"] == "AgentGate Pi" for row in system["orphaned_keys"])
+    assert dry["summary"]["would_clean"] == 2
+    assert dry_revoked_toolgate == []
+    assert dry_revoked_memorygate == []
+    assert live["summary"]["cleaned"] == 2
+    assert app.state.gates.revoked_toolgate_key_ids == ["tg-orphan"]
+    assert app.state.gates.revoked_memorygate_key_ids == ["mg-orphan"]
+    assert "agent_old" not in app.state.gates.toolgate_private_keys
+    assert "agent_old" not in app.state.gates.memorygate_private_keys
+    assert after["summary"]["orphaned_keys"] == 0
+    assert after["summary"]["unsafe_to_touch"] == 3
+    assert not any(
+        word in str(live).lower()
         for word in ["tgx_", "mg_read_", "api_key", "password", "secret", "bearer"]
     )
 

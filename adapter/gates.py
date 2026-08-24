@@ -547,10 +547,24 @@ class GateClients:
         )
         return payload if isinstance(payload, dict) else {}
 
+    def revoke_toolgate_agent_key(self, key_id: str) -> dict[str, Any]:
+        clean_id = str(key_id or "").strip()
+        if not clean_id:
+            raise RuntimeError("toolgate key id is unavailable")
+        payload = self._request("toolgate", f"/v2/agent-keys/{clean_id}", method="DELETE")
+        return payload if isinstance(payload, dict) else {}
+
     def memorygate_agent_keys(self) -> list[dict[str, Any]]:
         payload = self._request("memorygate", "/auth/agent-keys")
         rows = payload if isinstance(payload, list) else payload.get("results", payload.get("keys", []))
         return [row for row in rows if isinstance(row, dict)]
+
+    def revoke_memorygate_agent_key(self, key_id: str) -> dict[str, Any]:
+        clean_id = str(key_id or "").strip()
+        if not clean_id:
+            raise RuntimeError("memorygate key id is unavailable")
+        payload = self._request("memorygate", f"/auth/agent-keys/{clean_id}/revoke", method="POST")
+        return payload if isinstance(payload, dict) else {}
 
     def memorygate_audit_metrics(self, *, hours: int = 24) -> dict[str, Any]:
         payload = self._request("memorygate", f"/audit/metrics?hours={max(1, min(int(hours or 24), 168))}")
