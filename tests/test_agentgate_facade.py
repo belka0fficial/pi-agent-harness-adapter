@@ -2251,6 +2251,52 @@ def test_system_access_boundary_repair_syncs_native_gate_contexts_without_keys(m
     )
 
 
+def test_system_access_boundary_repair_dry_run_does_not_create_keys(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.gates.toolgate_keys = []
+    app.state.gates.memorygate_keys = []
+    app.state.gates.toolgate_private_keys = {}
+    app.state.gates.toolgate_private_key_scopes = {}
+    app.state.gates.memorygate_private_keys = set()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = ["echo"]
+        app.state.agents["agent_pi_operator"]["memory_scopes"] = ["briefing"]
+        app.state.teams["team_core"]["tool_ids"] = ["approval.test-echo"]
+        app.state.teams["team_core"]["memory_scopes"] = ["project-context"]
+        before = client.get("/api/system").json()["access_boundaries"]["summary"]
+        preview = client.post(
+            "/api/system/access-boundaries/repair",
+            json={"scope": "all", "dry_run": True},
+        ).json()
+        after = client.get("/api/system").json()["access_boundaries"]["summary"]
+
+    assert before["drift"] == 1
+    assert preview["status"] == "dry_run"
+    assert preview["dry_run"] is True
+    assert preview["metadata_only"] is True
+    assert preview["credentials_included"] is False
+    assert preview["before"] == before
+    assert preview["after"] == before
+    assert after == before
+    assert preview["repair"]["toolgate_contexts_checked"] == 2
+    assert preview["repair"]["memorygate_contexts_checked"] == 2
+    assert preview["repair"]["toolgate_contexts_repaired"] == 0
+    assert preview["repair"]["memorygate_contexts_repaired"] == 0
+    assert {row["toolgate"] for row in preview["contexts"] if row["toolgate"] != "not_requested"} == {"would_repair"}
+    assert {row["memorygate"] for row in preview["contexts"] if row["memorygate"] != "not_requested"} == {"would_repair"}
+    assert app.state.gates.toolgate_private_keys == {}
+    assert app.state.gates.toolgate_private_key_scopes == {}
+    assert app.state.gates.memorygate_private_keys == set()
+    assert not any(
+        word in str(preview).lower()
+        for word in ["tgx_", "mg_read_", "api_key", "password", "secret", "bearer"]
+    )
+
+
 def test_system_access_boundary_orphan_cleanup_is_metadata_only_and_conservative(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
