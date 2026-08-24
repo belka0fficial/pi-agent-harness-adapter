@@ -413,6 +413,14 @@ def _owner_token() -> str:
     return os.environ.get("AGENTGATE_OWNER_TOKEN", "").strip()
 
 
+def _owner_auth_configured() -> bool:
+    return len(_owner_token()) >= 32
+
+
+def _testing_auth_bypass_enabled() -> bool:
+    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
 def _extract_owner_token(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
@@ -425,10 +433,18 @@ async def require_owner_token(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in {"/health", "/health/detailed"}:
         return await call_next(request)
     expected = _owner_token()
-    if expected and not os.environ.get("PYTEST_CURRENT_TEST"):
+    if not _testing_auth_bypass_enabled() and not expected:
+        return JSONResponse(
+            {
+                "detail": "owner authentication is not configured",
+                "status": "unavailable",
+            },
+            status_code=503,
+        )
+    if expected and not _testing_auth_bypass_enabled():
         provided = _extract_owner_token(request)
         if not provided or not hmac.compare_digest(provided, expected):
-            return JSONResponse({"detail": "owner token required"}, status_code=401)
+            return JSONResponse({"detail": "owner authentication required"}, status_code=401)
     return await call_next(request)
 
 
@@ -3779,12 +3795,21 @@ def stop_scheduler():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "pi-agent-harness-adapter"}
+    return {
+        "status": "ok",
+        "service": "pi-agent-harness-adapter",
+        "owner_auth": "configured" if _owner_auth_configured() else "missing",
+    }
 
 
 @app.get("/health/detailed")
 def detailed_health():
-    return {"status": "ok", "service": "pi-agent-harness-adapter", "pi": "configured"}
+    return {
+        "status": "ok",
+        "service": "pi-agent-harness-adapter",
+        "pi": "configured",
+        "owner_auth": "configured" if _owner_auth_configured() else "missing",
+    }
 
 
 @app.post("/api/sessions")
@@ -8315,6 +8340,22 @@ def _verification_snapshot() -> dict[str, Any]:
         detail={
             "services": sorted(health),
             "unhealthy_count": len(unhealthy),
+        },
+    ))
+
+    owner_auth_ready = _owner_auth_configured()
+    checks.append(_verification_check(
+        "owner-authentication",
+        "Owner authentication",
+        "pass" if owner_auth_ready else "fail",
+        "Owner authentication is configured for protected AgentGate APIs." if owner_auth_ready else "Owner authentication is missing or too short; protected APIs fail closed outside tests.",
+        source="AgentGate",
+        severity="critical" if not owner_auth_ready else "info",
+        detail={
+            "configured": owner_auth_ready,
+            "minimum_length": 32,
+            "runtime_behavior": "protected_apis_fail_closed",
+            "test_bypass": "pytest_only" if _testing_auth_bypass_enabled() else "off",
         },
     ))
 

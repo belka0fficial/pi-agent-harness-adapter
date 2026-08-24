@@ -379,6 +379,42 @@ def test_agentgate_facade_decides_toolgate_approval():
     assert response.json()["status"] == "approved"
 
 
+def test_owner_auth_fails_closed_when_not_configured(monkeypatch):
+    reset_state()
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("AGENTGATE_OWNER_TOKEN", raising=False)
+
+    with TestClient(app) as client:
+        health = client.get("/health").json()
+        response = client.get("/api/home")
+
+    assert health["owner_auth"] == "missing"
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "owner authentication is not configured",
+        "status": "unavailable",
+    }
+
+
+def test_owner_auth_requires_matching_bearer_without_echoing_secret(monkeypatch):
+    reset_state()
+    owner_secret = "a" * 40
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+
+    with TestClient(app) as client:
+        health = client.get("/health").json()
+        rejected = client.get("/api/home", headers={"Authorization": "Bearer wrong"})
+        accepted = client.get("/api/home", headers={"Authorization": f"Bearer {owner_secret}"})
+
+    assert health["owner_auth"] == "configured"
+    assert rejected.status_code == 401
+    assert rejected.json() == {"detail": "owner authentication required"}
+    assert accepted.status_code == 200
+    combined = f"{health} {rejected.text} {accepted.text}"
+    assert owner_secret not in combined
+
+
 def test_agent_registry_persists_to_sqlite(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
@@ -1547,6 +1583,8 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
 def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    owner_secret = "b" * 40
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
     reset_state()
     app.state.gates.toolgate_keys = [
         {
@@ -1602,6 +1640,7 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
     check_ids = {item["id"] for item in snapshot["checks"]}
     assert {
         "service-health",
+        "owner-authentication",
         "listener-scope",
         "access-boundaries",
         "team-execution-policy-boundary",
@@ -1609,6 +1648,10 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
         "model-provider-metadata",
         "automation-approval-boundary",
     } <= check_ids
+    owner_auth = next(item for item in snapshot["checks"] if item["id"] == "owner-authentication")
+    assert owner_auth["status"] == "pass"
+    assert owner_auth["detail"]["configured"] is True
+    assert owner_secret not in str(owner_auth)
     access = next(item for item in snapshot["checks"] if item["id"] == "access-boundaries")
     assert access["detail"]["drift"] == 0
     assert system["verification"]["schema"] == snapshot["schema"]
