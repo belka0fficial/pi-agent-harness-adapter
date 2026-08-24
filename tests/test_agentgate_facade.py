@@ -4911,7 +4911,7 @@ def test_workstream_tool_draft_controls_are_metadata_only(monkeypatch, tmp_path)
         pending = client.post(
             "/api/tool-drafts",
             json={
-                "title": "Private shell helper",
+                "title": "Private shell helper token=title-secret password=bad /home/alexeybe1kin/private raw_command=rm",
                 "purpose": "Never expose token=tool-secret https://tool.example/path raw command arguments.",
                 "proposed_tool_id": "Private Shell Helper",
                 "risk": "high",
@@ -4945,7 +4945,11 @@ def test_workstream_tool_draft_controls_are_metadata_only(monkeypatch, tmp_path)
     joined = json.dumps(draft_detail.json()).lower()
     for forbidden in [
         "tool-secret",
+        "title-secret",
+        "password=bad",
         "https://tool.example",
+        "/home/alexeybe1kin",
+        "raw_command",
         "raw command",
         "/api/tool-drafts",
         "/v2/",

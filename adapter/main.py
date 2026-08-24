@@ -4309,8 +4309,11 @@ def _sanitize_tool_id(value: Any) -> str:
 def _redact_tool_draft_text(value: Any, *, limit: int) -> str:
     text = _safe_text(value, limit=limit)
     patterns = [
-        (r"(?i)\b(api[_-]?key|token|password|secret)\s*[:=]\s*\S+", r"\1=[redacted]"),
+        (r"(?i)\b(api[_-]?key|token|password|secret|credential)\s*[:=]\s*\S+", "[redacted-secret]"),
         (r"https?://\S+", "[redacted-url]"),
+        (r"(?i)\b(file|path|asset|workspace|folder|directory)\s*[:=]\s*\S+", "[redacted-path]"),
+        (r"(?<!\w)(?:/home|/app|/tmp|/var|/etc|/usr|~)/\S+", "[redacted-path]"),
+        (r"(?i)\b(raw[_-]?command|command|shell|script)\s*[:=]\s*\S+", "[redacted-command]"),
         (r"(?i)raw command arguments?", "redacted command details"),
     ]
     for pattern, replacement in patterns:
