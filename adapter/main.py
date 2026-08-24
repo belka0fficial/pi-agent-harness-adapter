@@ -472,10 +472,18 @@ AGENT_VOICE_PROFILE_FIELDS = {
 AGENT_PROFILE_PROVENANCE_FIELDS = {
     "origin_mode": 40,
     "review_status": 40,
+    "source_type": 40,
+    "source_confidence": 40,
+    "usage_policy": 80,
+    "asset_review_status": 40,
     "notes_summary": 600,
 }
 
 AGENT_PROFILE_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed"}
+AGENT_PROFILE_SOURCE_TYPES = {"owner_notes", "image_notes", "search_notes", "character_reference", "professional", "mixed"}
+AGENT_PROFILE_CONFIDENCE_LEVELS = {"unknown", "low", "medium", "high", "owner_verified"}
+AGENT_PROFILE_USAGE_POLICIES = {"private_only", "transformative", "original", "reference_only", "needs_review"}
+AGENT_PROFILE_ASSET_REVIEW_STATUSES = {"none", "text_only", "needs_review", "approved_metadata", "blocked"}
 
 TEAM_ORCHESTRATOR_POLICY_FIELDS = {
     "handoff_mode": 40,
@@ -548,14 +556,30 @@ def _safe_profile_provenance(value: Any) -> dict[str, Any]:
         text = _redact_profile_metadata_text(source.get(key), limit=limit)
         if key == "review_status" and text not in AGENT_PROFILE_REVIEW_STATUSES:
             text = "unreviewed"
+        if key == "source_type" and text not in AGENT_PROFILE_SOURCE_TYPES:
+            text = "owner_notes"
+        if key == "source_confidence" and text not in AGENT_PROFILE_CONFIDENCE_LEVELS:
+            text = "unknown"
+        if key == "usage_policy" and text not in AGENT_PROFILE_USAGE_POLICIES:
+            text = "needs_review"
+        if key == "asset_review_status" and text not in AGENT_PROFILE_ASSET_REVIEW_STATUSES:
+            text = "needs_review"
         if text:
             result[key] = text
     labels = _safe_profile_list(source.get("source_labels"), limit=8, item_limit=120)
     labels = [_redact_profile_metadata_text(label, limit=120) for label in labels]
     if labels:
         result["source_labels"] = labels
+    checklist = _safe_profile_list(source.get("review_checklist"), limit=12, item_limit=160)
+    checklist = [_redact_profile_metadata_text(item, limit=160) for item in checklist]
+    if checklist:
+        result["review_checklist"] = checklist
     if result:
         result.setdefault("review_status", "unreviewed")
+        result.setdefault("source_type", "owner_notes")
+        result.setdefault("source_confidence", "unknown")
+        result.setdefault("usage_policy", "needs_review")
+        result.setdefault("asset_review_status", "needs_review")
     return result
 
 
@@ -578,6 +602,12 @@ def _agent_profile_readiness(item: dict[str, Any]) -> dict[str, Any]:
     risk_notes = []
     if not checks["source_review"]:
         risk_notes.append("source_review_pending")
+    if provenance.get("source_confidence") in {"unknown", "low"}:
+        risk_notes.append("source_confidence_low")
+    if provenance.get("usage_policy") == "needs_review":
+        risk_notes.append("usage_policy_pending")
+    if provenance.get("asset_review_status") in {"needs_review", "blocked"}:
+        risk_notes.append("asset_review_pending")
     if not checks["model_route"]:
         risk_notes.append("model_route_missing")
     if not checks["memory_scope"]:

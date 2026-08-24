@@ -495,8 +495,18 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
                 "profile_provenance": {
                     "origin_mode": "owner_notes",
                     "review_status": "owner_reviewed",
+                    "source_type": "character_reference",
+                    "source_confidence": "owner_verified",
+                    "usage_policy": "transformative",
+                    "asset_review_status": "approved_metadata",
                     "source_labels": ["owner seed", "https://private.example/profile"],
                     "notes_summary": "Drafted from token=abc123 owner notes.",
+                    "review_checklist": [
+                        "No copied source text",
+                        "URL https://private.example/lore redacted",
+                        "token=abc123 redacted",
+                    ],
+                    "raw_source_page": "should-not-persist",
                 },
                 "story": "A studio guide for agent identity drafts.",
             },
@@ -541,8 +551,18 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
         "motion_style": "small idle gestures",
     }
     assert created.json()["profile_provenance"]["review_status"] == "owner_reviewed"
+    assert created.json()["profile_provenance"]["source_type"] == "character_reference"
+    assert created.json()["profile_provenance"]["source_confidence"] == "owner_verified"
+    assert created.json()["profile_provenance"]["usage_policy"] == "transformative"
+    assert created.json()["profile_provenance"]["asset_review_status"] == "approved_metadata"
     assert created.json()["profile_provenance"]["source_labels"] == ["owner seed", "[redacted-url]"]
+    assert created.json()["profile_provenance"]["review_checklist"] == [
+        "No copied source text",
+        "URL [redacted-url] redacted",
+        "token=[redacted] redacted",
+    ]
     assert "token=abc123" not in created.json()["profile_provenance"]["notes_summary"]
+    assert "raw_source_page" not in created.json()["profile_provenance"]
     assert patched.status_code == 200
     assert patched.json()["personality"] == ["steady", "playful"]
     assert patched.json()["appearance"] == {
