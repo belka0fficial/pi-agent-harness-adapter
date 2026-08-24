@@ -206,6 +206,34 @@ class WorkroomHandoffInput(BaseModel):
     owner_checkpoint: bool = True
 
 
+class AppWorkspaceInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    status: str = "draft"
+    owner_agent_id: str = "agent_pi_operator"
+    team_id: str | None = None
+    purpose: str = Field(default="", max_length=1000)
+    app_type: str = Field(default="", max_length=80)
+    risk_level: str = "medium"
+    required_tool_ids: list[str] = Field(default_factory=list)
+    required_memory_scopes: list[str] = Field(default_factory=list)
+    review_status: str = Field(default="unreviewed", max_length=80)
+    progress_summary: str = Field(default="", max_length=600)
+
+
+class AppWorkspaceUpdateInput(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    status: str | None = None
+    owner_agent_id: str | None = None
+    team_id: str | None = None
+    purpose: str | None = Field(default=None, max_length=1000)
+    app_type: str | None = Field(default=None, max_length=80)
+    risk_level: str | None = None
+    required_tool_ids: list[str] | None = None
+    required_memory_scopes: list[str] | None = None
+    review_status: str | None = Field(default=None, max_length=80)
+    progress_summary: str | None = Field(default=None, max_length=600)
+
+
 TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
     "persona-development": {
         "id": "persona-development",
@@ -268,6 +296,7 @@ app.state.messages = {}
 app.state.jobs = {}
 app.state.tasks = {}
 app.state.tool_drafts = {}
+app.state.app_workspaces = {}
 app.state.model_route_proposals = {}
 app.state.notification_channels = {}
 app.state.active_runs = {}
@@ -371,6 +400,7 @@ def _load_registry() -> None:
     app.state.jobs = {}
     app.state.tasks = {}
     app.state.tool_drafts = {}
+    app.state.app_workspaces = {}
     app.state.model_route_proposals = {}
     app.state.notification_channels = {}
     app.state.memory_candidates = {}
@@ -389,6 +419,8 @@ def _load_registry() -> None:
             app.state.tasks[row["id"]] = item
         elif row["kind"] == "tool_draft":
             app.state.tool_drafts[row["id"]] = item
+        elif row["kind"] == "app_workspace":
+            app.state.app_workspaces[row["id"]] = item
         elif row["kind"] == "model_route_proposal":
             app.state.model_route_proposals[row["id"]] = item
         elif row["kind"] == "notification_channel":
@@ -419,7 +451,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "model_route_proposal", "notification_channel", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "model_route_proposal", "notification_channel", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -435,7 +467,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "notification_channel", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "notification_channel", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -1411,6 +1443,20 @@ def _object_workstream_events() -> list[dict[str, Any]]:
             ref_type="tool_draft",
             ref_id=item.get("id"),
         ))
+    for item in getattr(app.state, "app_workspaces", {}).values():
+        rows.append(_workstream_event(
+            event_id=f"app_workspace:{item.get('id')}",
+            time=item.get("updated_at") or item.get("created_at"),
+            kind="app_builder",
+            status=item.get("status") or "draft",
+            risk=item.get("risk_level") or "medium",
+            source="AgentGate",
+            summary=f"App workspace: {item.get('name') or item.get('id')} · {item.get('progress_summary') or 'metadata only'}",
+            agent_id=item.get("owner_agent_id"),
+            team_id=item.get("team_id"),
+            ref_type="app_workspace",
+            ref_id=item.get("id"),
+        ))
     for item in getattr(app.state, "memory_candidates", {}).values():
         rows.append(_workstream_event(
             event_id=f"memory_candidate:{item.get('id')}",
@@ -1504,7 +1550,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_id = _safe_summary(ref_id, limit=160)
     if not clean_type or not clean_id:
         raise HTTPException(422, "ref_type and ref_id are required")
-    supported_types = {"agent", "team", "job", "task", "session", "tool_draft", "memory_candidate"}
+    supported_types = {"agent", "team", "job", "task", "session", "tool_draft", "app_workspace", "memory_candidate"}
     if clean_type not in supported_types:
         raise HTTPException(422, "unsupported workstream reference type")
     activity = [
@@ -1582,6 +1628,16 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
                 **draft,
                 "purpose": _redact_tool_draft_text(draft.get("purpose") or "", limit=500),
             }
+    elif clean_type == "app_workspace":
+        if clean_id not in getattr(app.state, "app_workspaces", {}):
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _public_app_workspace(app.state.app_workspaces[clean_id], activity_limit=5)
     elif clean_type == "memory_candidate":
         if clean_id not in getattr(app.state, "memory_candidates", {}):
             detail = {
@@ -1785,6 +1841,101 @@ def _validate_job_requirements(actor: dict[str, Any], required_tool_ids: list[An
             detail.append(f"missing memory scopes: {', '.join(missing_memory)}")
         raise HTTPException(403, "; ".join(detail))
     return tools, memory_scopes
+
+
+APP_WORKSPACE_STATUSES = {"draft", "planning", "review_ready", "archived"}
+APP_WORKSPACE_RISK_LEVELS = {"low", "medium", "high"}
+APP_WORKSPACE_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed", "blocked"}
+
+
+def _redact_app_workspace_text(value: Any, *, limit: int) -> str:
+    text = _redact_profile_metadata_text(value, limit=limit)
+    text = re.sub(r"(?i)\b(raw\s+)?(prompt|secret|credential|token|password|bearer)\b", "[redacted]", text)
+    text = re.sub(r"(?i)\b(file|path|asset|workspace|folder|directory)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+    text = re.sub(r"(?<!\w)(?:/home|/app|/tmp|/var|/etc|/usr|~)/\S+", "[redacted-path]", text)
+    return text[:limit]
+
+
+def _sanitize_app_workspace_status(value: Any) -> str:
+    status = str(value or "draft").strip().lower()
+    if status not in APP_WORKSPACE_STATUSES:
+        raise HTTPException(422, "status must be draft, planning, review_ready, or archived")
+    return status
+
+
+def _sanitize_app_workspace_risk(value: Any) -> str:
+    risk = str(value or "medium").strip().lower()
+    if risk not in APP_WORKSPACE_RISK_LEVELS:
+        raise HTTPException(422, "risk_level must be low, medium, or high")
+    return risk
+
+
+def _sanitize_app_workspace_review_status(value: Any) -> str:
+    status = str(value or "unreviewed").strip().lower()
+    return status if status in APP_WORKSPACE_REVIEW_STATUSES else "unreviewed"
+
+
+def _sanitize_app_workspace_profile(payload: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    existing = existing or {}
+    owner_agent_id = str(payload.get("owner_agent_id", existing.get("owner_agent_id") or "agent_pi_operator") or "").strip()
+    team_id_value = payload.get("team_id", existing.get("team_id"))
+    team_id = str(team_id_value or "").strip() or None
+    actor = _permission_context(owner_agent_id, team_id)
+    required_tool_ids, required_memory_scopes = _validate_job_requirements(
+        actor,
+        payload.get("required_tool_ids", existing.get("required_tool_ids") or []),
+        payload.get("required_memory_scopes", existing.get("required_memory_scopes") or []),
+    )
+    profile = {
+        "owner_agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "required_tool_ids": required_tool_ids[:24],
+        "required_memory_scopes": required_memory_scopes[:24],
+    }
+    if "name" in payload:
+        name = _redact_app_workspace_text(payload.get("name"), limit=80)
+        if not name:
+            raise HTTPException(422, "name is required")
+        profile["name"] = name
+    if "status" in payload:
+        profile["status"] = _sanitize_app_workspace_status(payload.get("status"))
+    if "purpose" in payload:
+        profile["purpose"] = _redact_app_workspace_text(payload.get("purpose"), limit=1000)
+    if "app_type" in payload:
+        profile["app_type"] = _redact_app_workspace_text(payload.get("app_type"), limit=80)
+    if "risk_level" in payload:
+        profile["risk_level"] = _sanitize_app_workspace_risk(payload.get("risk_level"))
+    if "review_status" in payload:
+        profile["review_status"] = _sanitize_app_workspace_review_status(payload.get("review_status"))
+    if "progress_summary" in payload:
+        profile["progress_summary"] = _redact_app_workspace_text(payload.get("progress_summary"), limit=600)
+    return profile
+
+
+def _public_app_workspace(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str, Any]:
+    row = {
+        "id": item.get("id"),
+        "name": _redact_app_workspace_text(item.get("name"), limit=80),
+        "status": _sanitize_app_workspace_status(item.get("status")),
+        "owner_agent_id": item.get("owner_agent_id"),
+        "team_id": item.get("team_id"),
+        "purpose": _redact_app_workspace_text(item.get("purpose"), limit=1000),
+        "app_type": _redact_app_workspace_text(item.get("app_type"), limit=80),
+        "risk_level": _sanitize_app_workspace_risk(item.get("risk_level")),
+        "required_tool_ids": _clean_list(item.get("required_tool_ids"))[:24],
+        "required_memory_scopes": _clean_list(item.get("required_memory_scopes"))[:24],
+        "review_status": _sanitize_app_workspace_review_status(item.get("review_status")),
+        "progress_summary": _redact_app_workspace_text(item.get("progress_summary"), limit=600),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+    if activity_limit:
+        row["recent_activity"] = _list_activity(
+            item.get("owner_agent_id") or "agent_pi_operator",
+            team_id=item.get("team_id"),
+            limit=activity_limit,
+        )
+    return row
 
 
 def _validate_task_dependencies(task_ids: list[Any] | None, *, current_task_id: str | None = None) -> list[str]:
@@ -5234,6 +5385,123 @@ def delete_team(team_id: str):
         _save_registry_item("agent", agent)
     _delete_registry_item("team", team_id)
     _sync_toolgate_execution_scopes()
+    return {"deleted": True}
+
+
+@app.get("/api/app-workspaces")
+def list_app_workspaces():
+    _ensure_registry_seeded()
+    workspaces = [
+        _public_app_workspace(item, activity_limit=3)
+        for item in sorted(
+            getattr(app.state, "app_workspaces", {}).values(),
+            key=lambda row: row.get("updated_at") or row.get("created_at") or "",
+            reverse=True,
+        )
+    ]
+    return {
+        "summary": {
+            "total": len(workspaces),
+            "active": sum(1 for item in workspaces if item.get("status") in {"draft", "planning"}),
+            "review_ready": sum(1 for item in workspaces if item.get("status") == "review_ready"),
+            "archived": sum(1 for item in workspaces if item.get("status") == "archived"),
+        },
+        "workspaces": workspaces,
+        "safety": {
+            "mode": "metadata_only",
+            "app_files_included": False,
+            "input_text_included": False,
+            "credentials_included": False,
+            "filesystem_locations_included": False,
+            "toolgate_called": False,
+        },
+    }
+
+
+@app.post("/api/app-workspaces")
+def create_app_workspace(payload: AppWorkspaceInput):
+    _ensure_registry_seeded()
+    workspace_id = f"appws_{_slug(payload.name)}"
+    if workspace_id in getattr(app.state, "app_workspaces", {}):
+        workspace_id = f"{workspace_id}_{uuid.uuid4().hex[:6]}"
+    profile = _sanitize_app_workspace_profile(payload.model_dump())
+    timestamp = now()
+    item = {
+        "id": workspace_id,
+        "name": profile.get("name") or "App workspace",
+        "status": profile.get("status") or "draft",
+        "owner_agent_id": profile["owner_agent_id"],
+        "team_id": profile["team_id"],
+        "purpose": profile.get("purpose") or "",
+        "app_type": profile.get("app_type") or "",
+        "risk_level": profile.get("risk_level") or "medium",
+        "required_tool_ids": profile["required_tool_ids"],
+        "required_memory_scopes": profile["required_memory_scopes"],
+        "review_status": profile.get("review_status") or "unreviewed",
+        "progress_summary": profile.get("progress_summary") or "",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    app.state.app_workspaces[workspace_id] = item
+    _save_registry_item("app_workspace", item)
+    _record_activity(
+        item["owner_agent_id"],
+        event_type="app_workspace.created",
+        status=item["status"],
+        source="AgentGate",
+        summary=f"App workspace created: {item['name']}",
+        team_id=item.get("team_id"),
+        ref_type="app_workspace",
+        ref_id=workspace_id,
+    )
+    return _public_app_workspace(item, activity_limit=3)
+
+
+@app.patch("/api/app-workspaces/{workspace_id}")
+def update_app_workspace(workspace_id: str, payload: AppWorkspaceUpdateInput):
+    _ensure_registry_seeded()
+    item = getattr(app.state, "app_workspaces", {}).get(workspace_id)
+    if not item:
+        raise HTTPException(404, "app workspace not found")
+    update_payload = payload.model_dump(exclude_unset=True)
+    if not update_payload:
+        return _public_app_workspace(item, activity_limit=3)
+    profile = _sanitize_app_workspace_profile(update_payload, existing=item)
+    item.update(profile)
+    item["updated_at"] = now()
+    app.state.app_workspaces[workspace_id] = item
+    _save_registry_item("app_workspace", item)
+    _record_activity(
+        item.get("owner_agent_id"),
+        event_type="app_workspace.updated",
+        status=item.get("status") or "updated",
+        source="AgentGate",
+        summary=f"App workspace updated: {item.get('name') or workspace_id}",
+        team_id=item.get("team_id"),
+        ref_type="app_workspace",
+        ref_id=workspace_id,
+    )
+    return _public_app_workspace(item, activity_limit=3)
+
+
+@app.delete("/api/app-workspaces/{workspace_id}")
+def delete_app_workspace(workspace_id: str):
+    _ensure_registry_seeded()
+    item = getattr(app.state, "app_workspaces", {}).get(workspace_id)
+    if not item:
+        raise HTTPException(404, "app workspace not found")
+    app.state.app_workspaces.pop(workspace_id, None)
+    _delete_registry_item("app_workspace", workspace_id)
+    _record_activity(
+        item.get("owner_agent_id"),
+        event_type="app_workspace.deleted",
+        status="deleted",
+        source="AgentGate",
+        summary=f"App workspace deleted: {item.get('name') or workspace_id}",
+        team_id=item.get("team_id"),
+        ref_type="app_workspace",
+        ref_id=workspace_id,
+    )
     return {"deleted": True}
 
 

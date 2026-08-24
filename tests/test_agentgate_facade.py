@@ -294,6 +294,7 @@ def reset_state():
     app.state.agents = {}
     app.state.teams = {}
     app.state.tool_drafts = {}
+    app.state.app_workspaces = {}
     app.state.notification_channels = {}
     app.state.memory_candidates = {}
     app.state.active_job_runs = {}
@@ -454,6 +455,117 @@ def test_registry_export_import_is_metadata_only(monkeypatch, tmp_path):
     restored = next(agent for agent in agents if agent["id"] == created["id"])
     assert restored["tool_ids"] == ["echo"]
     assert team["id"] in restored["team_ids"]
+
+
+def test_app_workspace_registry_create_list_patch_delete(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["echo"], "memory_scopes": ["project-context"]},
+        )
+        created = client.post(
+            "/api/app-workspaces",
+            json={
+                "name": "Budget Tracker",
+                "purpose": "Metadata-only planning record.",
+                "app_type": "dashboard",
+                "required_tool_ids": ["echo"],
+                "required_memory_scopes": ["project-context"],
+            },
+        )
+        workspace = created.json()
+        listed = client.get("/api/app-workspaces").json()
+        patched = client.patch(
+            f"/api/app-workspaces/{workspace['id']}",
+            json={"status": "planning", "progress_summary": "Wireframe reviewed."},
+        )
+
+    assert created.status_code == 200
+    assert workspace["status"] == "draft"
+    assert workspace["required_tool_ids"] == ["echo"]
+    assert workspace["required_memory_scopes"] == ["project-context"]
+    assert listed["summary"]["total"] >= 1
+    assert listed["summary"]["active"] >= 1
+    assert any(row["id"] == workspace["id"] for row in listed["workspaces"])
+    assert listed["safety"]["mode"] == "metadata_only"
+    assert patched.status_code == 200
+    assert patched.json()["status"] == "planning"
+    assert patched.json()["progress_summary"] == "Wireframe reviewed."
+
+    app.state.app_workspaces = {}
+    main._load_registry()
+    assert app.state.app_workspaces[workspace["id"]]["name"] == "Budget Tracker"
+
+    with TestClient(app) as client:
+        deleted = client.delete(f"/api/app-workspaces/{workspace['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True}
+
+    app.state.app_workspaces = {}
+    main._load_registry()
+    assert workspace["id"] not in app.state.app_workspaces
+
+
+def test_app_workspace_rejects_ungranted_requirements(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        response = client.post(
+            "/api/app-workspaces",
+            json={
+                "name": "Unsafe App",
+                "required_tool_ids": ["danger.write"],
+                "required_memory_scopes": ["private-journal"],
+            },
+        )
+
+    assert response.status_code == 403
+    assert "missing tool grants" in response.text
+    assert "missing memory scopes" in response.text
+
+
+def test_app_workspace_responses_redact_prompts_secrets_paths_and_urls(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        response = client.post(
+            "/api/app-workspaces",
+            json={
+                "name": "Private Build",
+                "purpose": "raw prompt token=abc123 https://private.example/app path=/home/private/app",
+                "app_type": "internal tool",
+                "progress_summary": "secret bearer abc123 file=/tmp/generated-app",
+                "raw_prompt": "should not persist",
+                "secret": "should not persist",
+                "host_path": "/home/private/nope",
+            },
+        )
+        listed = client.get("/api/app-workspaces")
+
+    assert response.status_code == 200
+    body = json.dumps({"created": response.json(), "listed": listed.json()}).lower()
+    for forbidden in [
+        "raw prompt",
+        "should not persist",
+        "abc123",
+        "https://private.example",
+        "/home/private",
+        "/tmp/generated-app",
+        "bearer abc123",
+    ]:
+        assert forbidden not in body
+    assert "[redacted" in body
 
 
 def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
