@@ -2432,6 +2432,63 @@ def test_verification_snapshot_reports_open_loop_boundary_without_loop_payloads(
         assert forbidden not in joined
 
 
+def test_verification_snapshot_accepts_scoped_listener_labels_with_ports(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    def system_overview():
+        return {
+            "vitals": {"cpu_percent": 1, "memory": {"percent": 2}, "disk": {"percent": 3}, "cpu_count": 4},
+            "containers": [
+                {"name": "agentgate", "status": "listening", "listeners": ["loopback:8080"]},
+                {"name": "systemgate", "status": "listening", "listeners": ["container-internal:8040"]},
+                {"name": "tailnet", "status": "listening", "listeners": ["tailscale:443"]},
+            ],
+            "errors": [],
+            "packages": [],
+            "backups": {"latest": {"name": "safe-backup", "created_at": 1760000000.0}},
+            "sources": {"backups": {"status": "ok"}},
+        }
+
+    monkeypatch.setattr(app.state.gates, "system_overview", system_overview)
+    with TestClient(app) as client:
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "listener-scope")
+    assert check["status"] == "pass"
+    assert check["detail"]["service_count"] == 3
+    assert check["detail"]["unsafe_listener_count"] == 0
+
+
+def test_verification_snapshot_warns_on_unscoped_listener_labels(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    def system_overview():
+        return {
+            "vitals": {"cpu_percent": 1, "memory": {"percent": 2}, "disk": {"percent": 3}, "cpu_count": 4},
+            "containers": [
+                {"name": "unsafe", "status": "listening", "listeners": ["lan:8080"]},
+                {"name": "unsafe-any", "status": "listening", "listeners": ["public:0.0.0.0:8080"]},
+            ],
+            "errors": [],
+            "packages": [],
+            "backups": {"latest": {"name": "safe-backup", "created_at": 1760000000.0}},
+            "sources": {"backups": {"status": "ok"}},
+        }
+
+    monkeypatch.setattr(app.state.gates, "system_overview", system_overview)
+    with TestClient(app) as client:
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "listener-scope")
+    assert check["status"] == "warn"
+    assert check["detail"]["service_count"] == 2
+    assert check["detail"]["unsafe_listener_count"] == 2
+
+
 def test_verification_snapshot_reports_free_model_gateway_boundary_without_secrets(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

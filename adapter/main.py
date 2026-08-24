@@ -10344,10 +10344,17 @@ def _verification_snapshot() -> dict[str, Any]:
 
     system = gates.system_overview()
     service_rows = system.get("containers", []) if isinstance(system, dict) else []
+    def listener_label_is_scoped(value: Any) -> bool:
+        label = str(value or "").strip().lower()
+        return any(
+            label == allowed or label.startswith(f"{allowed}:")
+            for allowed in {"loopback", "container-internal", "tailscale"}
+        )
+
     unsafe_listener_count = 0
     for row in service_rows:
         listeners = row.get("listeners") if isinstance(row, dict) else []
-        if any(str(item) not in {"loopback", "container-internal", "tailscale"} for item in (listeners or [])):
+        if any(not listener_label_is_scoped(item) for item in (listeners or [])):
             unsafe_listener_count += 1
     checks.append(_verification_check(
         "listener-scope",
