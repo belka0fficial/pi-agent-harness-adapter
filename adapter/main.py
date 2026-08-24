@@ -2528,6 +2528,7 @@ def _open_loop_from_workstream_ref(event: dict[str, Any]) -> dict[str, Any] | No
         evidence.append(f"Signal count keys {len(signal_counts)}")
     return {
         "id": _safe_summary(f"loop-workstream-{ref_type}-{ref_id}", limit=180),
+        "label": _safe_summary(ref_type.replace("_", " ").title(), limit=80),
         "title": _redact_audit_text(f"{ref_type.replace('_', ' ').title()} needs owner review", limit=160),
         "lane": _safe_summary(ref_type.replace("_", " ").title(), limit=80),
         "priority": _open_loop_priority(ref_type, status, controls),
@@ -2538,6 +2539,7 @@ def _open_loop_from_workstream_ref(event: dict[str, Any]) -> dict[str, Any] | No
         "next_step": _redact_audit_text(insight.get("owner_next_step") or "Open the owning AgentGate screen to inspect safe metadata.", limit=220),
         "approval_required": ref_type == "approval",
         "target_path": _open_loop_target_path(ref_type),
+        "source_kind": "workstream-ref",
         "source": {
             "kind": "workstream-ref",
             "ref_type": ref_type,
@@ -2557,6 +2559,7 @@ def _open_loops(limit: int = 12) -> dict[str, Any]:
         binding = approval.get("binding") if isinstance(approval.get("binding"), dict) else {}
         loop = {
             "id": _safe_summary(f"loop-approval-{approval.get('id')}", limit=180),
+            "label": "ToolGate approval",
             "title": _redact_audit_text(approval.get("title") or "ToolGate approval request", limit=160),
             "lane": "Approval boundary",
             "priority": _safe_summary(approval.get("severity") or "medium", limit=20) if approval.get("severity") in {"high", "medium", "low"} else "medium",
@@ -2570,6 +2573,7 @@ def _open_loops(limit: int = 12) -> dict[str, Any]:
             "next_step": "Review the ToolGate-bound request before anything executes.",
             "approval_required": True,
             "target_path": "/approvals",
+            "source_kind": "toolgate-approval",
             "source": {
                 "kind": "toolgate-approval",
                 "ref_type": "approval",

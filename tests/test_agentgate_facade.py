@@ -5082,13 +5082,19 @@ def test_open_loop_radar_uses_only_safe_workstream_metadata(monkeypatch, tmp_pat
     assert body["safety"]["credentials_included"] is False
     approval_loop = next(item for item in body["loops"] if item["source"]["ref_type"] == "approval")
     memory_loop = next(item for item in body["loops"] if item["source"]["ref_type"] == "memory_candidate")
+    assert all(item["label"] for item in body["loops"])
+    assert all(item["source_kind"] for item in body["loops"])
     assert approval_loop["status"] == "needs-approval"
     assert approval_loop["approval_required"] is True
     assert approval_loop["target_path"] == "/approvals"
+    assert approval_loop["label"] == "ToolGate approval"
+    assert approval_loop["source_kind"] == "toolgate-approval"
     assert approval_loop["signal"] == "ToolGate request is waiting for owner decision."
     assert memory_loop["status"] == "owner-review"
     assert memory_loop["approval_required"] is False
     assert memory_loop["target_path"] == "/memory"
+    assert memory_loop["label"] == "Memory Candidate"
+    assert memory_loop["source_kind"] == "workstream-ref"
     assert "enabled controls" in " ".join(memory_loop["evidence"])
 
     joined = json.dumps(body).lower()
