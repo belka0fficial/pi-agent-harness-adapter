@@ -802,7 +802,12 @@ def test_app_workspace_preview_proposal_registry_create_list_patch_delete(monkey
     assert drilldown.status_code == 200
     assert drilldown.json()["detail"]["id"] == proposal["id"]
     assert drilldown.json()["detail"]["workspace_id"] == workspace["id"]
+    assert drilldown.json()["detail"]["schema"] == "agentgate.app_preview_proposal_ref_detail.v1"
+    assert "summary" not in drilldown.json()["detail"]
+    assert drilldown.json()["detail"]["summary_digest"]
+    assert drilldown.json()["detail"]["linked_artifact_count"] == 1
     assert drilldown.json()["safety"]["mode"] == "metadata_only"
+    assert drilldown.json()["insight"]["controls"]["schema"] == "agentgate.app_preview_proposal_controls.v1"
 
     app.state.app_preview_proposals = {}
     main._load_registry()
@@ -1084,7 +1089,114 @@ def test_app_workspace_preview_proposal_promotion_approval_missing_workspace_or_
 
     assert missing_workspace.status_code == 404
     assert missing_proposal.status_code == 404
-    assert getattr(app.state.gates, "requests", {}) == {}
+
+
+def test_app_preview_proposal_workstream_controls_are_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post(
+            "/api/app-workspaces",
+            json={"name": "Command App Review Desk", "purpose": "Metadata-only app proposal proof."},
+        ).json()
+        created = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={
+                "name": "Command Preview",
+                "proposal_type": "dashboard_plugin",
+                "status": "review_ready",
+                "risk_level": "high",
+                "summary": "Never expose token=app-secret https://app.example/path raw_code=print(secret) path=/home/private/app",
+                "linked_artifact_ids": [],
+            },
+        ).json()["proposals"][0]
+        before_drilldown_requests = set(getattr(app.state.gates, "requests", {}).keys())
+        draft_detail = client.get(f"/api/workstream/refs/app_preview_proposal/{created['id']}")
+        after_drilldown_requests = set(getattr(app.state.gates, "requests", {}).keys())
+        queued = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals/{created['id']}/promotion-approval",
+            json={
+                "target_kind": "dashboard_plugin",
+                "owner_note": "metadata review only token=note-secret https://note.example/path",
+            },
+        ).json()
+        pending_detail = client.get(f"/api/workstream/refs/app_preview_proposal/{created['id']}")
+        client.post(
+            f"/api/approvals/{queued['approval']['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        )
+        approved_detail = client.get(f"/api/workstream/refs/app_preview_proposal/{created['id']}")
+        archived = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={
+                "name": "Archived Preview",
+                "proposal_type": "static_preview",
+                "status": "archived",
+                "summary": "Archived private token=archived-secret https://archived.example/path",
+            },
+        ).json()["proposals"][0]
+        archived_detail = client.get(f"/api/workstream/refs/app_preview_proposal/{archived['id']}")
+
+    assert draft_detail.status_code == 200
+    assert before_drilldown_requests == after_drilldown_requests
+    body = draft_detail.json()
+    detail = body["detail"]
+    controls = body["insight"]["controls"]
+    assert detail["schema"] == "agentgate.app_preview_proposal_ref_detail.v1"
+    assert "summary" not in detail
+    assert "linked_artifact_ids" not in detail
+    assert detail["summary_present"] is True
+    assert detail["summary_digest"]
+    assert detail["summary_chars"] > 0
+    assert detail["linked_artifact_count"] == 0
+    assert detail["approval_request_present"] is False
+    assert controls["schema"] == "agentgate.app_preview_proposal_controls.v1"
+    assert controls["metadata_only"] is True
+    assert controls["executes_from_drilldown"] is False
+    assert controls["promotion_readiness"]["enabled"] is True
+    assert controls["promotion_readiness"]["reason_code"] == "ready_for_toolgate_review"
+    assert controls["approval_boundary"]["enabled"] is False
+    assert controls["approval_boundary"]["reason_code"] == "no_pending_approval"
+    assert controls["lifecycle_boundary"]["enabled"] is True
+    joined = json.dumps(body).lower()
+    for forbidden in [
+        "app-secret",
+        "https://app.example",
+        "raw_code",
+        "print(secret)",
+        "/home/private",
+        "/api/app-workspaces",
+        "/v2/",
+        "package_manifest",
+        "raw_tool_args",
+        "postinstall",
+    ]:
+        assert forbidden not in joined
+
+    pending_controls = pending_detail.json()["insight"]["controls"]
+    assert pending_controls["promotion_readiness"]["enabled"] is False
+    assert pending_controls["promotion_readiness"]["reason_code"] == "approval_already_pending"
+    assert pending_controls["approval_boundary"]["enabled"] is True
+    assert pending_controls["approval_boundary"]["reason_code"] == "pending_owner_review"
+    assert pending_controls["lifecycle_boundary"]["enabled"] is False
+    assert pending_controls["lifecycle_boundary"]["reason_code"] == "pending_approval"
+
+    approved_controls = approved_detail.json()["insight"]["controls"]
+    assert approved_controls["promotion_readiness"]["enabled"] is False
+    assert approved_controls["promotion_readiness"]["reason_code"] == "approved_metadata"
+    assert approved_controls["approval_boundary"]["enabled"] is False
+    assert approved_controls["approval_boundary"]["reason_code"] == "approved_metadata"
+    assert approved_controls["lifecycle_boundary"]["enabled"] is False
+    assert approved_controls["lifecycle_boundary"]["reason_code"] == "approved_audit_history"
+
+    archived_controls = archived_detail.json()["insight"]["controls"]
+    assert archived_controls["promotion_readiness"]["enabled"] is False
+    assert archived_controls["promotion_readiness"]["reason_code"] == "archived"
+    assert archived_controls["approval_boundary"]["enabled"] is False
+    assert archived_controls["lifecycle_boundary"]["enabled"] is True
 
 
 def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):

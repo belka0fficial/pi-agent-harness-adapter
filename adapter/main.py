@@ -2094,6 +2094,8 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         insight["controls"] = _workstream_task_controls(detail)
     if ref_type == "tool_draft":
         insight["controls"] = _workstream_tool_draft_controls(detail)
+    if ref_type == "app_preview_proposal":
+        insight["controls"] = _workstream_app_preview_proposal_controls(detail)
     if ref_type == "memory_candidate":
         insight["controls"] = _workstream_memory_candidate_controls(detail)
     return insight
@@ -2453,6 +2455,107 @@ def _workstream_tool_draft_controls(detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _workstream_app_preview_proposal_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    status = str(detail.get("status") or "draft")
+    review_status = str(detail.get("review_status") or "unreviewed")
+    approval_status = str(detail.get("approval_status") or "")
+    approval_present = bool(detail.get("approval_request_present"))
+    archived = status == "archived"
+    pending = approval_status == "pending"
+    approved = approval_status == "approved" or review_status == "approved_metadata"
+    rejected = approval_status in {"rejected", "dismissed"} or review_status == "blocked"
+    reviewable = (
+        available
+        and not archived
+        and status in APP_PREVIEW_PROMOTION_REVIEWABLE_STATUSES
+        and review_status in APP_PREVIEW_PROMOTION_REVIEWABLE_REVIEW_STATUSES
+    )
+
+    if not available:
+        return {
+            "schema": "agentgate.app_preview_proposal_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "promotion_readiness": _workstream_control(False, "audit_only", "App preview proposal exists only in audit history."),
+            "approval_boundary": _workstream_control(False, "audit_only", "App preview proposal exists only in audit history."),
+            "lifecycle_boundary": _workstream_control(False, "audit_only", "App preview proposal exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.app_preview_proposal_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "promotion_readiness": _workstream_control(
+            reviewable and not approval_present,
+            (
+                "ready_for_toolgate_review"
+                if reviewable and not approval_present
+                else "approval_already_pending"
+                if pending
+                else "approved_metadata"
+                if approved
+                else "approval_rejected"
+                if rejected
+                else "archived"
+                if archived
+                else "not_reviewable"
+            ),
+            (
+                "Open Apps to queue a metadata-only ToolGate promotion review."
+                if reviewable and not approval_present
+                else "ToolGate already has a pending promotion review."
+                if pending
+                else "ToolGate already approved this proposal as metadata only."
+                if approved
+                else "ToolGate rejected this promotion review."
+                if rejected
+                else "Archived proposals cannot queue promotion review."
+                if archived
+                else "This proposal is not ready for promotion review."
+            ),
+        ),
+        "approval_boundary": _workstream_control(
+            pending,
+            (
+                "pending_owner_review"
+                if pending
+                else "approved_metadata"
+                if approved
+                else "approval_rejected"
+                if rejected
+                else "no_pending_approval"
+            ),
+            (
+                "Open Approvals to decide the pending ToolGate promotion review."
+                if pending
+                else "This proposal is already approved as metadata only."
+                if approved
+                else "This proposal's promotion review was rejected."
+                if rejected
+                else "There is no pending ToolGate promotion approval."
+            ),
+        ),
+        "lifecycle_boundary": _workstream_control(
+            not pending and not approved,
+            (
+                "safe_non_approved_record"
+                if not pending and not approved
+                else "pending_approval"
+                if pending
+                else "approved_audit_history"
+            ),
+            (
+                "Open Apps to archive or delete this non-approved proposal record."
+                if not pending and not approved
+                else "Pending approval proposals remain visible for owner review."
+                if pending
+                else "Approved proposal metadata remains review history."
+            ),
+        ),
+    }
+
+
 def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_type = _safe_summary(ref_type, limit=80)
     clean_id = _safe_summary(ref_id, limit=160)
@@ -2598,7 +2701,30 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
                 "summary": "Reference is present in audit history but not in current runtime state.",
             }
         else:
-            detail = _public_app_preview_proposal(app.state.app_preview_proposals[clean_id])
+            proposal = _public_app_preview_proposal(app.state.app_preview_proposals[clean_id])
+            summary = str(proposal.get("summary") or "")
+            detail = {
+                "schema": "agentgate.app_preview_proposal_ref_detail.v1",
+                "id": proposal.get("id"),
+                "workspace_id": _safe_text(proposal.get("workspace_id"), limit=120),
+                "name": _redact_app_workspace_text(proposal.get("name") or "", limit=120),
+                "proposal_type": _sanitize_app_preview_proposal_type(proposal.get("proposal_type")),
+                "status": _sanitize_app_preview_proposal_status(proposal.get("status")),
+                "risk_level": _sanitize_app_workspace_risk(proposal.get("risk_level")),
+                "review_status": _sanitize_app_preview_proposal_review_status(proposal.get("review_status")),
+                "summary_present": bool(summary),
+                "summary_digest": hashlib.sha256(summary.encode("utf-8")).hexdigest() if summary else "",
+                "summary_chars": len(summary),
+                "linked_artifact_count": len(proposal.get("linked_artifact_ids") or []),
+                "approval_request_present": bool(proposal.get("approval_request_id")),
+                "approval_status": _safe_text(proposal.get("approval_status") or "", limit=40) or None,
+                "approval_target_kind": _sanitize_app_preview_promotion_target_kind(proposal.get("approval_target_kind")) if proposal.get("approval_target_kind") else None,
+                "approval_requested_at": proposal.get("approval_requested_at"),
+                "created_by_agent_id": _safe_text(proposal.get("created_by_agent_id"), limit=120),
+                "team_id": _safe_text(proposal.get("team_id"), limit=120) or None,
+                "created_at": proposal.get("created_at"),
+                "updated_at": proposal.get("updated_at"),
+            }
     elif clean_type == "memory_candidate":
         if clean_id not in getattr(app.state, "memory_candidates", {}):
             detail = {
