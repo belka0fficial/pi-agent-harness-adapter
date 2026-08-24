@@ -296,6 +296,7 @@ def reset_state():
     app.state.tool_drafts = {}
     app.state.app_workspaces = {}
     app.state.app_artifacts = {}
+    app.state.app_preview_proposals = {}
     app.state.notification_channels = {}
     app.state.memory_candidates = {}
     app.state.active_job_runs = {}
@@ -664,7 +665,7 @@ def test_app_workspace_artifacts_redact_tokens_urls_paths_and_raw_code(monkeypat
             json={
                 "name": "Preview https://private.example/mockup token=abc123 path=/home/private/app",
                 "artifact_type": "preview_stub",
-                "summary": "raw_code=print(secret) file=/tmp/app.py bearer abc123 ```const token = 'abc123'```",
+                "summary": "raw_code=print(secret) file=/tmp/app.py bearer abc123 token equals abc123 ```const token = 'abc123'```",
                 "review_status": "needs_review",
                 "raw_code": "print('should not persist')",
                 "host_path": "/home/private/nope",
@@ -672,6 +673,164 @@ def test_app_workspace_artifacts_redact_tokens_urls_paths_and_raw_code(monkeypat
             },
         )
         listed = client.get(f"/api/app-workspaces/{workspace['id']}/artifacts")
+
+    assert response.status_code == 200
+    body = json.dumps({"created": response.json(), "listed": listed.json()}).lower()
+    for forbidden in [
+        "abc123",
+        "https://private.example",
+        "/home/private",
+        "/tmp/app.py",
+        "print('should not persist')",
+        "print(secret)",
+        "const token",
+        "bearer abc123",
+    ]:
+        assert forbidden not in body
+    assert "[redacted" in body
+    assert response.json()["safety"]["host_paths_accepted"] is False
+    assert response.json()["safety"]["raw_code_included"] is False
+
+
+def test_app_workspace_preview_proposal_registry_create_list_patch_delete(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post(
+            "/api/app-workspaces",
+            json={"name": "Preview Desk", "purpose": "Metadata-only proposal desk."},
+        ).json()
+        artifact = client.post(
+            f"/api/app-workspaces/{workspace['id']}/artifacts",
+            json={"name": "Review Note", "artifact_type": "review_note"},
+        ).json()["artifacts"][0]
+        created = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={
+                "name": "Static Preview Package",
+                "proposal_type": "static_preview",
+                "status": "draft",
+                "risk_level": "medium",
+                "summary": "Metadata-only proposal for owner review.",
+                "linked_artifact_ids": [artifact["id"]],
+            },
+        )
+        proposal = created.json()["proposals"][0]
+        listed = client.get(f"/api/app-workspaces/{workspace['id']}/preview-proposals")
+        patched = client.patch(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals/{proposal['id']}",
+            json={"status": "review_ready", "review_status": "needs_review", "proposal_type": "review_bundle"},
+        )
+        drilldown = client.get(f"/api/workstream/refs/app_preview_proposal/{proposal['id']}")
+
+    assert created.status_code == 200
+    assert created.json()["summary"]["total"] == 1
+    assert proposal["workspace_id"] == workspace["id"]
+    assert proposal["proposal_type"] == "static_preview"
+    assert proposal["linked_artifact_ids"] == [artifact["id"]]
+    assert proposal["created_by_agent_id"] == "agent_pi_operator"
+    assert created.json()["safety"]["mode"] == "metadata_only"
+    assert created.json()["safety"]["files_created"] is False
+    assert created.json()["safety"]["source_code_stored"] is False
+    assert created.json()["safety"]["previews_run"] is False
+    assert created.json()["safety"]["packages_built"] is False
+    assert created.json()["safety"]["apps_published"] is False
+    assert created.json()["safety"]["toolgate_called"] is False
+    assert listed.json()["summary"]["draft"] == 1
+    assert patched.status_code == 200
+    assert patched.json()["summary"]["review_ready"] == 1
+    assert patched.json()["proposals"][0]["proposal_type"] == "review_bundle"
+    assert drilldown.status_code == 200
+    assert drilldown.json()["detail"]["id"] == proposal["id"]
+    assert drilldown.json()["detail"]["workspace_id"] == workspace["id"]
+    assert drilldown.json()["safety"]["mode"] == "metadata_only"
+
+    app.state.app_preview_proposals = {}
+    main._load_registry()
+    assert app.state.app_preview_proposals[proposal["id"]]["name"] == "Static Preview Package"
+
+    with TestClient(app) as client:
+        deleted = client.delete(f"/api/app-workspaces/{workspace['id']}/preview-proposals/{proposal['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert deleted.json()["summary"]["total"] == 0
+
+    app.state.app_preview_proposals = {}
+    main._load_registry()
+    assert proposal["id"] not in app.state.app_preview_proposals
+
+
+def test_app_workspace_preview_proposal_linked_artifact_validation(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        first = client.post("/api/app-workspaces", json={"name": "First Workspace"}).json()
+        second = client.post("/api/app-workspaces", json={"name": "Second Workspace"}).json()
+        foreign_artifact = client.post(
+            f"/api/app-workspaces/{second['id']}/artifacts",
+            json={"name": "Foreign Spec", "artifact_type": "spec"},
+        ).json()["artifacts"][0]
+        missing = client.post(
+            f"/api/app-workspaces/{first['id']}/preview-proposals",
+            json={"name": "Missing Link", "linked_artifact_ids": ["appart_missing"]},
+        )
+        foreign = client.post(
+            f"/api/app-workspaces/{first['id']}/preview-proposals",
+            json={"name": "Foreign Link", "linked_artifact_ids": [foreign_artifact["id"]]},
+        )
+
+    assert missing.status_code == 422
+    assert "linked artifact not found" in missing.text
+    assert foreign.status_code == 422
+    assert "does not belong" in foreign.text
+
+
+def test_app_workspace_preview_proposals_missing_workspace_404(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        listed = client.get("/api/app-workspaces/appws_missing/preview-proposals")
+        created = client.post(
+            "/api/app-workspaces/appws_missing/preview-proposals",
+            json={"name": "Missing", "proposal_type": "static_preview"},
+        )
+
+    assert listed.status_code == 404
+    assert created.status_code == 404
+
+
+def test_app_workspace_preview_proposals_redact_tokens_urls_paths_and_raw_code(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post(
+            "/api/app-workspaces",
+            json={"name": "Proposal Safety", "purpose": "Metadata only."},
+        ).json()
+        response = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={
+                "name": "Package https://private.example/app token=abc123 path=/home/private/app",
+                "proposal_type": "tool_package",
+                "summary": "raw_code=print(secret) file=/tmp/app.py bearer abc123 ```const token = 'abc123'```",
+                "raw_code": "print('should not persist')",
+                "host_path": "/home/private/nope",
+                "url": "https://private.example/nope",
+            },
+        )
+        listed = client.get(f"/api/app-workspaces/{workspace['id']}/preview-proposals")
 
     assert response.status_code == 200
     body = json.dumps({"created": response.json(), "listed": listed.json()}).lower()
