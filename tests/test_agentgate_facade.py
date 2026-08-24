@@ -3103,6 +3103,75 @@ def test_gateway_candidates_skip_hostile_model_labels():
     assert "token=secret-value" not in json.dumps(safe).lower()
 
 
+def test_gateway_candidates_redact_hostile_metadata_fields():
+    safe = main._safe_gateway_model({
+        "id": "stealth/ox-alpha",
+        "owned_by": "StealthProvider",
+        "context_window": "128k https://private.invalid/context?token=secret-value",
+        "modalities": ["text", "api_key=abc123", "bearer hidden-token"],
+        "capabilities": ["reasoning", "tool_url=https://private.invalid/tool", "password=abc123"],
+    })
+
+    assert safe
+    visible = json.dumps(safe).lower()
+    assert "https://private.invalid" not in visible
+    assert "token=secret-value" not in visible
+    assert "api_key=abc123" not in visible
+    assert "bearer hidden-token" not in visible
+    assert "password=abc123" not in visible
+    assert "private-" in visible
+
+
+def test_model_providers_use_gateway_key_without_leaking_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("FREE_LLM_API_URL", "http://freellmapi.internal:3001")
+    monkeypatch.setenv("FREE_LLM_API_KEY", "free-gateway-secret")
+    reset_state()
+    calls = []
+
+    class Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        calls.append({"url": url, "headers": kwargs.get("headers") or {}})
+        if url.endswith("/health"):
+            return Response(200, {"status": "ok"})
+        if url.endswith("/v1/models"):
+            if kwargs.get("headers", {}).get("Authorization") == "Bearer free-gateway-secret":
+                return Response(200, {"data": [{"id": "stealth/ox-alpha", "owned_by": "StealthProvider"}]})
+            return Response(401, {"error": "missing key"})
+        return Response(404, {})
+
+    monkeypatch.setattr(main.httpx, "get", fake_get)
+
+    with TestClient(app) as client:
+        providers = client.get("/api/model/providers")
+        candidates = client.get("/api/model/gateway-candidates")
+
+    assert providers.status_code == 200
+    assert candidates.status_code == 200
+    free_provider = next(item for item in providers.json()["providers"] if item["id"] == "freellmapi")
+    assert free_provider["status"] == "ok"
+    assert free_provider["configured"] is True
+    assert free_provider["models_visible"] is True
+    assert free_provider["model_count"] == 1
+    assert candidates.json()["gateway"]["configured"] is True
+    assert candidates.json()["candidate_count"] == 1
+    model_calls = [item for item in calls if item["url"].endswith("/v1/models")]
+    assert model_calls
+    assert all(item["headers"].get("Authorization") == "Bearer free-gateway-secret" for item in model_calls)
+    visible = json.dumps({"providers": providers.json(), "candidates": candidates.json()}).lower()
+    assert "free-gateway-secret" not in visible
+    assert "freellmapi.internal" not in visible
+    assert "authorization" not in visible
+
+
 def test_model_route_approval_applies_and_rejects_metadata_only(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

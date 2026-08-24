@@ -7189,10 +7189,10 @@ def _safe_gateway_model(row: dict[str, Any]) -> dict[str, Any] | None:
         "model": model_id,
         "name": model_id,
         "owned_by": owned_by,
-        "context": str(context)[:40] if context is not None else None,
+        "context": _redact_handoff_text(str(context), limit=40) if context is not None else None,
         "available": True if available is True else False if available is False else None,
-        "modalities": [_safe_text(item, limit=40) for item in modalities[:6]],
-        "capabilities": [_safe_text(item, limit=40) for item in capabilities[:8]],
+        "modalities": [_redact_handoff_text(item, limit=40) for item in modalities[:6]],
+        "capabilities": [_redact_handoff_text(item, limit=40) for item in capabilities[:8]],
         "risk": "external",
         "policy": "low_risk_only",
         "note": "Candidate FreeLLMAPI helper route. Use for low-risk work only until provider and Pi routing are owner-reviewed.",
@@ -7270,6 +7270,7 @@ def model_gateway_candidates():
 @app.get("/api/model/providers")
 def model_providers():
     freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
+    headers = _freellmapi_headers()
     providers = [
         {
             "id": "pi",
@@ -7302,7 +7303,7 @@ def model_providers():
     except httpx.HTTPError:
         freeapi["status"] = "unavailable"
     try:
-        models_response = httpx.get(f"{freeapi_url}/v1/models", timeout=3)
+        models_response = httpx.get(f"{freeapi_url}/v1/models", headers=headers, timeout=3)
         if models_response.status_code == 200:
             models_payload = models_response.json()
             rows = models_payload.get("data", []) if isinstance(models_payload, dict) else []
