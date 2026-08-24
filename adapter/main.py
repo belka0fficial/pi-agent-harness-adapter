@@ -4846,6 +4846,20 @@ def detailed_health():
     }
 
 
+@app.get("/api/auth/session")
+def owner_auth_session():
+    return {
+        "status": "ok",
+        "owner_authenticated": True,
+        "auth_mode": "owner_bearer",
+        "token_storage": "browser_session",
+        "metadata_only": True,
+        "credentials_included": False,
+        "token_included": False,
+        "token_length_included": False,
+    }
+
+
 @app.post("/api/sessions")
 def create_session(payload: dict[str, Any]):
     actor = _permission_context(payload.get("agent_id"), payload.get("team_id"))

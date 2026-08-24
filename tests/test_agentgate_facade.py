@@ -415,6 +415,39 @@ def test_owner_auth_requires_matching_bearer_without_echoing_secret(monkeypatch)
     assert owner_secret not in combined
 
 
+def test_owner_auth_session_validates_bearer_without_echoing_secret(monkeypatch):
+    reset_state()
+    owner_secret = "session-owner-token-" + "d" * 32
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+
+    with TestClient(app) as client:
+        accepted = client.get(
+            "/api/auth/session",
+            headers={"Authorization": f"Bearer {owner_secret}"},
+        )
+        rejected = client.get(
+            "/api/auth/session",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+
+    assert accepted.status_code == 200
+    assert accepted.json() == {
+        "status": "ok",
+        "owner_authenticated": True,
+        "auth_mode": "owner_bearer",
+        "token_storage": "browser_session",
+        "metadata_only": True,
+        "credentials_included": False,
+        "token_included": False,
+        "token_length_included": False,
+    }
+    assert rejected.status_code == 401
+    combined = f"{accepted.text} {rejected.text}"
+    assert owner_secret not in combined
+    assert "wrong-token" not in combined
+
+
 def test_agent_registry_persists_to_sqlite(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
