@@ -148,6 +148,7 @@ class AgentInput(BaseModel):
     soul: str = Field(default="", max_length=12000)
     voice: str = Field(default="", max_length=1000)
     voice_profile: dict[str, Any] = Field(default_factory=dict)
+    expression_profile: dict[str, Any] = Field(default_factory=dict)
     personality: list[str] = Field(default_factory=list)
     appearance: dict[str, Any] = Field(default_factory=dict)
     story: str = Field(default="", max_length=4000)
@@ -469,6 +470,26 @@ AGENT_VOICE_PROFILE_FIELDS = {
     "call_behavior": 300,
 }
 
+AGENT_EXPRESSION_PROFILE_FIELDS = {
+    "sidecar_mode": 40,
+    "voice_sidecar": 120,
+    "avatar_sidecar": 120,
+    "read_aloud": 40,
+    "call_mode": 40,
+    "mic_policy": 40,
+    "camera_policy": 40,
+    "expression_analysis": 40,
+    "idle_animation": 40,
+    "safety_notes": 600,
+}
+
+AGENT_EXPRESSION_SIDECAR_MODES = {"disabled", "metadata_only", "local_sidecar", "external_review_required"}
+AGENT_EXPRESSION_READ_ALOUD = {"disabled", "owner_triggered", "draft_only"}
+AGENT_EXPRESSION_CALL_MODES = {"disabled", "push_to_talk", "owner_started"}
+AGENT_EXPRESSION_DEVICE_POLICIES = {"disabled", "owner_started", "push_to_talk"}
+AGENT_EXPRESSION_ANALYSIS_MODES = {"disabled", "metadata_only", "owner_started"}
+AGENT_EXPRESSION_IDLE_ANIMATION = {"disabled", "static", "subtle"}
+
 AGENT_PROFILE_PROVENANCE_FIELDS = {
     "origin_mode": 40,
     "review_status": 40,
@@ -541,6 +562,37 @@ def _safe_voice_profile(value: Any) -> dict[str, str]:
     return result
 
 
+def _safe_expression_profile(value: Any) -> dict[str, str]:
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, str] = {}
+    for key, limit in AGENT_EXPRESSION_PROFILE_FIELDS.items():
+        text = _redact_profile_metadata_text(source.get(key), limit=limit)
+        text = re.sub(r"(?i)\b(sample|file|path|asset|voiceprint|credential|token)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+        if key == "sidecar_mode" and text not in AGENT_EXPRESSION_SIDECAR_MODES:
+            text = "disabled"
+        if key == "read_aloud" and text not in AGENT_EXPRESSION_READ_ALOUD:
+            text = "disabled"
+        if key == "call_mode" and text not in AGENT_EXPRESSION_CALL_MODES:
+            text = "disabled"
+        if key in {"mic_policy", "camera_policy"} and text not in AGENT_EXPRESSION_DEVICE_POLICIES:
+            text = "disabled"
+        if key == "expression_analysis" and text not in AGENT_EXPRESSION_ANALYSIS_MODES:
+            text = "disabled"
+        if key == "idle_animation" and text not in AGENT_EXPRESSION_IDLE_ANIMATION:
+            text = "disabled"
+        if text:
+            result[key] = text
+    if result:
+        result.setdefault("sidecar_mode", "disabled")
+        result.setdefault("read_aloud", "disabled")
+        result.setdefault("call_mode", "disabled")
+        result.setdefault("mic_policy", "disabled")
+        result.setdefault("camera_policy", "disabled")
+        result.setdefault("expression_analysis", "disabled")
+        result.setdefault("idle_animation", "disabled")
+    return result
+
+
 def _redact_profile_metadata_text(value: Any, *, limit: int) -> str:
     text = _safe_text(value, limit=limit)
     text = re.sub(r"(?i)\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+", r"\1=[redacted]", text)
@@ -586,6 +638,7 @@ def _safe_profile_provenance(value: Any) -> dict[str, Any]:
 def _agent_profile_readiness(item: dict[str, Any]) -> dict[str, Any]:
     appearance = item.get("appearance") if isinstance(item.get("appearance"), dict) else {}
     voice_profile = item.get("voice_profile") if isinstance(item.get("voice_profile"), dict) else {}
+    expression_profile = item.get("expression_profile") if isinstance(item.get("expression_profile"), dict) else {}
     provenance = item.get("profile_provenance") if isinstance(item.get("profile_provenance"), dict) else {}
     checks = {
         "purpose": bool(str(item.get("purpose") or "").strip()),
@@ -608,6 +661,12 @@ def _agent_profile_readiness(item: dict[str, Any]) -> dict[str, Any]:
         risk_notes.append("usage_policy_pending")
     if provenance.get("asset_review_status") in {"needs_review", "blocked"}:
         risk_notes.append("asset_review_pending")
+    if expression_profile.get("mic_policy") not in {None, "", "disabled", "push_to_talk", "owner_started"}:
+        risk_notes.append("mic_policy_invalid")
+    if expression_profile.get("camera_policy") not in {None, "", "disabled", "owner_started"}:
+        risk_notes.append("camera_policy_invalid")
+    if expression_profile.get("sidecar_mode") in {"local_sidecar", "external_review_required"} and provenance.get("asset_review_status") != "approved_metadata":
+        risk_notes.append("expression_sidecar_review_pending")
     if not checks["model_route"]:
         risk_notes.append("model_route_missing")
     if not checks["memory_scope"]:
@@ -751,6 +810,8 @@ def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
         cleaned["personality"] = _safe_profile_list(cleaned.get("personality"))
     if "voice_profile" in cleaned:
         cleaned["voice_profile"] = _safe_voice_profile(cleaned.get("voice_profile"))
+    if "expression_profile" in cleaned:
+        cleaned["expression_profile"] = _safe_expression_profile(cleaned.get("expression_profile"))
     if "appearance" in cleaned:
         cleaned["appearance"] = _safe_appearance(cleaned.get("appearance"))
     if "profile_provenance" in cleaned:
@@ -791,6 +852,7 @@ def _portable_agent(item: dict[str, Any]) -> dict[str, Any]:
         "soul",
         "voice",
         "voice_profile",
+        "expression_profile",
         "personality",
         "appearance",
         "story",

@@ -478,6 +478,19 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
                     "call_behavior": "token=abc123 should disappear",
                     "raw_sample_path": "/tmp/nope.wav",
                 },
+                "expression_profile": {
+                    "sidecar_mode": "metadata_only",
+                    "voice_sidecar": "local voice presenter",
+                    "avatar_sidecar": "prometheus-avatar",
+                    "read_aloud": "owner_triggered",
+                    "call_mode": "push_to_talk",
+                    "mic_policy": "push_to_talk",
+                    "camera_policy": "owner_started",
+                    "expression_analysis": "metadata_only",
+                    "idle_animation": "subtle",
+                    "safety_notes": "No always-on mic. credential=abc123 and https://private.example should redact.",
+                    "asset_path": "/home/private/avatar.glb",
+                },
                 "personality": ["kind", "kind", "evidence-first", ""],
                 "appearance": {
                     "mode": "character",
@@ -524,6 +537,13 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
                     "tone": "steady",
                     "tts_hint": "voiceprint=abc123",
                 },
+                "expression_profile": {
+                    "sidecar_mode": "unsafe-mode",
+                    "mic_policy": "always_on",
+                    "camera_policy": "always_on",
+                    "read_aloud": "owner_triggered",
+                    "safety_notes": "sample=/home/private/sample.wav",
+                },
             },
         )
 
@@ -536,6 +556,18 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
         "interaction_style": "asks one clear question when blocked",
         "tts_hint": "sample=[redacted]",
         "call_behavior": "token=[redacted] should disappear",
+    }
+    assert created.json()["expression_profile"] == {
+        "sidecar_mode": "metadata_only",
+        "voice_sidecar": "local voice presenter",
+        "avatar_sidecar": "prometheus-avatar",
+        "read_aloud": "owner_triggered",
+        "call_mode": "push_to_talk",
+        "mic_policy": "push_to_talk",
+        "camera_policy": "owner_started",
+        "expression_analysis": "metadata_only",
+        "idle_animation": "subtle",
+        "safety_notes": "No always-on mic. credential=[redacted] and [redacted-url] should redact.",
     }
     assert created.json()["personality"] == ["kind", "evidence-first"]
     assert created.json()["appearance"] == {
@@ -572,6 +604,16 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
     assert patched.json()["voice_profile"] == {
         "tone": "steady",
         "tts_hint": "voiceprint=[redacted]",
+    }
+    assert patched.json()["expression_profile"] == {
+        "sidecar_mode": "disabled",
+        "mic_policy": "disabled",
+        "camera_policy": "disabled",
+        "read_aloud": "owner_triggered",
+        "safety_notes": "sample=[redacted]",
+        "call_mode": "disabled",
+        "expression_analysis": "disabled",
+        "idle_animation": "disabled",
     }
     assert patched.json()["profile_readiness"]["review_status"] == "owner_reviewed"
     payload = str(patched.json()).lower()
