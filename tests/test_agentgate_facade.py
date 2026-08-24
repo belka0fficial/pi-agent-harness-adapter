@@ -4301,6 +4301,16 @@ def test_auxiliary_model_routes_are_metadata_only(monkeypatch, tmp_path):
             "/api/model/auxiliary-routes/unknown",
             json={"provider": "openai-codex", "model": "gpt-5.6-luna"},
         )
+        direct_reviewed = client.patch(
+            "/api/model/auxiliary-routes/summary",
+            json={
+                "provider": "openai-codex",
+                "model": "gpt-5.6-luna",
+                "enabled": True,
+                "risk_policy": "owner_reviewed",
+                "owner_review_status": "owner_reviewed",
+            },
+        )
         listed = client.get("/api/model/auxiliary-routes").json()
 
     assert initial["summary"]["total"] >= 4
@@ -4316,6 +4326,9 @@ def test_auxiliary_model_routes_are_metadata_only(monkeypatch, tmp_path):
     assert "token=abc123" not in str(saved_body)
     assert "private.example" not in str(saved_body)
     assert missing.status_code == 404
+    assert direct_reviewed.status_code == 409
+    assert direct_reviewed.json()["detail"]["reason"] == "toolgate_review_required"
+    assert "openai-codex" not in str(direct_reviewed.json())
     summary_route = next(item for item in listed["routes"] if item["task_id"] == "summary")
     assert summary_route["provider"] == "openai-codex"
     assert listed["summary"]["enabled"] >= 1

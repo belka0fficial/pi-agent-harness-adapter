@@ -8642,6 +8642,16 @@ def update_auxiliary_model_route(task_id: str, payload: AuxiliaryModelRouteInput
     _ensure_registry_seeded()
     if task_id not in AUXILIARY_MODEL_TASKS:
         raise HTTPException(404, "auxiliary model task not found")
+    if payload.owner_review_status == "owner_reviewed":
+        raise HTTPException(
+            409,
+            {
+                "reason": "toolgate_review_required",
+                "message": "Auxiliary helper routes cannot be marked owner-reviewed through the dashboard save path.",
+                "task_id": task_id,
+                "metadata_only": True,
+            },
+        )
     item = _safe_auxiliary_model_route(task_id, payload.model_dump())
     item["updated_at"] = now()
     app.state.auxiliary_model_routes[task_id] = item
