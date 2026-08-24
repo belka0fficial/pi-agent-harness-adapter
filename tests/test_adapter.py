@@ -672,6 +672,12 @@ def test_agentgate_session_stop_endpoint_stops_current_server_side_run():
             await asyncio.sleep(0.05)
             result = await client.post(f"/api/sessions/{session_id}/runs/current/stop")
             assert result.status_code == 200
+            body = result.json()
+            assert body["session_id"] == session_id
+            assert body["status"] == "stopping"
+            assert body["active_run"]["status"] == "stopping"
+            assert "run_id" not in result.text
+            assert "run-stop" not in result.text
             response = await asyncio.wait_for(stream_task, timeout=2)
             assert "event: run.stopped" in response.text
 

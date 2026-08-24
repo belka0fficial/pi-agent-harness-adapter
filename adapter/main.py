@@ -3619,17 +3619,26 @@ async def stop_current_session_run(session_id: str):
     except ValueError:
         raise HTTPException(404, "run not found")
     session = app.state.sessions.get(session_id, {})
-    _record_activity(
-        session.get("agent_id") or "agent_pi_operator",
-        event_type="chat.stop_requested",
-        status="stopping",
-        source="AgentGate",
-        summary="Stop requested for active chat run",
-        team_id=session.get("team_id"),
-        ref_type="session",
-        ref_id=session_id,
-    )
-    return {"run_id": run_id, "session_id": session_id, "status": "stopping"}
+    requested_at = now()
+    try:
+        _record_activity(
+            session.get("agent_id") or "agent_pi_operator",
+            event_type="chat.stop_requested",
+            status="stopping",
+            source="AgentGate",
+            summary="Stop requested for active chat run",
+            team_id=session.get("team_id"),
+            ref_type="session",
+            ref_id=session_id,
+        )
+    except sqlite3.OperationalError:
+        pass
+    return {
+        "session_id": session_id,
+        "status": "stopping",
+        "requested_at": requested_at,
+        "active_run": {"status": "stopping"},
+    }
 
 def _model_options_payload() -> dict[str, Any]:
     command = app.state.pi.command

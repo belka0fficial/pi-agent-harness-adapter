@@ -55,7 +55,10 @@ Frozen from `agentgate/api/agentgate/main.py` on this overnight run. `pi-agent-h
 ## Runs
 
 - `POST /v1/runs/{run_id}/stop`
-  - Used by Chat stop button.
+  - Raw compatibility/runtime stop API. The caller already knows the Pi `run_id`.
+  - Browser and AgentGate UI code must prefer scoped facades that do not return raw run ids:
+    - `POST /api/sessions/{session_id}/runs/current/stop`
+    - `POST /api/jobs/{job_id}/stop`
 - `POST /v1/runs/{run_id}/approval`
   - Used for Hermes approval decisions.
   - Request is arbitrary JSON, usually `{ "decision": "approved"|"rejected" }`.
