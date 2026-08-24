@@ -123,6 +123,20 @@ class ToolDraftInput(BaseModel):
     source_role: str | None = None
 
 
+class CharacterSourceInput(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    source_type: str = "owner_notes"
+    target_agent_id: str | None = None
+    summary: str = Field(default="", max_length=1200)
+    visual_notes: str = Field(default="", max_length=800)
+    usage_policy: str = "needs_review"
+    source_confidence: str = "unknown"
+    asset_review_status: str = "text_only"
+    review_status: str = "unreviewed"
+    source_labels: list[str] = Field(default_factory=list)
+    review_checklist: list[str] = Field(default_factory=list)
+
+
 class ModelRouteProbeInput(BaseModel):
     provider: str = Field(default="", max_length=120)
     model: str = Field(default="", max_length=160)
@@ -359,6 +373,7 @@ app.state.app_preview_proposals = {}
 app.state.model_route_proposals = {}
 app.state.notification_channels = {}
 app.state.notification_deliveries = {}
+app.state.character_sources = {}
 app.state.active_runs = {}
 app.state.active_job_runs = {}
 app.state.approval_runs = {}
@@ -467,6 +482,7 @@ def _load_registry() -> None:
     app.state.notification_channels = {}
     app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
+    app.state.character_sources = {}
     for row in rows:
         try:
             item = json.loads(row["data"])
@@ -496,6 +512,8 @@ def _load_registry() -> None:
             app.state.notification_deliveries[row["id"]] = item
         elif row["kind"] == "memory_candidate":
             app.state.memory_candidates[row["id"]] = item
+        elif row["kind"] == "character_source":
+            app.state.character_sources[row["id"]] = item
     _normalize_agent_model_defaults()
 
 
@@ -520,7 +538,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "notification_channel", "notification_delivery", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "notification_channel", "notification_delivery", "memory_candidate", "character_source"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -536,7 +554,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "notification_delivery", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "notification_delivery", "memory_candidate", "character_source"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -736,6 +754,76 @@ def _safe_profile_provenance(value: Any) -> dict[str, Any]:
         result.setdefault("usage_policy", "needs_review")
         result.setdefault("asset_review_status", "needs_review")
     return result
+
+
+def _safe_character_source_payload(payload: CharacterSourceInput | dict[str, Any]) -> dict[str, Any]:
+    source = payload.model_dump() if isinstance(payload, CharacterSourceInput) else dict(payload)
+    provenance = _safe_profile_provenance({
+        "review_status": source.get("review_status"),
+        "source_type": source.get("source_type"),
+        "source_confidence": source.get("source_confidence"),
+        "usage_policy": source.get("usage_policy"),
+        "asset_review_status": source.get("asset_review_status"),
+        "source_labels": source.get("source_labels"),
+        "review_checklist": source.get("review_checklist"),
+        "notes_summary": source.get("summary"),
+    })
+    target_agent_id = _safe_text(source.get("target_agent_id"), limit=120)
+
+    def clean_text(value: Any, *, limit: int) -> str:
+        text = _redact_profile_metadata_text(value, limit=limit)
+        text = re.sub(r"(?i)\b(file|path|sample|asset|image)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+        return text[:limit]
+
+    return {
+        "title": clean_text(source.get("title"), limit=120),
+        "source_type": provenance.get("source_type", "owner_notes"),
+        "target_agent_id": target_agent_id or None,
+        "summary": clean_text(source.get("summary"), limit=1200),
+        "visual_notes": clean_text(source.get("visual_notes"), limit=800),
+        "usage_policy": provenance.get("usage_policy", "needs_review"),
+        "source_confidence": provenance.get("source_confidence", "unknown"),
+        "asset_review_status": provenance.get("asset_review_status", "text_only"),
+        "review_status": provenance.get("review_status", "unreviewed"),
+        "source_labels": provenance.get("source_labels", []),
+        "review_checklist": provenance.get("review_checklist", []),
+    }
+
+
+def _public_character_source(item: dict[str, Any]) -> dict[str, Any]:
+    def clean_text(value: Any, *, limit: int) -> str:
+        text = _redact_profile_metadata_text(value, limit=limit)
+        text = re.sub(r"(?i)\b(file|path|sample|asset|image)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+        return text[:limit]
+
+    public = {
+        "id": item.get("id"),
+        "title": clean_text(item.get("title"), limit=120),
+        "source_type": item.get("source_type") or "owner_notes",
+        "target_agent_id": item.get("target_agent_id"),
+        "summary": clean_text(item.get("summary"), limit=1200),
+        "visual_notes": clean_text(item.get("visual_notes"), limit=800),
+        "usage_policy": item.get("usage_policy") or "needs_review",
+        "source_confidence": item.get("source_confidence") or "unknown",
+        "asset_review_status": item.get("asset_review_status") or "text_only",
+        "review_status": item.get("review_status") or "unreviewed",
+        "source_labels": _safe_profile_list(item.get("source_labels"), limit=8, item_limit=120),
+        "review_checklist": _safe_profile_list(item.get("review_checklist"), limit=12, item_limit=160),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "safety": {
+            "metadata_only": True,
+            "excludes": [
+                "source pages",
+                "image files",
+                "generated assets",
+                "memory contents",
+                "credentials",
+                "provider URLs",
+            ],
+        },
+    }
+    return public
 
 
 def _agent_profile_readiness(item: dict[str, Any]) -> dict[str, Any]:
@@ -7985,3 +8073,77 @@ def agentgate_character():
         "voice": os.environ.get("AGENT_VOICE", "Direct, observant, and calm."),
         "operating_principle": os.environ.get("AGENT_PRINCIPLE", "Use MemoryGate context and ToolGate capabilities within owner approvals."),
     }
+
+
+@app.get("/api/character/sources")
+def list_character_sources(target_agent_id: str | None = None, review_status: str | None = None):
+    _ensure_registry_seeded()
+    rows = []
+    for item in app.state.character_sources.values():
+        public = _public_character_source(item)
+        if target_agent_id and public.get("target_agent_id") != target_agent_id:
+            continue
+        if review_status and public.get("review_status") != review_status:
+            continue
+        rows.append(public)
+    rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
+    return {
+        "sources": rows,
+        "summary": {
+            "total": len(rows),
+            "unreviewed": sum(1 for item in rows if item.get("review_status") == "unreviewed"),
+            "owner_reviewed": sum(1 for item in rows if item.get("review_status") == "owner_reviewed"),
+            "needs_review": sum(1 for item in rows if item.get("review_status") == "needs_review"),
+        },
+        "safety": {
+            "metadata_only": True,
+            "stores": ["review labels", "redacted summaries", "bounded visual notes"],
+            "excludes": ["source pages", "image files", "generated assets", "credentials", "provider URLs"],
+        },
+    }
+
+
+@app.post("/api/character/sources")
+def create_character_source(payload: CharacterSourceInput):
+    _ensure_registry_seeded()
+    if payload.target_agent_id and payload.target_agent_id not in app.state.agents:
+        raise HTTPException(404, "target agent not found")
+    item_id = f"charsrc_{uuid.uuid4().hex[:12]}"
+    cleaned = _safe_character_source_payload(payload)
+    item = {
+        "id": item_id,
+        **cleaned,
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    app.state.character_sources[item_id] = item
+    _save_registry_item("character_source", item)
+    _record_activity(
+        item.get("target_agent_id") or "agent_pi_operator",
+        event_type="character.source_created",
+        status=item.get("review_status") or "unreviewed",
+        source="AgentGate Character Studio",
+        summary=f"Character source review created: {item.get('title') or item_id}",
+        ref_type="character_source",
+        ref_id=item_id,
+    )
+    return _public_character_source(item)
+
+
+@app.delete("/api/character/sources/{source_id}")
+def delete_character_source(source_id: str):
+    item = app.state.character_sources.get(source_id)
+    if not item:
+        raise HTTPException(404, "character source not found")
+    app.state.character_sources.pop(source_id, None)
+    _delete_registry_item("character_source", source_id)
+    _record_activity(
+        item.get("target_agent_id") or "agent_pi_operator",
+        event_type="character.source_deleted",
+        status="deleted",
+        source="AgentGate Character Studio",
+        summary=f"Character source review deleted: {item.get('title') or source_id}",
+        ref_type="character_source",
+        ref_id=source_id,
+    )
+    return {"deleted": True, "id": source_id}

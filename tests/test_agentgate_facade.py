@@ -316,6 +316,7 @@ def reset_state():
     app.state.notification_channels = {}
     app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
+    app.state.character_sources = {}
     app.state.active_job_runs = {}
     app.state.approval_runs = {}
 
@@ -1212,6 +1213,62 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
     assert "raw" not in payload
     assert "https://private.example" not in payload
     assert "token=abc123" not in payload
+
+
+def test_character_source_reviews_are_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        agent = client.post(
+            "/api/agents",
+            json={
+                "name": "Character Source Agent",
+                "purpose": "Review character source metadata.",
+            },
+        ).json()
+        created = client.post(
+            "/api/character/sources",
+            json={
+                "title": "Naruto-like courage notes https://private.example/ref",
+                "source_type": "character_reference",
+                "target_agent_id": agent["id"],
+                "summary": "Owner notes with token=abc123 and no copied source page.",
+                "visual_notes": "Orange palette, file=/home/private/image.png, no actual upload.",
+                "usage_policy": "transformative",
+                "source_confidence": "owner_verified",
+                "asset_review_status": "approved_metadata",
+                "review_status": "owner_reviewed",
+                "source_labels": ["owner seed", "https://private.example/source"],
+                "review_checklist": ["No copied text", "bearer abc123 removed"],
+            },
+        ).json()
+        listed = client.get(f"/api/character/sources?target_agent_id={agent['id']}").json()
+        reviewed = client.get("/api/character/sources?review_status=owner_reviewed").json()
+        activity = client.get(f"/api/agents/{agent['id']}/activity").json()["activity"]
+        deleted = client.delete(f"/api/character/sources/{created['id']}")
+        after_delete = client.get(f"/api/character/sources?target_agent_id={agent['id']}").json()
+
+    assert created["source_type"] == "character_reference"
+    assert created["usage_policy"] == "transformative"
+    assert created["source_confidence"] == "owner_verified"
+    assert created["asset_review_status"] == "approved_metadata"
+    assert created["review_status"] == "owner_reviewed"
+    assert created["source_labels"] == ["owner seed", "[redacted-url]"]
+    assert created["review_checklist"] == ["No copied text", "bearer [redacted] removed"]
+    assert created["safety"]["metadata_only"] is True
+    assert listed["summary"]["total"] == 1
+    assert listed["summary"]["owner_reviewed"] == 1
+    assert reviewed["sources"][0]["id"] == created["id"]
+    assert "character.source_created" in [item["event_type"] for item in activity]
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert after_delete["sources"] == []
+    combined = f"{created} {listed} {reviewed} {activity} {after_delete}".lower()
+    assert "https://private.example" not in combined
+    assert "token=abc123" not in combined
+    assert "/home/private" not in combined
 
 
 def test_agent_profile_readiness_public_projection_redacts_provenance(monkeypatch, tmp_path):
