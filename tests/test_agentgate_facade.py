@@ -943,6 +943,72 @@ def test_app_workspace_preview_proposal_promotion_approval_archived_fails_closed
     assert getattr(app.state.gates, "requests", {}) == {}
 
 
+def test_app_workspace_preview_proposal_promotion_approval_decision_syncs_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post("/api/app-workspaces", json={"name": "Decision Sync Desk"}).json()
+        proposal = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={"name": "Rejected Package", "status": "review_ready", "proposal_type": "tool_package"},
+        ).json()["proposals"][0]
+        queued = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals/{proposal['id']}/promotion-approval",
+            json={"target_kind": "tool_package", "owner_note": "metadata review only"},
+        ).json()
+        rejected = client.post(
+            f"/api/approvals/{queued['approval']['approval_request_id']}/decision",
+            json={"decision": "rejected"},
+        )
+        listed = client.get(f"/api/app-workspaces/{workspace['id']}/preview-proposals").json()["proposals"][0]
+
+    assert rejected.status_code == 200
+    assert rejected.json()["app_preview_promotion_status"] == "rejected"
+    assert listed["approval_status"] == "rejected"
+    assert listed["approval_target_kind"] == "tool_package"
+    assert listed["review_status"] == "blocked"
+    assert "approval_decided_at" not in listed
+    assert "package_manifest" not in json.dumps(listed).lower()
+
+
+def test_app_workspace_preview_proposal_promotion_approval_approved_stays_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post("/api/app-workspaces", json={"name": "Approved Metadata Desk"}).json()
+        proposal = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={"name": "Approved Metadata", "status": "review_ready", "proposal_type": "dashboard_plugin"},
+        ).json()["proposals"][0]
+        queued = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals/{proposal['id']}/promotion-approval",
+            json={"target_kind": "dashboard_plugin", "owner_note": "metadata review only"},
+        ).json()
+        approved = client.post(
+            f"/api/approvals/{queued['approval']['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        )
+        listed_response = client.get(f"/api/app-workspaces/{workspace['id']}/preview-proposals").json()
+        listed = listed_response["proposals"][0]
+
+    assert approved.status_code == 200
+    assert approved.json()["app_preview_promotion_status"] == "approved_metadata"
+    assert listed["approval_status"] == "approved"
+    assert listed["approval_target_kind"] == "dashboard_plugin"
+    assert listed["review_status"] == "approved_metadata"
+    assert listed_response["safety"]["previews_run"] is False
+    assert listed_response["safety"]["packages_installed"] is False
+    assert listed_response["safety"]["apps_published"] is False
+    assert listed_response["safety"]["plugins_promoted"] is False
+    assert listed_response["safety"]["toolgate_called"] is False
+
+
 def test_app_workspace_preview_proposal_promotion_approval_missing_workspace_or_proposal_404(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

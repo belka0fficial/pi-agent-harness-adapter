@@ -2384,6 +2384,31 @@ def _create_app_preview_promotion_approval_request(
     return request
 
 
+def _apply_app_preview_promotion_approval_request(result: dict[str, Any], decision: str) -> None:
+    request_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    proposal_id = str(request_payload.get("subject_id") or "")
+    proposal = getattr(app.state, "app_preview_proposals", {}).get(proposal_id)
+    if not proposal:
+        result["app_preview_promotion_status"] = "proposal_missing"
+        return
+    target_kind = _sanitize_app_preview_promotion_target_kind(
+        request_payload.get("target_kind") or proposal.get("approval_target_kind")
+    )
+    proposal["approval_request_id"] = result.get("id") or proposal.get("approval_request_id")
+    proposal["approval_status"] = decision
+    proposal["approval_target_kind"] = target_kind
+    proposal["approval_decided_at"] = now()
+    if decision == "approved":
+        proposal["review_status"] = "approved_metadata"
+        result["app_preview_promotion_status"] = "approved_metadata"
+    else:
+        proposal["review_status"] = "blocked"
+        result["app_preview_promotion_status"] = "rejected"
+    proposal["updated_at"] = now()
+    app.state.app_preview_proposals[proposal_id] = proposal
+    _save_registry_item("app_preview_proposal", proposal)
+
+
 def _sanitize_app_workspace_profile(payload: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
     existing = existing or {}
     owner_agent_id = str(payload.get("owner_agent_id", existing.get("owner_agent_id") or "agent_pi_operator") or "").strip()
@@ -7022,6 +7047,8 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
                 result["automation_status"] = "rejected"
     if result.get("kind") == "model_route_change" and request_payload.get("subject_type") == "model_route":
         _apply_model_route_request(result, decision)
+    if result.get("kind") == "app_preview_promotion_review" and request_payload.get("subject_type") == "app_preview_proposal":
+        _apply_app_preview_promotion_approval_request(result, decision)
     _record_activity(
         "agent_pi_operator",
         event_type="approval.decided",
