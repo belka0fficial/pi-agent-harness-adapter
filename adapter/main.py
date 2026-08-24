@@ -8142,7 +8142,62 @@ def _freellmapi_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def _free_model_gateway_setup_payload(
+    *,
+    api_url_configured: bool,
+    api_key_configured: bool,
+    health_status: str = "unchecked",
+    models_status: str = "not_checked",
+    models_visible: bool = False,
+    candidate_count: int = 0,
+) -> dict[str, Any]:
+    blockers: list[str] = []
+    if not api_url_configured:
+        blockers.append("FREE_LLM_API_URL is using the local default; confirm a gateway is running there or set it server-side.")
+    if not api_key_configured:
+        blockers.append("FREE_LLM_API_KEY or FREELLMAPI_API_KEY is missing server-side.")
+    if health_status not in {"ok", "unchecked"}:
+        blockers.append("Gateway health check is not passing from the adapter.")
+    if api_key_configured and models_status != "ok":
+        blockers.append("Gateway models endpoint is not returning visible model metadata.")
+    if api_key_configured and models_status == "ok" and not models_visible:
+        blockers.append("Gateway auth works, but no model candidates were visible.")
+    if not blockers and not models_visible:
+        blockers.append("Gateway setup is incomplete.")
+    return {
+        "schema": "agentgate.free_model_gateway.setup.v1",
+        "required_env": ["FREE_LLM_API_URL", "FREE_LLM_API_KEY"],
+        "accepted_key_env": ["FREE_LLM_API_KEY", "FREELLMAPI_API_KEY"],
+        "configured": {
+            "api_url_configured": api_url_configured,
+            "api_key_configured": api_key_configured,
+            "health_status": health_status,
+            "models_status": models_status,
+            "models_visible": models_visible,
+            "candidate_count": candidate_count,
+        },
+        "next_steps": [
+            "Run or configure the FreeLLMAPI-compatible gateway on the host.",
+            "Set FREE_LLM_API_URL and one accepted key env server-side, never in the browser.",
+            "Restart the Pi adapter after changing env, then refresh this dashboard.",
+            "Stage visible candidates only as disabled low-risk helper-route metadata until owner review.",
+        ],
+        "blockers": blockers[:6],
+        "safety": {
+            "metadata_only": True,
+            "execution_enabled": False,
+            "automatic_prompt_routing": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "raw_prompts_included": False,
+            "memory_contents_included": False,
+            "tool_arguments_included": False,
+        },
+    }
+
+
 def _free_model_gateway_candidates_payload() -> dict[str, Any]:
+    api_url_configured = bool(os.environ.get("FREE_LLM_API_URL"))
     freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
     headers = _freellmapi_headers()
     result: dict[str, Any] = {
@@ -8161,29 +8216,67 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
         "candidate_count": 0,
         "runtime_note": "Candidates are metadata only until Pi can see the same provider/model route.",
     }
+    result["setup"] = _free_model_gateway_setup_payload(
+        api_url_configured=api_url_configured,
+        api_key_configured=bool(headers),
+    )
     try:
         ping = httpx.get(f"{freeapi_url}/health", timeout=3)
         if ping.status_code == 200:
             result["gateway"]["status"] = "ok"
+            result["setup"] = _free_model_gateway_setup_payload(
+                api_url_configured=api_url_configured,
+                api_key_configured=bool(headers),
+                health_status="ok",
+            )
     except httpx.HTTPError:
+        result["setup"] = _free_model_gateway_setup_payload(
+            api_url_configured=api_url_configured,
+            api_key_configured=bool(headers),
+            health_status="unavailable",
+        )
         return result
     try:
         response = httpx.get(f"{freeapi_url}/v1/models", headers=headers, timeout=5)
     except httpx.HTTPError:
+        result["setup"] = _free_model_gateway_setup_payload(
+            api_url_configured=api_url_configured,
+            api_key_configured=bool(headers),
+            health_status=str(result["setup"]["configured"]["health_status"]),
+            models_status="unavailable",
+        )
         return result
     if response.status_code in {401, 403}:
         result["gateway"]["status"] = "auth_required"
         result["gateway"]["auth_status"] = "auth_required" if headers else "missing"
         result["gateway"]["models_status"] = "auth_required"
+        result["setup"] = _free_model_gateway_setup_payload(
+            api_url_configured=api_url_configured,
+            api_key_configured=bool(headers),
+            health_status=str(result["setup"]["configured"]["health_status"]),
+            models_status="auth_required",
+        )
         return result
     if response.status_code != 200:
         result["gateway"]["status"] = "unavailable"
         result["gateway"]["models_status"] = "unavailable"
+        result["setup"] = _free_model_gateway_setup_payload(
+            api_url_configured=api_url_configured,
+            api_key_configured=bool(headers),
+            health_status=str(result["setup"]["configured"]["health_status"]),
+            models_status="unavailable",
+        )
         return result
     try:
         payload = response.json()
     except ValueError:
         result["gateway"]["models_status"] = "invalid_response"
+        result["setup"] = _free_model_gateway_setup_payload(
+            api_url_configured=api_url_configured,
+            api_key_configured=bool(headers),
+            health_status=str(result["setup"]["configured"]["health_status"]),
+            models_status="invalid_response",
+        )
         return result
     rows = payload.get("data", []) if isinstance(payload, dict) else []
     candidates = []
@@ -8201,6 +8294,14 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
     result["gateway"]["model_count"] = len(candidates)
     result["candidate_count"] = len(candidates)
     result["candidates"] = candidates
+    result["setup"] = _free_model_gateway_setup_payload(
+        api_url_configured=api_url_configured,
+        api_key_configured=bool(headers),
+        health_status=str(result["setup"]["configured"]["health_status"]),
+        models_status="ok",
+        models_visible=bool(candidates),
+        candidate_count=len(candidates),
+    )
     return result
 
 

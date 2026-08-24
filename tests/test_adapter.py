@@ -684,6 +684,12 @@ def test_gateway_candidates_report_auth_required_without_urls(monkeypatch):
     assert payload["gateway"]["status"] == "auth_required"
     assert payload["gateway"]["configured"] is False
     assert payload["candidate_count"] == 0
+    assert payload["setup"]["schema"] == "agentgate.free_model_gateway.setup.v1"
+    assert payload["setup"]["configured"]["api_key_configured"] is False
+    assert payload["setup"]["configured"]["models_status"] == "auth_required"
+    assert "FREE_LLM_API_KEY" in payload["setup"]["required_env"]
+    assert payload["setup"]["safety"]["credentials_included"] is False
+    assert payload["setup"]["safety"]["provider_urls_included"] is False
     assert "base_url" not in str(payload)
     assert "Invalid unified key" not in str(payload)
 
@@ -724,6 +730,10 @@ def test_gateway_candidates_are_safe_model_metadata(monkeypatch):
 
     candidate = payload["candidates"][0]
     assert payload["gateway"]["models_visible"] is True
+    assert payload["setup"]["configured"]["api_key_configured"] is True
+    assert payload["setup"]["configured"]["models_status"] == "ok"
+    assert payload["setup"]["configured"]["candidate_count"] == 1
+    assert payload["setup"]["safety"]["metadata_only"] is True
     assert candidate["provider"] == "freellmapi"
     assert candidate["model"] == "free-helper"
     assert candidate["owned_by"] == "groq"
