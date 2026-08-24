@@ -4247,6 +4247,152 @@ def _create_job_approval_request(item: dict[str, Any], actor: dict[str, Any]) ->
     )
 
 
+def _task_summary_digest(item: dict[str, Any]) -> str:
+    text = str(item.get("summary") or "").encode("utf-8")
+    return hashlib.sha256(text).hexdigest()
+
+
+def _task_checkpoint_fingerprint(item: dict[str, Any]) -> str:
+    payload = {
+        "agent_id": item.get("agent_id"),
+        "team_id": item.get("team_id"),
+        "title": _redact_handoff_text(item.get("title") or "", limit=160),
+        "summary_digest": _task_summary_digest(item),
+        "checkpoint_note_digest": hashlib.sha256(str(item.get("checkpoint_note") or "").encode("utf-8")).hexdigest(),
+        "priority": item.get("priority"),
+        "risk": item.get("risk"),
+        "required_tool_ids": sorted(item.get("required_tool_ids") or []),
+        "required_memory_scopes": sorted(item.get("required_memory_scopes") or []),
+        "depends_on_task_ids": sorted(item.get("depends_on_task_ids") or []),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _invalidate_task_checkpoint_approval(item: dict[str, Any], *, reason: str = "task checkpoint metadata changed") -> None:
+    if not item.get("owner_checkpoint"):
+        return
+    if not item.get("checkpoint_approval_request_id") and item.get("checkpoint_status") != "approved":
+        return
+    item["checkpoint_status"] = "pending"
+    item["checkpoint_approval_status"] = "stale"
+    item["checkpoint_approval_stale_reason"] = _safe_summary(reason, limit=140)
+    item["checkpoint_approval_request_id"] = None
+    item["checkpoint_approval_requested_at"] = None
+    item["checkpoint_approval_decided_at"] = None
+
+
+def _create_task_checkpoint_approval_request(item: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    if not item.get("owner_checkpoint"):
+        raise HTTPException(409, "task does not require an owner checkpoint")
+    if _task_checkpoint_status(item) == "approved":
+        raise HTTPException(409, "task checkpoint is already approved")
+    existing_request_id = item.get("checkpoint_approval_request_id")
+    if existing_request_id:
+        existing = app.state.gates.request_status(str(existing_request_id))
+        if existing and str(existing.get("status") or "") == "pending":
+            return existing
+    payload = {
+        "subject_type": "task_checkpoint",
+        "subject_id": item["id"],
+        "action": "checkpoint_review",
+        "agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+        "task_title": _redact_handoff_text(item.get("title") or item["id"], limit=160),
+        "task_status": item.get("status") or "queued",
+        "priority": item.get("priority") or "medium",
+        "risk": item.get("risk") or "low",
+        "dependency_count": len(item.get("depends_on_task_ids") or []),
+        "required_tool_count": len(item.get("required_tool_ids") or []),
+        "required_memory_scope_count": len(item.get("required_memory_scopes") or []),
+        "summary_digest": _task_summary_digest(item),
+        "task_fingerprint": _task_checkpoint_fingerprint(item),
+    }
+    request = app.state.gates.create_admin_request(
+        kind="task_checkpoint_review",
+        title=f"Review task checkpoint: {_redact_handoff_text(item.get('title') or item['id'], limit=120)}",
+        details=(
+            "Owner checkpoint review is required before this delegated task can open a scoped room. "
+            "AgentGate sent labels, counts, and a summary digest only; raw task summary, prompts, "
+            "memory contents, tool arguments, and credentials stay server-side."
+        ),
+        payload=payload,
+        severity="warning" if item.get("risk") != "high" else "critical",
+    )
+    item["checkpoint_approval_request_id"] = request.get("id")
+    item["checkpoint_approval_status"] = request.get("status") or "pending"
+    item["checkpoint_fingerprint"] = payload["task_fingerprint"]
+    item["checkpoint_approval_requested_at"] = now()
+    item["checkpoint_status"] = "pending"
+    item["updated_at"] = now()
+    _save_registry_item("task", item)
+    _record_activity(
+        actor["agent_id"],
+        event_type="task.checkpoint_approval_requested",
+        status="pending",
+        source="ToolGate",
+        summary=f"Task checkpoint sent to ToolGate review: {_redact_handoff_text(item.get('title') or item['id'], limit=120)}",
+        team_id=actor["team_id"],
+        ref_type="task",
+        ref_id=item["id"],
+    )
+    return request
+
+
+def _apply_task_checkpoint_approval_request(result: dict[str, Any], decision: str) -> None:
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    task_id = str(payload.get("subject_id") or "")
+    item = app.state.tasks.get(task_id)
+    if not item:
+        return
+    request_fingerprint = str(payload.get("task_fingerprint") or "")
+    current_fingerprint = _task_checkpoint_fingerprint(item)
+    item["checkpoint_approval_request_id"] = result.get("id") or item.get("checkpoint_approval_request_id")
+    item["checkpoint_approval_status"] = decision
+    item["checkpoint_approval_decided_at"] = now()
+    if request_fingerprint and request_fingerprint != current_fingerprint:
+        item["checkpoint_status"] = "pending"
+        item["checkpoint_approval_status"] = "stale"
+        item["checkpoint_approval_stale_reason"] = "task changed after ToolGate review was requested"
+        item["checkpoint_fingerprint"] = current_fingerprint
+        item["updated_at"] = now()
+        _save_registry_item("task", item)
+        _record_activity(
+            item.get("agent_id"),
+            event_type="task.checkpoint_approval_stale",
+            status="pending",
+            source="ToolGate",
+            summary=f"Task checkpoint review became stale: {_redact_handoff_text(item.get('title') or task_id, limit=120)}",
+            team_id=item.get("team_id"),
+            ref_type="task",
+            ref_id=task_id,
+        )
+        return
+    if decision == "approved":
+        item["checkpoint_status"] = "approved"
+        event_type = "task.checkpoint_approved"
+        status = "ready"
+        summary = f"ToolGate approved task checkpoint: {_redact_handoff_text(item.get('title') or task_id, limit=120)}"
+    else:
+        item["checkpoint_status"] = "rejected"
+        item["status"] = "blocked"
+        event_type = "task.checkpoint_rejected"
+        status = "blocked"
+        summary = f"ToolGate rejected task checkpoint: {_redact_handoff_text(item.get('title') or task_id, limit=120)}"
+    item["updated_at"] = now()
+    _save_registry_item("task", item)
+    _record_activity(
+        item.get("agent_id"),
+        event_type=event_type,
+        status=status,
+        source="ToolGate",
+        summary=summary,
+        team_id=item.get("team_id"),
+        ref_type="task",
+        ref_id=task_id,
+    )
+
+
 def _activate_approved_job(job_id: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
     item = app.state.jobs.get(job_id)
     if not item:
@@ -4408,6 +4554,12 @@ def _public_task(item: dict[str, Any]) -> dict[str, Any]:
         "owner_checkpoint": bool(item.get("owner_checkpoint")),
         "checkpoint_status": _task_checkpoint_status(item),
         "checkpoint_note": item.get("checkpoint_note") or "",
+        "checkpoint_approval_request_id": item.get("checkpoint_approval_request_id"),
+        "checkpoint_approval_status": item.get("checkpoint_approval_status"),
+        "checkpoint_approval_requested_at": item.get("checkpoint_approval_requested_at"),
+        "checkpoint_approval_decided_at": item.get("checkpoint_approval_decided_at"),
+        "checkpoint_approval_stale_reason": item.get("checkpoint_approval_stale_reason"),
+        "checkpoint_fingerprint_ready": bool(item.get("checkpoint_fingerprint")),
         "execution_summary": item.get("execution_summary") or "",
         "execution_history": item.get("execution_history") or [],
         "source": item.get("source") or "AgentGate",
@@ -7357,38 +7509,56 @@ def update_task(task_id: str, payload: dict[str, Any]):
     item = app.state.tasks.get(task_id)
     if not item:
         raise HTTPException(404, "task not found")
+    checkpoint_relevant_changed = False
     if "agent_id" in payload or "team_id" in payload:
         actor = _permission_context(
             payload.get("agent_id") or item.get("agent_id"),
             payload.get("team_id") if "team_id" in payload else item.get("team_id"),
         )
-        item["agent_id"] = actor["agent_id"]
-        item["team_id"] = actor["team_id"]
+        if item.get("agent_id") != actor["agent_id"] or item.get("team_id") != actor["team_id"]:
+            checkpoint_relevant_changed = True
+            item["agent_id"] = actor["agent_id"]
+            item["team_id"] = actor["team_id"]
     else:
         actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
     if "title" in payload:
-        item["title"] = _safe_text(payload.get("title"), limit=160)
+        next_title = _safe_text(payload.get("title"), limit=160)
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("title") != next_title
+        item["title"] = next_title
     if "summary" in payload:
-        item["summary"] = _safe_text(payload.get("summary"), limit=1200)
+        next_summary = _safe_text(payload.get("summary"), limit=1200)
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("summary") != next_summary
+        item["summary"] = next_summary
     if "status" in payload:
         item["status"] = _sanitize_task_status(payload.get("status"))
         item["completed_at"] = now() if item["status"] in {"done", "cancelled"} else None
     if "priority" in payload:
-        item["priority"] = _sanitize_priority(payload.get("priority"))
+        next_priority = _sanitize_priority(payload.get("priority"))
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("priority") != next_priority
+        item["priority"] = next_priority
     if "risk" in payload:
-        item["risk"] = _sanitize_risk(payload.get("risk"))
+        next_risk = _sanitize_risk(payload.get("risk"))
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("risk") != next_risk
+        item["risk"] = next_risk
     if "required_tool_ids" in payload or "required_memory_scopes" in payload:
         required_tool_ids, required_memory_scopes = _validate_job_requirements(
             actor,
             payload.get("required_tool_ids", item.get("required_tool_ids")),
             payload.get("required_memory_scopes", item.get("required_memory_scopes")),
         )
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("required_tool_ids") != required_tool_ids or item.get("required_memory_scopes") != required_memory_scopes
         item["required_tool_ids"] = required_tool_ids
         item["required_memory_scopes"] = required_memory_scopes
     if "depends_on_task_ids" in payload:
-        item["depends_on_task_ids"] = _validate_task_dependencies(payload.get("depends_on_task_ids"), current_task_id=task_id)
+        next_depends = _validate_task_dependencies(payload.get("depends_on_task_ids"), current_task_id=task_id)
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("depends_on_task_ids") != next_depends
+        item["depends_on_task_ids"] = next_depends
     if "owner_checkpoint" in payload:
-        item["owner_checkpoint"] = bool(payload.get("owner_checkpoint"))
+        next_owner_checkpoint = bool(payload.get("owner_checkpoint"))
+        if item.get("owner_checkpoint") and not next_owner_checkpoint and item.get("checkpoint_status") in {"pending", "approved"}:
+            raise HTTPException(409, "owner checkpoint cannot be disabled while pending or approved")
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("owner_checkpoint") != next_owner_checkpoint
+        item["owner_checkpoint"] = next_owner_checkpoint
         if item["owner_checkpoint"] and item.get("checkpoint_status") == "not_required":
             item["checkpoint_status"] = "pending"
         if not item["owner_checkpoint"]:
@@ -7397,36 +7567,19 @@ def update_task(task_id: str, payload: dict[str, Any]):
         checkpoint_status = str(payload.get("checkpoint_status") or "").strip()
         if checkpoint_status not in {"pending", "approved", "rejected", "not_required"}:
             raise HTTPException(422, "checkpoint_status must be pending, approved, rejected, or not_required")
+        if checkpoint_status in {"approved", "rejected"}:
+            raise HTTPException(409, "use ToolGate checkpoint review to approve or reject delegated task checkpoints")
         if checkpoint_status != "not_required" and not item.get("owner_checkpoint"):
             raise HTTPException(422, "owner_checkpoint must be enabled before setting checkpoint status")
         item["checkpoint_status"] = checkpoint_status
-        if checkpoint_status == "approved":
-            _record_activity(
-                item.get("agent_id"),
-                event_type="task.checkpoint_approved",
-                status="ready",
-                source="AgentGate",
-                summary=f"Owner checkpoint approved: {item.get('title') or task_id}",
-                team_id=item.get("team_id"),
-                ref_type="task",
-                ref_id=task_id,
-            )
-        elif checkpoint_status == "rejected":
-            item["status"] = "blocked"
-            _record_activity(
-                item.get("agent_id"),
-                event_type="task.checkpoint_rejected",
-                status="blocked",
-                source="AgentGate",
-                summary=f"Owner checkpoint rejected: {item.get('title') or task_id}",
-                team_id=item.get("team_id"),
-                ref_type="task",
-                ref_id=task_id,
-            )
     if "checkpoint_note" in payload:
-        item["checkpoint_note"] = _safe_text(payload.get("checkpoint_note"), limit=600)
+        next_note = _safe_text(payload.get("checkpoint_note"), limit=600)
+        checkpoint_relevant_changed = checkpoint_relevant_changed or item.get("checkpoint_note") != next_note
+        item["checkpoint_note"] = next_note
     if "execution_summary" in payload:
         item["execution_summary"] = _redact_tool_draft_text(payload.get("execution_summary"), limit=1000)
+    if checkpoint_relevant_changed:
+        _invalidate_task_checkpoint_approval(item)
     item["updated_at"] = now()
     _save_registry_item("task", item)
     _record_activity(
@@ -7440,6 +7593,28 @@ def update_task(task_id: str, payload: dict[str, Any]):
         ref_id=task_id,
     )
     return _public_task(item)
+
+
+@app.post("/api/tasks/{task_id}/checkpoint-approval")
+def queue_task_checkpoint_approval(task_id: str):
+    item = app.state.tasks.get(task_id)
+    if not item:
+        raise HTTPException(404, "task not found")
+    actor = _permission_context(item.get("agent_id") or "agent_pi_operator", item.get("team_id"))
+    request = _create_task_checkpoint_approval_request(item, actor)
+    return {
+        "task": _safe_workstream_task_detail(task_id),
+        "approval_request_id": _safe_text(request.get("id"), limit=120),
+        "approval_status": _safe_text(request.get("status") or "pending", limit=60),
+        "safety": {
+            "metadata_only": True,
+            "raw_summary_included": False,
+            "raw_prompts_included": False,
+            "memory_contents_included": False,
+            "tool_arguments_included": False,
+            "credentials_included": False,
+        },
+    }
 
 
 @app.post("/api/tasks/{task_id}/session")
@@ -8085,6 +8260,8 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
         _apply_model_route_request(result, decision)
     if result.get("kind") == "app_preview_promotion_review" and request_payload.get("subject_type") == "app_preview_proposal":
         _apply_app_preview_promotion_approval_request(result, decision)
+    if result.get("kind") == "task_checkpoint_review" and request_payload.get("subject_type") == "task_checkpoint":
+        _apply_task_checkpoint_approval_request(result, decision)
     _record_activity(
         "agent_pi_operator",
         event_type="approval.decided",

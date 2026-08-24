@@ -3385,7 +3385,12 @@ def test_delegated_task_dependencies_and_owner_checkpoint_gate_sessions(monkeypa
         blocked_by_dependency = client.post(f"/api/tasks/{task['id']}/session")
         client.patch(f"/api/tasks/{dependency['id']}", json={"status": "done"})
         blocked_by_checkpoint = client.post(f"/api/tasks/{task['id']}/session")
-        approved = client.patch(f"/api/tasks/{task['id']}", json={"checkpoint_status": "approved"}).json()
+        direct_bypass = client.patch(f"/api/tasks/{task['id']}", json={"checkpoint_status": "approved"})
+        disable_bypass = client.patch(f"/api/tasks/{task['id']}", json={"owner_checkpoint": False})
+        queued = client.post(f"/api/tasks/{task['id']}/checkpoint-approval")
+        request_id = queued.json()["approval_request_id"]
+        approved_decision = client.post(f"/api/approvals/{request_id}/decision", json={"decision": "approved"})
+        approved = client.get(f"/api/tasks/{task['id']}").json()
         opened = client.post(f"/api/tasks/{task['id']}/session")
         activity = client.get(f"/api/tasks/{task['id']}/activity").json()["activity"]
 
@@ -3398,15 +3403,67 @@ def test_delegated_task_dependencies_and_owner_checkpoint_gate_sessions(monkeypa
     assert "dependencies" in blocked_by_dependency.json()["detail"]
     assert blocked_by_checkpoint.status_code == 409
     assert "checkpoint" in blocked_by_checkpoint.json()["detail"]
+    assert direct_bypass.status_code == 409
+    assert disable_bypass.status_code == 409
+    assert queued.status_code == 200
+    assert queued.json()["safety"]["metadata_only"] is True
+    assert queued.json()["safety"]["raw_summary_included"] is False
+    assert queued.json()["task"]["checkpoint_approval_status"] == "pending"
+    assert app.state.gates.request_status(request_id)["kind"] == "task_checkpoint_review"
+    assert app.state.gates.request_status(request_id)["payload"]["summary_digest"]
+    assert "Waits for dependency" not in str(app.state.gates.request_status(request_id))
+    assert approved_decision.status_code == 200
     assert approved["checkpoint_status"] == "approved"
+    assert approved["checkpoint_approval_status"] == "approved"
     assert opened.status_code == 200
     assert opened.json()["session"]["task_id"] == task["id"]
     event_types = [item["event_type"] for item in activity]
     assert "task.checkpoint_requested" in event_types
+    assert "task.checkpoint_approval_requested" in event_types
     assert "task.checkpoint_approved" in event_types
     assert "password" not in str(opened.json()).lower()
     assert "api_key" not in str(opened.json()).lower()
     assert "token" not in str(opened.json()).lower()
+
+
+def test_task_checkpoint_toolgate_review_goes_stale_after_task_change(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        task = client.post(
+            "/api/tasks",
+            json={
+                "title": "Mutable checkpoint",
+                "summary": "private summary token=task-secret https://task.example/path",
+                "agent_id": "agent_pi_operator",
+                "team_id": "team_core",
+                "owner_checkpoint": True,
+            },
+        ).json()
+        queued = client.post(f"/api/tasks/{task['id']}/checkpoint-approval").json()
+        request = app.state.gates.request_status(queued["approval_request_id"])
+        changed = client.patch(f"/api/tasks/{task['id']}", json={"risk": "high"}).json()
+        decided = client.post(
+            f"/api/approvals/{queued['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        )
+        after = client.get(f"/api/tasks/{task['id']}").json()
+        blocked = client.post(f"/api/tasks/{task['id']}/session")
+
+    assert request["payload"]["task_fingerprint"]
+    assert "task-secret" not in str(request)
+    assert "https://task.example" not in str(request)
+    assert "task-secret" not in str(queued)
+    assert "https://task.example" not in str(queued)
+    assert changed["checkpoint_approval_status"] == "stale"
+    assert decided.status_code == 200
+    assert after["checkpoint_status"] == "pending"
+    assert after["checkpoint_approval_status"] == "stale"
+    assert "changed after ToolGate review" in after["checkpoint_approval_stale_reason"]
+    assert blocked.status_code == 409
 
 
 def test_group_session_roster_and_speaker_are_enforced(monkeypatch, tmp_path):
