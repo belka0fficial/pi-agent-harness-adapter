@@ -7206,8 +7206,7 @@ def _freellmapi_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
 
-@app.get("/api/model/gateway-candidates")
-def model_gateway_candidates():
+def _free_model_gateway_candidates_payload() -> dict[str, Any]:
     freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
     headers = _freellmapi_headers()
     result: dict[str, Any] = {
@@ -7216,6 +7215,7 @@ def model_gateway_candidates():
             "name": "FreeLLMAPI",
             "status": "unavailable",
             "configured": bool(headers),
+            "auth_status": "configured" if headers else "missing",
             "models_visible": False,
             "risk": "external",
             "policy": "low_risk_only",
@@ -7237,7 +7237,7 @@ def model_gateway_candidates():
         return result
     if response.status_code in {401, 403}:
         result["gateway"]["status"] = "auth_required"
-        result["gateway"]["configured"] = False
+        result["gateway"]["auth_status"] = "auth_required" if headers else "missing"
         result["gateway"]["models_status"] = "auth_required"
         return result
     if response.status_code != 200:
@@ -7260,6 +7260,7 @@ def model_gateway_candidates():
         if len(candidates) >= 60:
             break
     result["gateway"]["configured"] = True
+    result["gateway"]["auth_status"] = "ok"
     result["gateway"]["models_visible"] = bool(candidates)
     result["gateway"]["model_count"] = len(candidates)
     result["candidate_count"] = len(candidates)
@@ -7267,10 +7268,12 @@ def model_gateway_candidates():
     return result
 
 
-@app.get("/api/model/providers")
-def model_providers():
-    freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
-    headers = _freellmapi_headers()
+@app.get("/api/model/gateway-candidates")
+def model_gateway_candidates():
+    return _free_model_gateway_candidates_payload()
+
+
+def _model_providers_payload(gateway_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     providers = [
         {
             "id": "pi",
@@ -7284,40 +7287,29 @@ def model_providers():
             "policy": "normal",
         }
     ]
+    gateway_payload = gateway_payload if isinstance(gateway_payload, dict) else _free_model_gateway_candidates_payload()
+    gateway = gateway_payload.get("gateway") if isinstance(gateway_payload.get("gateway"), dict) else {}
     freeapi = {
         "id": "freellmapi",
         "name": "FreeLLMAPI",
         "kind": "free-model-gateway",
-        "status": "unavailable",
+        "status": _safe_summary(gateway.get("status") or "unavailable", limit=60),
         "privacy": "external free providers; use only for low-risk helper tasks until reviewed",
-        "configured": False,
-        "models_visible": False,
+        "configured": bool(gateway.get("configured")),
+        "models_visible": bool(gateway.get("models_visible")),
+        "model_count": int(gateway_payload.get("candidate_count") or 0),
+        "models_status": _safe_summary(gateway.get("models_status") or gateway.get("auth_status") or "", limit=60) or None,
         "risk": "external",
         "policy": "low_risk_only",
         "setup_hint": "Configure FreeLLMAPI provider credentials server-side before using it.",
     }
-    try:
-        ping = httpx.get(f"{freeapi_url}/health", timeout=3)
-        if ping.status_code == 200:
-            freeapi["status"] = "ok"
-    except httpx.HTTPError:
-        freeapi["status"] = "unavailable"
-    try:
-        models_response = httpx.get(f"{freeapi_url}/v1/models", headers=headers, timeout=3)
-        if models_response.status_code == 200:
-            models_payload = models_response.json()
-            rows = models_payload.get("data", []) if isinstance(models_payload, dict) else []
-            freeapi["configured"] = True
-            freeapi["models_visible"] = True
-            freeapi["model_count"] = len(rows)
-        elif models_response.status_code in {401, 403}:
-            freeapi["configured"] = False
-            freeapi["models_status"] = "auth_required"
-            freeapi["status"] = "auth_required" if freeapi["status"] == "ok" else freeapi["status"]
-    except (httpx.HTTPError, ValueError):
-        pass
     providers.append(freeapi)
     return {"providers": providers}
+
+
+@app.get("/api/model/providers")
+def model_providers():
+    return _model_providers_payload()
 
 
 @app.get("/api/model/auxiliary-routes")
@@ -7754,11 +7746,11 @@ def save_model_route(agent_id: str, payload: ModelRouteSaveInput):
     }
 
 
-def _safe_model_summary() -> dict[str, Any]:
+def _safe_model_summary(gateway_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     _ensure_registry_seeded()
     _normalize_agent_model_defaults()
     default_agent = app.state.agents.get("agent_pi_operator", {})
-    providers = model_providers().get("providers", [])
+    providers = _model_providers_payload(gateway_payload=gateway_payload).get("providers", [])
     safe_providers = []
     for provider in providers:
         safe_providers.append({
@@ -9507,7 +9499,8 @@ def _verification_snapshot() -> dict[str, Any]:
         },
     ))
 
-    model_summary = _safe_model_summary()
+    gateway_candidates = model_gateway_candidates()
+    model_summary = _safe_model_summary(gateway_payload=gateway_candidates)
     providers = model_summary.get("providers", [])
     providers_visible = sum(1 for item in providers if item.get("models_visible"))
     checks.append(_verification_check(
@@ -9521,6 +9514,37 @@ def _verification_snapshot() -> dict[str, Any]:
             "provider_count": len(providers),
             "providers_visible": providers_visible,
             "default_agent_id": (model_summary.get("default_route") or {}).get("agent_id"),
+        },
+    ))
+    free_provider = next((item for item in providers if item.get("id") == "freellmapi"), {})
+    gateway = gateway_candidates.get("gateway") if isinstance(gateway_candidates.get("gateway"), dict) else {}
+    gateway_status = _safe_summary(gateway.get("status") or free_provider.get("status") or "unavailable", limit=60)
+    gateway_configured = bool(gateway.get("configured"))
+    gateway_models_visible = bool(gateway.get("models_visible"))
+    gateway_candidate_count = int(gateway_candidates.get("candidate_count") or 0)
+    gateway_ready = gateway_status == "ok" and gateway_configured and gateway_models_visible and gateway_candidate_count > 0
+    checks.append(_verification_check(
+        "free-model-gateway-boundary",
+        "Free model gateway boundary",
+        "pass" if gateway_ready else "warn",
+        (
+            "FreeLLMAPI gateway auth is configured and low-risk model candidates are visible as safe metadata."
+            if gateway_ready
+            else "FreeLLMAPI gateway needs owner setup or candidate visibility before helper routes can rely on it."
+        ),
+        source="AgentGate Models",
+        severity="info" if gateway_ready else "warning",
+        detail={
+            "gateway_status": gateway_status,
+            "gateway_configured": gateway_configured,
+            "gateway_models_visible": gateway_models_visible,
+            "candidate_count": gateway_candidate_count,
+            "provider_id": "freellmapi",
+            "auth_status": _safe_summary(gateway.get("auth_status") or "", limit=60) or None,
+            "policy": "low_risk_only",
+            "metadata_only": True,
+            "credentials_included": False,
+            "provider_urls_included": False,
         },
     ))
 

@@ -1871,6 +1871,7 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
         "team-execution-policy-boundary",
         "auxiliary-model-routes",
         "model-provider-metadata",
+        "free-model-gateway-boundary",
         "automation-approval-boundary",
     } <= check_ids
     owner_auth = next(item for item in snapshot["checks"] if item["id"] == "owner-authentication")
@@ -1885,6 +1886,114 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
         re.I,
     )
     assert not forbidden.search(str(snapshot))
+
+
+def test_verification_snapshot_reports_free_model_gateway_boundary_without_secrets(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "c" * 40)
+    monkeypatch.setenv("FREE_LLM_API_URL", "http://freellmapi.internal:3001")
+    monkeypatch.setenv("FREE_LLM_API_KEY", "free-gateway-secret")
+    reset_state()
+    calls = []
+
+    class Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        calls.append({"url": url, "headers": kwargs.get("headers") or {}})
+        if url.endswith("/health"):
+            return Response(200, {"status": "ok"})
+        if url.endswith("/v1/models"):
+            assert kwargs.get("headers", {}).get("Authorization") == "Bearer free-gateway-secret"
+            return Response(
+                200,
+                {
+                    "data": [
+                        {
+                            "id": "stealth/ox-alpha",
+                            "owned_by": "StealthProvider",
+                            "context_window": "128k https://private.invalid/context?token=secret-value",
+                            "modalities": ["text", "api_key=abc123"],
+                            "capabilities": ["reasoning", "bearer hidden-token"],
+                        }
+                    ]
+                },
+            )
+        return Response(404, {})
+
+    monkeypatch.setattr(main.httpx, "get", fake_get)
+
+    with TestClient(app) as client:
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "free-model-gateway-boundary")
+    assert check["status"] == "pass"
+    assert check["detail"]["gateway_status"] == "ok"
+    assert check["detail"]["gateway_configured"] is True
+    assert check["detail"]["gateway_models_visible"] is True
+    assert check["detail"]["candidate_count"] == 1
+    assert check["detail"]["provider_id"] == "freellmapi"
+    assert check["detail"]["auth_status"] == "ok"
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    assert sum(1 for item in calls if item["url"].endswith("/v1/models")) == 1
+    visible = json.dumps(snapshot).lower()
+    assert "free-gateway-secret" not in visible
+    assert "freellmapi.internal" not in visible
+    assert "https://private.invalid" not in visible
+    assert "token=secret-value" not in visible
+    assert "api_key=abc123" not in visible
+    assert "bearer hidden-token" not in visible
+    assert "authorization" not in visible
+
+
+def test_verification_snapshot_reports_missing_gateway_key_as_safe_warning(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "d" * 40)
+    monkeypatch.setenv("FREE_LLM_API_URL", "http://freellmapi.internal:3001")
+    monkeypatch.delenv("FREE_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("FREELLMAPI_API_KEY", raising=False)
+    reset_state()
+
+    class Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/health"):
+            return Response(200, {"status": "ok"})
+        if url.endswith("/v1/models"):
+            assert kwargs.get("headers") == {}
+            return Response(401, {"error": "missing key api_key=secret https://private.invalid/auth"})
+        return Response(404, {})
+
+    monkeypatch.setattr(main.httpx, "get", fake_get)
+
+    with TestClient(app) as client:
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "free-model-gateway-boundary")
+    assert check["status"] == "warn"
+    assert check["detail"]["gateway_status"] == "auth_required"
+    assert check["detail"]["gateway_configured"] is False
+    assert check["detail"]["auth_status"] == "missing"
+    assert check["detail"]["candidate_count"] == 0
+    visible = json.dumps(snapshot).lower()
+    assert "freellmapi.internal" not in visible
+    assert "api_key=secret" not in visible
+    assert "https://private.invalid" not in visible
+    assert "authorization" not in visible
 
 
 def test_verification_snapshot_reports_team_execution_policy_counts(monkeypatch, tmp_path):
