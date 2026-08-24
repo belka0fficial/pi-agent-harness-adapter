@@ -3475,15 +3475,137 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     agent_body = agent_detail.json()
     assert agent_body["ref_type"] == "agent"
     assert agent_body["detail"]["id"] == "agent_pi_operator"
+    assert agent_body["detail"]["schema"] == "agentgate.agent_ref_detail.v1"
     assert "profile_readiness" in agent_body["detail"]
+    assert "soul" not in agent_body["detail"]
+    assert "purpose" not in agent_body["detail"]
+    assert agent_body["insight"]["controls"]["schema"] == "agentgate.agent_controls.v1"
     assert "Open the Agent profile" in agent_body["insight"]["owner_next_step"]
     assert agent_body["safety"]["mode"] == "metadata_only"
     team_body = team_detail.json()
     assert team_body["ref_type"] == "team"
     assert team_body["detail"]["id"] == "team_core"
+    assert team_body["detail"]["schema"] == "agentgate.team_ref_detail.v1"
     assert "orchestration_readiness" in team_body["detail"]
+    assert "purpose" not in team_body["detail"]
+    assert "member_agent_ids" not in team_body["detail"]
+    assert team_body["insight"]["controls"]["schema"] == "agentgate.team_controls.v1"
     assert "Open the Team workroom" in team_body["insight"]["owner_next_step"]
     assert team_body["safety"]["mode"] == "metadata_only"
+
+
+def test_workstream_agent_team_details_are_digest_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        agent = client.post(
+            "/api/agents",
+            json={
+                "name": "Private Coach",
+                "title": "Private title token=title-secret",
+                "purpose": "Never expose purpose token=purpose-secret https://agent.example/path",
+                "soul": "Never expose soul token=soul-secret bearer abc123 raw prompt notes.",
+                "voice": "Never expose voice password=voice-secret https://voice.example/path",
+                "story": "Never expose story secret=story-secret /home/private/story.md",
+                "primary_provider": "openai",
+                "primary_model": "model-safe",
+                "tool_ids": ["tool-secret=https://tool.example"],
+                "skill_ids": ["skill-token=skill-secret"],
+                "memory_scopes": ["memory-secret=memory-secret"],
+            },
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Private Team",
+                "purpose": "Never expose team purpose token=team-secret https://team.example/path",
+                "orchestrator_agent_id": agent["id"],
+                "member_agent_ids": [agent["id"]],
+                "tool_ids": ["team-tool-token=tool-secret"],
+                "skill_ids": ["team-skill-token=skill-secret"],
+                "memory_scopes": ["team-memory-token=memory-secret"],
+                "orchestrator_policy": {
+                    "handoff_mode": "manual",
+                    "approval_mode": "toolgate_required",
+                    "review_status": "unreviewed",
+                    "notes": "Never expose policy token=policy-secret https://policy.example/path",
+                },
+            },
+        ).json()
+        agent_detail = client.get(f"/api/workstream/refs/agent/{agent['id']}")
+        team_detail = client.get(f"/api/workstream/refs/team/{team['id']}")
+
+    assert agent_detail.status_code == 200
+    agent_body = agent_detail.json()
+    agent_safe = agent_body["detail"]
+    assert agent_safe["schema"] == "agentgate.agent_ref_detail.v1"
+    assert agent_safe["purpose_present"] is True
+    assert agent_safe["purpose_digest"]
+    assert agent_safe["soul_present"] is True
+    assert agent_safe["soul_digest"]
+    assert agent_safe["voice_present"] is True
+    assert agent_safe["story_present"] is True
+    assert agent_safe["tool_count"] == 1
+    assert agent_safe["skill_count"] == 1
+    assert agent_safe["memory_scope_count"] == 1
+    assert agent_body["insight"]["controls"]["schema"] == "agentgate.agent_controls.v1"
+    assert agent_body["insight"]["controls"]["metadata_only"] is True
+    assert agent_body["insight"]["controls"]["executes_from_drilldown"] is False
+    assert agent_body["insight"]["controls"]["profile_readiness"]["reason_code"] == "needs_owner_review"
+    assert agent_body["insight"]["controls"]["access_boundary"]["reason_code"] == "grants_present"
+    assert agent_body["insight"]["controls"]["model_route_boundary"]["reason_code"] == "route_present"
+
+    assert team_detail.status_code == 200
+    team_body = team_detail.json()
+    team_safe = team_body["detail"]
+    assert team_safe["schema"] == "agentgate.team_ref_detail.v1"
+    assert team_safe["purpose_present"] is True
+    assert team_safe["purpose_digest"]
+    assert team_safe["member_count"] == 1
+    assert team_safe["tool_count"] == 1
+    assert team_safe["skill_count"] == 1
+    assert team_safe["memory_scope_count"] == 1
+    assert team_body["insight"]["controls"]["schema"] == "agentgate.team_controls.v1"
+    assert team_body["insight"]["controls"]["metadata_only"] is True
+    assert team_body["insight"]["controls"]["executes_from_drilldown"] is False
+    assert team_body["insight"]["controls"]["policy_readiness"]["reason_code"] == "needs_owner_review"
+    assert team_body["insight"]["controls"]["group_execution_boundary"]["reason_code"] == "group_execution_blocked"
+    assert team_body["insight"]["controls"]["access_boundary"]["reason_code"] == "shared_grants_present"
+    detail_joined = json.dumps({"agent": agent_safe, "team": team_safe}).lower()
+    for forbidden_field in [
+        '"member_agent_ids"',
+        '"tool_ids"',
+        '"skill_ids"',
+        '"memory_scopes"',
+        '"orchestrator_policy"',
+    ]:
+        assert forbidden_field not in detail_joined
+
+    joined = json.dumps({"agent": agent_body, "team": team_body}).lower()
+    for forbidden in [
+        "purpose-secret",
+        "soul-secret",
+        "voice-secret",
+        "story-secret",
+        "title-secret",
+        "team-secret",
+        "policy-secret",
+        "skill-secret",
+        "memory-secret",
+        "tool.example",
+        "agent.example",
+        "voice.example",
+        "team.example",
+        "policy.example",
+        "/home/private",
+        "raw prompt",
+        "bearer abc123",
+        "tool-secret=https",
+    ]:
+        assert forbidden not in joined
 
 
 def test_workstream_memory_candidate_controls_are_metadata_only(monkeypatch, tmp_path):

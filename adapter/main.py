@@ -2009,9 +2009,9 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         owner_next_step = "Open the Agent profile to review soul, model route, access grants, and readiness."
         review_state = readiness.get("status") or detail.get("status")
         signal_counts = {
-            "tools": len(detail.get("tool_ids") or []),
-            "skills": len(detail.get("skill_ids") or []),
-            "memory_scopes": len(detail.get("memory_scopes") or []),
+            "tools": int(detail.get("tool_count") or len(detail.get("tool_ids") or [])),
+            "skills": int(detail.get("skill_count") or len(detail.get("skill_ids") or [])),
+            "memory_scopes": int(detail.get("memory_scope_count") or len(detail.get("memory_scopes") or [])),
             "readiness_score": int(readiness.get("score") or 0),
         }
     elif ref_type == "team":
@@ -2019,9 +2019,9 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         owner_next_step = "Open the Team workroom to review roster, orchestrator policy, handoffs, and group turns."
         review_state = readiness.get("status") or detail.get("status")
         signal_counts = {
-            "members": len(detail.get("member_agent_ids") or []),
-            "tools": len(detail.get("tool_ids") or []),
-            "skills": len(detail.get("skill_ids") or []),
+            "members": int(detail.get("member_count") or len(detail.get("member_agent_ids") or [])),
+            "tools": int(detail.get("tool_count") or len(detail.get("tool_ids") or [])),
+            "skills": int(detail.get("skill_count") or len(detail.get("skill_ids") or [])),
             "readiness_score": int(readiness.get("score") or 0),
         }
     elif ref_type == "tool_draft":
@@ -2096,6 +2096,10 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         insight["controls"] = _workstream_tool_draft_controls(detail)
     if ref_type == "app_preview_proposal":
         insight["controls"] = _workstream_app_preview_proposal_controls(detail)
+    if ref_type == "agent":
+        insight["controls"] = _workstream_agent_controls(detail)
+    if ref_type == "team":
+        insight["controls"] = _workstream_team_controls(detail)
     if ref_type == "memory_candidate":
         insight["controls"] = _workstream_memory_candidate_controls(detail)
     return insight
@@ -2556,6 +2560,199 @@ def _workstream_app_preview_proposal_controls(detail: dict[str, Any]) -> dict[st
     }
 
 
+def _workstream_agent_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    readiness = detail.get("profile_readiness") if isinstance(detail.get("profile_readiness"), dict) else {}
+    ready = bool(readiness.get("ready"))
+    review_status = str(readiness.get("review_status") or detail.get("profile_review_status") or "unreviewed")
+    tool_count = int(detail.get("tool_count") or 0)
+    skill_count = int(detail.get("skill_count") or 0)
+    memory_count = int(detail.get("memory_scope_count") or 0)
+    has_primary_route = bool(detail.get("primary_route_present"))
+
+    if not available:
+        return {
+            "schema": "agentgate.agent_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "profile_readiness": _workstream_control(False, "audit_only", "Agent exists only in audit history."),
+            "access_boundary": _workstream_control(False, "audit_only", "Agent exists only in audit history."),
+            "model_route_boundary": _workstream_control(False, "audit_only", "Agent exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.agent_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "profile_readiness": _workstream_control(
+            not ready or review_status != "owner_reviewed",
+            "ready_owner_reviewed" if ready and review_status == "owner_reviewed" else "needs_owner_review",
+            (
+                "Agent profile is ready and owner-reviewed."
+                if ready and review_status == "owner_reviewed"
+                else "Open Agents to review profile metadata, soul, and provenance."
+            ),
+        ),
+        "access_boundary": _workstream_control(
+            tool_count > 0 or skill_count > 0 or memory_count > 0,
+            "grants_present" if tool_count > 0 or skill_count > 0 or memory_count > 0 else "no_grants",
+            (
+                "Open Agents to review tool, skill, and memory grants."
+                if tool_count > 0 or skill_count > 0 or memory_count > 0
+                else "This agent has no explicit grants in the registry."
+            ),
+        ),
+        "model_route_boundary": _workstream_control(
+            has_primary_route,
+            "route_present" if has_primary_route else "route_missing",
+            (
+                "Open Agents or Models to review provider/model route labels."
+                if has_primary_route
+                else "Open Agents or Models to choose a primary model route."
+            ),
+        ),
+    }
+
+
+def _workstream_team_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    readiness = detail.get("orchestration_readiness") if isinstance(detail.get("orchestration_readiness"), dict) else {}
+    ready = bool(readiness.get("ready"))
+    review_status = str(readiness.get("review_status") or detail.get("policy_review_status") or "unreviewed")
+    approval_mode = str(readiness.get("approval_mode") or detail.get("approval_mode") or "toolgate_required")
+    member_count = int(detail.get("member_count") or 0)
+    shared_access = int(detail.get("shared_access_count") or 0)
+
+    if not available:
+        return {
+            "schema": "agentgate.team_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "policy_readiness": _workstream_control(False, "audit_only", "Team exists only in audit history."),
+            "group_execution_boundary": _workstream_control(False, "audit_only", "Team exists only in audit history."),
+            "access_boundary": _workstream_control(False, "audit_only", "Team exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.team_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "policy_readiness": _workstream_control(
+            not ready or review_status != "owner_reviewed" or approval_mode != "toolgate_required",
+            (
+                "ready_toolgate_required"
+                if ready and review_status == "owner_reviewed" and approval_mode == "toolgate_required"
+                else "needs_owner_review"
+            ),
+            (
+                "Team policy is owner-reviewed with ToolGate as the action boundary."
+                if ready and review_status == "owner_reviewed" and approval_mode == "toolgate_required"
+                else "Open Teams to review orchestrator policy before autonomous group execution."
+            ),
+        ),
+        "group_execution_boundary": _workstream_control(
+            ready and review_status == "owner_reviewed" and approval_mode == "toolgate_required",
+            "group_execution_guard_satisfied" if ready and review_status == "owner_reviewed" and approval_mode == "toolgate_required" else "group_execution_blocked",
+            (
+                "Reviewed team policy allows bounded group turns through server-side guards."
+                if ready and review_status == "owner_reviewed" and approval_mode == "toolgate_required"
+                else "Group execution remains blocked until policy review and ToolGate boundary are satisfied."
+            ),
+        ),
+        "access_boundary": _workstream_control(
+            shared_access > 0,
+            "shared_grants_present" if shared_access > 0 else "no_shared_grants",
+            (
+                "Open Teams to review shared tool, skill, and memory grants."
+                if shared_access > 0
+                else "This team has no shared grants configured."
+            ),
+        ),
+    }
+
+
+def _safe_workstream_agent_detail(agent_id: str) -> dict[str, Any]:
+    item = app.state.agents.get(agent_id)
+    if not item:
+        raise HTTPException(404, "workstream reference not found")
+    public = _public_agent(item, activity_limit=0)
+    readiness = public.get("profile_readiness") if isinstance(public.get("profile_readiness"), dict) else {}
+    provenance = public.get("profile_provenance") if isinstance(public.get("profile_provenance"), dict) else {}
+    purpose = str(item.get("purpose") or "")
+    soul = str(item.get("soul") or "")
+    voice = str(item.get("voice") or "")
+    story = str(item.get("story") or "")
+    return {
+        "schema": "agentgate.agent_ref_detail.v1",
+        "id": public.get("id"),
+        "name": _redact_profile_metadata_text(public.get("name") or public.get("id"), limit=80),
+        "title": _redact_profile_metadata_text(public.get("title") or "", limit=120),
+        "mode": _redact_profile_metadata_text(public.get("mode") or "", limit=80),
+        "status": _redact_profile_metadata_text(public.get("status") or "draft", limit=40),
+        "profile_readiness": readiness,
+        "profile_review_status": provenance.get("review_status") or readiness.get("review_status") or "unreviewed",
+        "purpose_present": bool(purpose),
+        "purpose_digest": hashlib.sha256(purpose.encode("utf-8")).hexdigest() if purpose else "",
+        "purpose_chars": len(purpose),
+        "soul_present": bool(soul),
+        "soul_digest": hashlib.sha256(soul.encode("utf-8")).hexdigest() if soul else "",
+        "soul_chars": len(soul),
+        "voice_present": bool(voice),
+        "voice_digest": hashlib.sha256(voice.encode("utf-8")).hexdigest() if voice else "",
+        "voice_chars": len(voice),
+        "story_present": bool(story),
+        "story_digest": hashlib.sha256(story.encode("utf-8")).hexdigest() if story else "",
+        "story_chars": len(story),
+        "personality_count": len(public.get("personality") or []),
+        "appearance_present": isinstance(public.get("appearance"), dict) and bool(public.get("appearance")),
+        "voice_profile_present": isinstance(public.get("voice_profile"), dict) and bool(public.get("voice_profile")),
+        "expression_profile_present": isinstance(public.get("expression_profile"), dict) and bool(public.get("expression_profile")),
+        "tool_count": len(public.get("tool_ids") or []),
+        "skill_count": len(public.get("skill_ids") or []),
+        "memory_scope_count": len(public.get("memory_scopes") or []),
+        "team_count": len(public.get("team_ids") or []),
+        "primary_route_present": bool(public.get("primary_provider") or public.get("primary_model")),
+        "fallback_route_present": bool(public.get("fallback_provider") or public.get("fallback_model")),
+        "created_at": public.get("created_at"),
+        "updated_at": public.get("updated_at"),
+    }
+
+
+def _safe_workstream_team_detail(team_id: str) -> dict[str, Any]:
+    item = app.state.teams.get(team_id)
+    if not item:
+        raise HTTPException(404, "workstream reference not found")
+    public = _public_team(item, activity_limit=0)
+    readiness = public.get("orchestration_readiness") if isinstance(public.get("orchestration_readiness"), dict) else {}
+    policy = _safe_orchestrator_policy(item.get("orchestrator_policy"))
+    purpose = str(item.get("purpose") or "")
+    return {
+        "schema": "agentgate.team_ref_detail.v1",
+        "id": public.get("id"),
+        "name": _redact_profile_metadata_text(public.get("name") or public.get("id"), limit=80),
+        "status": _redact_profile_metadata_text(public.get("status") or "draft", limit=40),
+        "purpose_present": bool(purpose),
+        "purpose_digest": hashlib.sha256(purpose.encode("utf-8")).hexdigest() if purpose else "",
+        "purpose_chars": len(purpose),
+        "orchestrator_present": bool(public.get("orchestrator_agent_id")),
+        "orchestrator_is_member": bool(public.get("orchestrator_agent_id") in (public.get("member_agent_ids") or [])),
+        "member_count": len(public.get("member_agent_ids") or []),
+        "tool_count": len(public.get("tool_ids") or []),
+        "skill_count": len(public.get("skill_ids") or []),
+        "memory_scope_count": len(public.get("memory_scopes") or []),
+        "shared_access_count": len(public.get("tool_ids") or []) + len(public.get("skill_ids") or []) + len(public.get("memory_scopes") or []),
+        "policy_review_status": policy.get("review_status") or "unreviewed",
+        "approval_mode": policy.get("approval_mode") or "toolgate_required",
+        "handoff_mode": policy.get("handoff_mode") or "manual",
+        "turn_order": policy.get("turn_order") or "roster",
+        "max_sequence_rounds": policy.get("max_sequence_rounds") or 3,
+        "max_speakers_per_round": policy.get("max_speakers_per_round") or 6,
+        "orchestration_readiness": readiness,
+        "created_at": public.get("created_at"),
+        "updated_at": public.get("updated_at"),
+    }
+
+
 def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_type = _safe_summary(ref_type, limit=80)
     clean_id = _safe_summary(ref_id, limit=160)
@@ -2596,7 +2793,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
                 "summary": "Reference is present in audit history but not in current runtime state.",
             }
         else:
-            detail = _public_agent(app.state.agents[clean_id], activity_limit=5)
+            detail = _safe_workstream_agent_detail(clean_id)
     elif clean_type == "approval":
         detail = _safe_workstream_approval_detail(clean_id)
     elif clean_type == "team":
@@ -2608,7 +2805,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
                 "summary": "Reference is present in audit history but not in current runtime state.",
             }
         else:
-            detail = _public_team(app.state.teams[clean_id], activity_limit=5)
+            detail = _safe_workstream_team_detail(clean_id)
     elif clean_type == "job":
         if clean_id not in app.state.jobs:
             detail = {
