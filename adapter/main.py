@@ -2216,6 +2216,176 @@ def _workstream(limit: int = 60) -> dict[str, Any]:
     }
 
 
+def _open_loop_target_path(ref_type: str) -> str:
+    return {
+        "approval": "/approvals",
+        "job": "/automations",
+        "task": "/tasks",
+        "session": "/chats",
+        "agent": "/agents",
+        "team": "/agents",
+        "memory_candidate": "/memory",
+        "tool_draft": "/tools",
+        "app_workspace": "/apps",
+        "app_artifact": "/apps",
+        "app_preview_proposal": "/apps",
+    }.get(ref_type, "/")
+
+
+def _open_loop_priority(ref_type: str, status: str, controls: dict[str, Any] | None) -> str:
+    enabled_controls = [
+        key
+        for key, value in (controls or {}).items()
+        if isinstance(value, dict) and value.get("enabled") is True
+    ]
+    if ref_type == "approval":
+        return "high"
+    if ref_type in {"memory_candidate", "tool_draft", "app_preview_proposal", "task"} and enabled_controls:
+        return "high"
+    if status in {"failed", "blocked", "stale", "quarantined", "review_ready", "pending"}:
+        return "medium"
+    return "low"
+
+
+def _open_loop_status(ref_type: str, status: str, controls: dict[str, Any] | None) -> str:
+    if ref_type == "approval":
+        return "needs-approval"
+    enabled_controls = [
+        key
+        for key, value in (controls or {}).items()
+        if isinstance(value, dict) and value.get("enabled") is True
+    ]
+    if enabled_controls:
+        return "owner-review"
+    if status in {"failed", "blocked", "stale", "quarantined", "review_ready", "pending"}:
+        return "owner-review"
+    return "observed"
+
+
+def _open_loop_from_workstream_ref(event: dict[str, Any]) -> dict[str, Any] | None:
+    ref_type = _safe_summary(event.get("ref_type") or "", limit=80)
+    ref_id = _safe_summary(event.get("ref_id") or "", limit=120)
+    if not ref_type or not ref_id:
+        return None
+    try:
+        ref_detail = _safe_workstream_ref_detail(ref_type, ref_id)
+    except HTTPException:
+        return None
+    insight = ref_detail.get("insight") if isinstance(ref_detail.get("insight"), dict) else {}
+    controls = insight.get("controls") if isinstance(insight.get("controls"), dict) else {}
+    status = _safe_summary(insight.get("review_state") or insight.get("status") or event.get("status") or "metadata", limit=80)
+    loop_status = _open_loop_status(ref_type, status, controls)
+    if loop_status == "observed":
+        return None
+    signal_counts = insight.get("signal_counts") if isinstance(insight.get("signal_counts"), dict) else {}
+    enabled_controls = [
+        key
+        for key, value in controls.items()
+        if isinstance(value, dict) and value.get("enabled") is True
+    ]
+    evidence = [
+        f"Safe workstream ref {ref_type}:{ref_id}",
+        f"Review state {status}; enabled controls {len(enabled_controls)}",
+    ]
+    if signal_counts:
+        evidence.append(f"Signal count keys {len(signal_counts)}")
+    return {
+        "id": _safe_summary(f"loop-workstream-{ref_type}-{ref_id}", limit=180),
+        "title": _redact_audit_text(f"{ref_type.replace('_', ' ').title()} needs owner review", limit=160),
+        "lane": _safe_summary(ref_type.replace("_", " ").title(), limit=80),
+        "priority": _open_loop_priority(ref_type, status, controls),
+        "confidence_label": "workstream control metadata",
+        "status": loop_status,
+        "signal": _redact_audit_text(insight.get("owner_next_step") or event.get("summary") or "Open the owning screen to review this item.", limit=220),
+        "evidence": evidence[:3],
+        "next_step": _redact_audit_text(insight.get("owner_next_step") or "Open the owning AgentGate screen to inspect safe metadata.", limit=220),
+        "approval_required": ref_type == "approval",
+        "target_path": _open_loop_target_path(ref_type),
+        "source": {
+            "kind": "workstream-ref",
+            "ref_type": ref_type,
+            "ref_id": ref_id,
+            "observed_at": event.get("time"),
+        },
+    }
+
+
+def _open_loops(limit: int = 12) -> dict[str, Any]:
+    limit = min(max(limit, 1), 24)
+    loops: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    seen_refs: set[tuple[str, str]] = set()
+    for approval in app.state.gates.approvals(history=False):
+        approval_ref_id = _safe_summary(approval.get("id") or "", limit=120)
+        binding = approval.get("binding") if isinstance(approval.get("binding"), dict) else {}
+        loop = {
+            "id": _safe_summary(f"loop-approval-{approval.get('id')}", limit=180),
+            "title": _redact_audit_text(approval.get("title") or "ToolGate approval request", limit=160),
+            "lane": "Approval boundary",
+            "priority": _safe_summary(approval.get("severity") or "medium", limit=20) if approval.get("severity") in {"high", "medium", "low"} else "medium",
+            "confidence_label": "ToolGate binding",
+            "status": "needs-approval",
+            "signal": "ToolGate request is waiting for owner decision.",
+            "evidence": [
+                f"ToolGate approval {_safe_summary(approval.get('id') or '', limit=120)} is pending for {_safe_summary(binding.get('type') or 'request', limit=80)}:{_redact_audit_text(binding.get('id') or '', limit=120)}",
+                f"Binding digest {_redact_audit_text(binding.get('digest') or '', limit=120)}",
+            ],
+            "next_step": "Review the ToolGate-bound request before anything executes.",
+            "approval_required": True,
+            "target_path": "/approvals",
+            "source": {
+                "kind": "toolgate-approval",
+                "ref_type": "approval",
+                "ref_id": approval_ref_id,
+                "observed_at": approval.get("created_at"),
+            },
+        }
+        seen.add(loop["id"])
+        seen_refs.add(("approval", approval_ref_id))
+        loops.append(loop)
+    for event in _workstream(limit=60)["events"]:
+        ref_key = (
+            _safe_summary(event.get("ref_type") or "", limit=80),
+            _safe_summary(event.get("ref_id") or "", limit=120),
+        )
+        if ref_key in seen_refs:
+            continue
+        loop = _open_loop_from_workstream_ref(event)
+        if not loop or loop["id"] in seen:
+            continue
+        seen.add(loop["id"])
+        seen_refs.add(ref_key)
+        loops.append(loop)
+        if len(loops) >= limit:
+            break
+    priority_rank = {"high": 3, "medium": 2, "low": 1}
+    loops.sort(key=lambda item: (bool(item.get("approval_required")), priority_rank.get(str(item.get("priority")), 0)), reverse=True)
+    loops = loops[:limit]
+    return {
+        "schema": "agentgate.open_loops.v1",
+        "loops": loops,
+        "summary": {
+            "total": len(loops),
+            "needs_approval": len([item for item in loops if item.get("approval_required") is True]),
+            "owner_review": len([item for item in loops if item.get("approval_required") is not True]),
+        },
+        "safety": {
+            "metadata_only": True,
+            "actions_executed": False,
+            "approvals_decided": False,
+            "jobs_started": False,
+            "memory_written": False,
+            "tools_installed": False,
+            "raw_prompts_included": False,
+            "memory_contents_included": False,
+            "tool_arguments_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "host_paths_included": False,
+        },
+    }
+
+
 def _safe_session_detail(session_id: str) -> dict[str, Any]:
     item = app.state.sessions.get(session_id)
     if not item:
@@ -10040,6 +10210,11 @@ def agentgate_audit(limit: int = 60):
 @app.get("/api/workstream")
 def agentgate_workstream(limit: int = 60):
     return _workstream(limit=limit)
+
+
+@app.get("/api/open-loops")
+def agentgate_open_loops(limit: int = 12):
+    return _open_loops(limit=limit)
 
 
 @app.get("/api/workstream/refs/{ref_type}/{ref_id}")

@@ -4708,6 +4708,93 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert team_body["safety"]["mode"] == "metadata_only"
 
 
+def test_open_loop_radar_uses_only_safe_workstream_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    def approvals(*, history: bool = False):
+        if history:
+            return []
+        return [{
+            "id": "req-radar",
+            "source": "ToolGate",
+            "severity": "high",
+            "title": "Review echo token=approval-title-secret",
+            "details": "Do not expose raw prompt api_key=approval-detail-secret https://approval.example/path",
+            "binding": {
+                "type": "tool",
+                "id": "echo token=approval-binding-secret",
+                "version": "1",
+                "digest": "sha256:radar",
+            },
+            "created_at": "2026-01-02T00:00:00+00:00",
+        }]
+
+    monkeypatch.setattr(app.state.gates, "approvals", approvals)
+    with TestClient(app) as client:
+        app.state.memory_candidates = {
+            "mem-radar": {
+                "id": "mem-radar",
+                "text": "private memory token=memory-secret https://memory.example/path /home/alexey/private",
+                "status": "pending",
+                "memory_type": "preference",
+                "confidence": "high",
+                "tags": ["safe"],
+                "evidence": {
+                    "session_id": "sess-1",
+                    "source_message_id": "msg-secret",
+                    "source_role": "user",
+                },
+                "created_at": "2026-01-03T00:00:00+00:00",
+            }
+        }
+        response = client.get("/api/open-loops?limit=8")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema"] == "agentgate.open_loops.v1"
+    assert body["summary"]["total"] >= 2
+    assert body["summary"]["needs_approval"] == 1
+    assert body["safety"]["metadata_only"] is True
+    assert body["safety"]["actions_executed"] is False
+    assert body["safety"]["approvals_decided"] is False
+    assert body["safety"]["memory_written"] is False
+    assert body["safety"]["tool_arguments_included"] is False
+    assert body["safety"]["credentials_included"] is False
+    approval_loop = next(item for item in body["loops"] if item["source"]["ref_type"] == "approval")
+    memory_loop = next(item for item in body["loops"] if item["source"]["ref_type"] == "memory_candidate")
+    assert approval_loop["status"] == "needs-approval"
+    assert approval_loop["approval_required"] is True
+    assert approval_loop["target_path"] == "/approvals"
+    assert approval_loop["signal"] == "ToolGate request is waiting for owner decision."
+    assert memory_loop["status"] == "owner-review"
+    assert memory_loop["approval_required"] is False
+    assert memory_loop["target_path"] == "/memory"
+    assert "enabled controls" in " ".join(memory_loop["evidence"])
+
+    joined = json.dumps(body).lower()
+    for forbidden in [
+        "approval-title-secret",
+        "approval-detail-secret",
+        "approval-binding-secret",
+        "memory-secret",
+        "https://approval.example",
+        "https://memory.example",
+        "/home/alexey",
+        "api_key=approval",
+        "raw prompt",
+        "tool arguments api",
+        "\"text\":",
+        "\"content\":",
+        "\"provider_url\":",
+        "\"run_id\":",
+        "/api/sessions",
+        "/v1/runs",
+    ]:
+        assert forbidden not in joined
+
+
 def test_workstream_agent_team_details_are_digest_only(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
