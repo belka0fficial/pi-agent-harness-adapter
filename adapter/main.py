@@ -4895,6 +4895,62 @@ def get_session(session_id: str):
     return _public_session(item)
 
 
+@app.get("/api/sessions/{session_id}/approvals")
+def get_session_approvals(session_id: str):
+    if session_id not in app.state.sessions:
+        raise HTTPException(404, "session not found")
+    pending_by_id = {
+        str(item.get("id") or ""): item
+        for item in app.state.gates.approvals(history=False)
+    }
+    approvals = []
+    for request_id, binding in app.state.approval_runs.items():
+        if binding.get("session_id") != session_id:
+            continue
+        if str(request_id) not in pending_by_id:
+            continue
+        detail = _safe_workstream_approval_detail(str(request_id))
+        approvals.append(
+            {
+                "id": detail["id"],
+                "source": detail["source"],
+                "severity": detail["severity"],
+                "title": detail["title"],
+                "details": detail["details"],
+                "binding": {
+                    "type": detail["binding"]["subject_type"],
+                    "id": detail["binding"]["subject_id_label"],
+                    "version": detail["binding"]["subject_version"],
+                    "digest": detail["binding"]["digest"],
+                },
+                "created_at": detail["created_at"],
+                "session_id": session_id,
+                "agent_id": _safe_summary(binding.get("agent_id") or "", limit=120) or None,
+                "team_id": _safe_summary(binding.get("team_id") or "", limit=120) or None,
+                "metadata_only": True,
+                "tool_args_included": False,
+                "memory_contents_included": False,
+                "credentials_included": False,
+                "provider_urls_included": False,
+                "host_paths_included": False,
+                "raw_run_id_included": False,
+            }
+        )
+    approvals.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return {
+        "session_id": session_id,
+        "approvals": approvals,
+        "count": len(approvals),
+        "metadata_only": True,
+        "tool_args_included": False,
+        "memory_contents_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
+        "raw_run_ids_included": False,
+    }
+
+
 @app.patch("/api/sessions/{session_id}")
 def update_session(session_id: str, payload: dict[str, Any]):
     item = app.state.sessions.get(session_id)
@@ -6538,6 +6594,17 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
                 run_id = str(event_data.get("run_id") or "")
                 if event.event == "run.started" and run_id:
                     request.app.state.active_runs[session_id] = run_id
+                    event = PiEvent(
+                        "run.started",
+                        {
+                            "session_id": session_id,
+                            "agent_id": actor["agent_id"],
+                            "team_id": actor["team_id"],
+                            "status": "running",
+                            "metadata_only": True,
+                            "raw_run_id_included": False,
+                        },
+                    )
                 if event.event == "approval.required" and run_id:
                     request_id = str(event_data.get("request_id") or event_data.get("approval_id") or event_data.get("id") or "")
                     tool_id = str(event_data.get("tool_name") or event_data.get("name") or "")
@@ -6560,6 +6627,24 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
                             ref_type="approval",
                             ref_id=request_id,
                         )
+                    event = PiEvent(
+                        "approval.required",
+                        {
+                            "request_id": _safe_summary(request_id, limit=120),
+                            "tool_name": _safe_summary(tool_id, limit=120),
+                            "session_id": session_id,
+                            "agent_id": actor["agent_id"],
+                            "team_id": actor["team_id"],
+                            "status": "waiting",
+                            "metadata_only": True,
+                            "tool_args_included": False,
+                            "memory_contents_included": False,
+                            "credentials_included": False,
+                            "provider_urls_included": False,
+                            "host_paths_included": False,
+                            "raw_run_id_included": False,
+                        },
+                    )
                 if event.event == "message.delta":
                     collected.append(str(event_data.get("delta") or event_data.get("text") or event_data.get("content") or ""))
                 if event.event in {"run.failed", "run.stopped"}:

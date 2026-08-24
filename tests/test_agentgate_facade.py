@@ -303,6 +303,24 @@ class LocalNotificationPi:
         yield PiEvent("message.completed", {"message_id": "msg-local-notification"})
 
 
+class ApprovalRequiredPi:
+    async def stream(self, prompt: str, *, session_id: str, options: dict | None = None):
+        yield PiEvent("run.started", {"run_id": "run-secret-123", "session_id": session_id})
+        yield PiEvent(
+            "approval.required",
+            {
+                "run_id": "run-secret-123",
+                "request_id": "req-pending",
+                "tool_name": "echo",
+                "summary": {
+                    "action": "token=abc123 https://private.example/path /home/alexey/private memory text",
+                    "raw_args": {"secret": "abc123"},
+                },
+            },
+        )
+        yield PiEvent("message.completed", {"message_id": "msg-approval"})
+
+
 def reset_state():
     app.state.sessions = {"sess-1": {"id": "sess-1", "title": "Real session", "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-02T00:00:00+00:00"}}
     app.state.messages = {"sess-1": [{"id": "u1", "role": "user", "content": "hello", "created_at": "2026-01-01T00:00:00+00:00"}, {"id": "a1", "role": "assistant", "content": "hi", "created_at": "2026-01-01T00:01:00+00:00"}]}
@@ -377,6 +395,103 @@ def test_agentgate_facade_decides_toolgate_approval():
     assert response.status_code == 200
     assert response.json()["id"] == "req-pending"
     assert response.json()["status"] == "approved"
+
+
+def test_session_approvals_are_session_scoped_and_redacted():
+    reset_state()
+    app.state.sessions["sess-2"] = {"id": "sess-2", "title": "Other session", "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00"}
+    app.state.approval_runs = {
+        "req-pending": {
+            "run_id": "run-secret-123",
+            "session_id": "sess-1",
+            "agent_id": "agent_pi_operator",
+            "team_id": "team_core",
+            "tool_id": "echo",
+            "tool_ids": ["echo"],
+        },
+        "req-other": {
+            "run_id": "run-other-secret",
+            "session_id": "sess-2",
+            "agent_id": "agent_pi_operator",
+            "team_id": "team_core",
+            "tool_id": "echo",
+            "tool_ids": ["echo"],
+        },
+    }
+
+    with TestClient(app) as client:
+        response = client.get("/api/sessions/sess-1/approvals")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert payload["approvals"][0]["id"] == "req-pending"
+    assert payload["approvals"][0]["details"] == "Stored in ToolGate"
+    assert payload["approvals"][0]["metadata_only"] is True
+    assert payload["raw_run_ids_included"] is False
+    serialized = json.dumps(payload).lower()
+    for forbidden in [
+        "run-secret",
+        "run-other-secret",
+        "req-other",
+        "token=abc123",
+        "https://private.example",
+        "/home/alexey",
+        "raw_args",
+        "secret",
+        "memory text",
+    ]:
+        assert forbidden not in serialized
+
+
+def test_chat_stream_sanitizes_approval_required_event():
+    reset_state()
+    app.state.pi = ApprovalRequiredPi()
+    app.state.agents = {
+        "agent_pi_operator": {
+            "id": "agent_pi_operator",
+            "name": "Pi",
+            "tool_ids": ["echo"],
+            "skill_ids": [],
+            "memory_scopes": [],
+            "team_ids": ["team_core"],
+        }
+    }
+    app.state.teams = {
+        "team_core": {
+            "id": "team_core",
+            "name": "Core",
+            "member_agent_ids": ["agent_pi_operator"],
+            "tool_ids": [],
+            "skill_ids": [],
+            "memory_scopes": [],
+        }
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sessions/sess-1/chat/stream",
+            json={"input": "please run the gated echo", "agent_id": "agent_pi_operator", "team_id": "team_core"},
+        )
+        session_approvals = client.get("/api/sessions/sess-1/approvals")
+
+    assert response.status_code == 200
+    assert "event: approval.required" in response.text
+    assert '"metadata_only":true' in response.text.replace(" ", "")
+    assert '"raw_run_id_included":false' in response.text.replace(" ", "")
+    assert session_approvals.status_code == 200
+    assert session_approvals.json()["approvals"][0]["id"] == "req-pending"
+    serialized = f"{response.text} {json.dumps(session_approvals.json())}".lower()
+    for forbidden in [
+        "run-secret",
+        "token=abc123",
+        "https://private.example",
+        "/home/alexey",
+        "raw_args",
+        "secret",
+        "memory text",
+    ]:
+        assert forbidden not in serialized
 
 
 def test_owner_auth_fails_closed_when_not_configured(monkeypatch):
