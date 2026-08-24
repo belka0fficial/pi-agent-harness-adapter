@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from adapter import main
 from adapter.gates import GateClients
 from adapter.main import app
-from adapter.pi_client import PiEvent
+from adapter.pi_client import PiClient, PiEvent
 
 
 class FakeGates:
@@ -2669,6 +2669,107 @@ def test_verification_snapshot_warns_on_unsafe_sidecar_runtime_without_leaking_v
     assert "secret-value" not in visible
     assert "/home/private" not in visible
     assert "avatar.glb" not in visible
+
+
+def test_verification_snapshot_reports_pi_runtime_concurrency_boundary(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "k" * 40)
+    monkeypatch.delenv("PI_MAX_CONCURRENT_RUNS", raising=False)
+    reset_state()
+    app.state.pi = PiClient(command="fake-pi")
+
+    with TestClient(app) as client:
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "pi-runtime-concurrency")
+    assert check["status"] == "pass"
+    assert check["severity"] == "info"
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["limit_source"] == "PI_MAX_CONCURRENT_RUNS"
+    assert check["detail"]["run_limit"] == 1
+    assert check["detail"]["default_serialized"] is True
+    assert check["detail"]["semaphore_enabled"] is True
+    assert check["detail"]["active_run_count"] == 0
+    assert check["detail"]["active_session_count"] == 0
+    assert check["detail"]["active_rpc_process_count"] == 0
+    assert check["detail"]["warning_count"] == 0
+    assert check["detail"]["run_ids_included"] is False
+    assert check["detail"]["session_ids_included"] is False
+    assert check["detail"]["prompts_included"] is False
+    assert check["detail"]["process_args_included"] is False
+    assert check["detail"]["process_ids_included"] is False
+    assert check["detail"]["session_files_included"] is False
+    assert check["detail"]["environment_included"] is False
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    assert check["detail"]["host_paths_included"] is False
+    visible = json.dumps(check).lower()
+    assert "run_secret" not in visible
+    assert "/home/" not in visible
+    assert "--append-system-prompt" not in visible
+    assert "toolgate_execution_key" not in visible
+    assert "api_key" not in visible
+    assert "token=" not in visible
+
+
+def test_verification_snapshot_warns_on_pi_runtime_concurrency_over_limit_without_leaking_values(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "l" * 40)
+    monkeypatch.setenv("PI_MAX_CONCURRENT_RUNS", "1")
+    reset_state()
+    pi = PiClient(command="fake-pi")
+
+    class ProcessProbe:
+        returncode = None
+        pid = 424242
+        args = ["pi", "--append-system-prompt", "token=secret"]
+
+    class RuntimeProbe:
+        process = ProcessProbe()
+        session_file = "/home/private/pi-session.json"
+        current_config = {"toolgate_execution_key": "secret", "provider": "https://private.invalid"}
+
+    pi._sessions = {"sess_secret_path": RuntimeProbe(), "sess_two": RuntimeProbe()}  # type: ignore[assignment]
+    pi._runs = {"run_secret_one": object(), "run_secret_two": object()}  # type: ignore[assignment]
+    app.state.pi = pi
+
+    with TestClient(app) as client:
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "pi-runtime-concurrency")
+    assert check["status"] == "warn"
+    assert check["severity"] == "warning"
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["run_limit"] == 1
+    assert check["detail"]["active_run_count"] == 2
+    assert check["detail"]["active_session_count"] == 2
+    assert check["detail"]["active_rpc_process_count"] == 2
+    assert check["detail"]["active_run_over_limit"] is True
+    assert check["detail"]["active_rpc_process_over_limit"] is True
+    assert check["detail"]["warning_count"] >= 2
+    assert check["detail"]["run_ids_included"] is False
+    assert check["detail"]["session_ids_included"] is False
+    assert check["detail"]["prompts_included"] is False
+    assert check["detail"]["process_args_included"] is False
+    assert check["detail"]["process_ids_included"] is False
+    assert check["detail"]["session_files_included"] is False
+    assert check["detail"]["environment_included"] is False
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    assert check["detail"]["host_paths_included"] is False
+    visible = json.dumps(check).lower()
+    assert "run_secret" not in visible
+    assert "sess_secret" not in visible
+    assert "424242" not in visible
+    assert "/home/private" not in visible
+    assert "--append-system-prompt" not in visible
+    assert "token=secret" not in visible
+    assert "toolgate_execution_key" not in visible
+    assert "private.invalid" not in visible
+    assert "current_config" not in visible
+    assert "processprobe" not in visible
 
 
 def test_verification_snapshot_warns_on_available_nonlocal_notification_channel(monkeypatch, tmp_path):

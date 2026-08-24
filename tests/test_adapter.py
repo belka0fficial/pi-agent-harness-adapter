@@ -825,6 +825,56 @@ def test_pi_client_serializes_streams_by_default(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_pi_client_runtime_concurrency_snapshot_uses_counts_only(monkeypatch):
+    monkeypatch.setenv("PI_MAX_CONCURRENT_RUNS", "2")
+    client = PiClient(command="fake-pi")
+
+    class ProcessProbe:
+        returncode = None
+        pid = 424242
+        args = ["pi", "--append-system-prompt", "token=secret"]
+
+    class RuntimeProbe:
+        process = ProcessProbe()
+        session_file = "/home/private/pi-session.json"
+        current_config = {"toolgate_execution_key": "secret", "provider": "https://private.invalid"}
+
+    client._sessions = {"sess_secret_path": RuntimeProbe()}  # type: ignore[assignment]
+    client._runs = {"run_secret_one": object()}  # type: ignore[assignment]
+
+    snapshot = client.runtime_concurrency_snapshot()
+
+    assert snapshot["metadata_only"] is True
+    assert snapshot["run_limit"] == 2
+    assert snapshot["default_serialized"] is False
+    assert snapshot["semaphore_enabled"] is True
+    assert snapshot["active_run_count"] == 1
+    assert snapshot["active_session_count"] == 1
+    assert snapshot["active_rpc_process_count"] == 1
+    assert snapshot["active_run_over_limit"] is False
+    assert snapshot["active_rpc_process_over_limit"] is False
+    assert snapshot["warning_count"] == 0
+    assert snapshot["run_ids_included"] is False
+    assert snapshot["session_ids_included"] is False
+    assert snapshot["prompts_included"] is False
+    assert snapshot["process_args_included"] is False
+    assert snapshot["process_ids_included"] is False
+    assert snapshot["session_files_included"] is False
+    assert snapshot["environment_included"] is False
+    assert snapshot["credentials_included"] is False
+    assert snapshot["provider_urls_included"] is False
+    assert snapshot["host_paths_included"] is False
+    visible = str(snapshot).lower()
+    assert "run_secret" not in visible
+    assert "sess_secret" not in visible
+    assert "424242" not in visible
+    assert "/home/private" not in visible
+    assert "--append-system-prompt" not in visible
+    assert "token=secret" not in visible
+    assert "toolgate_execution_key" not in visible
+    assert "private.invalid" not in visible
+
+
 class DecisionGates:
     def __init__(self):
         self.decisions = []

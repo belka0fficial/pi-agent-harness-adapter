@@ -486,6 +486,45 @@ class PiClient:
         self._run_limit = _positive_int_env("PI_MAX_CONCURRENT_RUNS", 1)
         self._run_semaphore = asyncio.Semaphore(self._run_limit)
 
+    def runtime_concurrency_snapshot(self) -> dict[str, Any]:
+        active_rpc_process_count = 0
+        for runtime in self._sessions.values():
+            process = getattr(runtime, "process", None)
+            if process is not None and getattr(process, "returncode", None) is None:
+                active_rpc_process_count += 1
+        active_run_count = len(self._runs)
+        active_run_over_limit = active_run_count > self._run_limit
+        active_rpc_process_over_limit = active_rpc_process_count > self._run_limit
+        warning_count = 0
+        if active_run_over_limit:
+            warning_count += 1
+        if active_rpc_process_over_limit:
+            warning_count += 1
+        return {
+            "metadata_only": True,
+            "limit_source": "PI_MAX_CONCURRENT_RUNS",
+            "run_limit": self._run_limit,
+            "default_serialized": self._run_limit == 1,
+            "semaphore_enabled": True,
+            "active_run_count": active_run_count,
+            "active_session_count": len(self._sessions),
+            "active_rpc_process_count": active_rpc_process_count,
+            "active_run_over_limit": active_run_over_limit,
+            "active_rpc_process_over_limit": active_rpc_process_over_limit,
+            "warning_count": warning_count,
+            "run_ids_included": False,
+            "session_ids_included": False,
+            "approval_ids_included": False,
+            "prompts_included": False,
+            "process_args_included": False,
+            "process_ids_included": False,
+            "session_files_included": False,
+            "environment_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "host_paths_included": False,
+        }
+
     def _get_or_create_runtime(self, session_id: str) -> SessionRuntime:
         runtime = self._sessions.get(session_id)
         if not runtime:

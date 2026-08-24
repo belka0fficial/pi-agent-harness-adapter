@@ -1250,6 +1250,57 @@ def _sidecar_runtime_boundary_summary() -> dict[str, Any]:
     }
 
 
+def _pi_runtime_concurrency_summary() -> dict[str, Any]:
+    pi = getattr(app.state, "pi", None)
+    snapshot = None
+    if pi and callable(getattr(pi, "runtime_concurrency_snapshot", None)):
+        try:
+            snapshot = pi.runtime_concurrency_snapshot()
+        except Exception:  # noqa: BLE001 - verification must fail closed without leaking runtime detail
+            snapshot = None
+    if isinstance(snapshot, dict):
+        return {
+            **snapshot,
+            "metadata_only": True,
+            "run_ids_included": False,
+            "session_ids_included": False,
+            "approval_ids_included": False,
+            "prompts_included": False,
+            "process_args_included": False,
+            "process_ids_included": False,
+            "session_files_included": False,
+            "environment_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "host_paths_included": False,
+        }
+    return {
+        "run_limit": 0,
+        "limit_source": "PI_MAX_CONCURRENT_RUNS",
+        "default_limit": 1,
+        "default_serialized": False,
+        "semaphore_enabled": False,
+        "active_run_count": 0,
+        "active_session_count": 0,
+        "active_rpc_process_count": 0,
+        "active_run_over_limit": False,
+        "active_rpc_process_over_limit": False,
+        "warning_count": 1,
+        "metadata_only": True,
+        "run_ids_included": False,
+        "session_ids_included": False,
+        "approval_ids_included": False,
+        "prompts_included": False,
+        "process_args_included": False,
+        "process_ids_included": False,
+        "session_files_included": False,
+        "environment_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
+    }
+
+
 def _safe_orchestrator_policy(value: Any) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     result: dict[str, Any] = {}
@@ -10044,6 +10095,22 @@ def _verification_snapshot() -> dict[str, Any]:
             "runtime_behavior": "protected_apis_fail_closed",
             "test_bypass": "pytest_only" if _testing_auth_bypass_enabled() else "off",
         },
+    ))
+
+    pi_concurrency = _pi_runtime_concurrency_summary()
+    pi_concurrency_warning_count = int(pi_concurrency.get("warning_count") or 0)
+    checks.append(_verification_check(
+        "pi-runtime-concurrency",
+        "Pi runtime concurrency",
+        "pass" if pi_concurrency_warning_count == 0 else "warn",
+        (
+            "Pi runtime streams are concurrency-capped and no active runtime count exceeds the configured limit."
+            if pi_concurrency_warning_count == 0
+            else "Pi runtime concurrency metadata needs owner review before high-volume chats, jobs, or group turns."
+        ),
+        source="Pi adapter",
+        severity="warning" if pi_concurrency_warning_count else "info",
+        detail=pi_concurrency,
     ))
 
     system = gates.system_overview()
