@@ -8538,7 +8538,7 @@ def _auxiliary_routes_payload(*, probe_routes: bool = True) -> dict[str, Any]:
     }
 
 
-def _safe_gateway_model(row: dict[str, Any]) -> dict[str, Any] | None:
+def _safe_gateway_model(row: dict[str, Any], *, provider_id: str = "freellmapi") -> dict[str, Any] | None:
     try:
         model_id = _safe_model_route_label(row.get("id") or row.get("name"), field="model", limit=160)
     except HTTPException:
@@ -8546,16 +8546,16 @@ def _safe_gateway_model(row: dict[str, Any]) -> dict[str, Any] | None:
     if not model_id:
         return None
     try:
-        owned_by = _safe_model_route_label(row.get("owned_by") or row.get("provider") or "freellmapi", field="provider", limit=80)
+        owned_by = _safe_model_route_label(row.get("owned_by") or row.get("provider") or provider_id, field="provider", limit=80)
     except HTTPException:
-        owned_by = "freellmapi"
+        owned_by = provider_id
     context = row.get("context_window") or row.get("context") or row.get("max_context")
     modalities = row.get("modalities") if isinstance(row.get("modalities"), list) else []
     capabilities = row.get("capabilities") if isinstance(row.get("capabilities"), list) else []
     available = row.get("available")
     return {
         "id": model_id,
-        "provider": "freellmapi",
+        "provider": provider_id,
         "model": model_id,
         "name": model_id,
         "owned_by": owned_by,
@@ -8565,21 +8565,61 @@ def _safe_gateway_model(row: dict[str, Any]) -> dict[str, Any] | None:
         "capabilities": [_redact_handoff_text(item, limit=40) for item in capabilities[:8]],
         "risk": "external",
         "policy": "low_risk_only",
-        "note": "Candidate FreeLLMAPI helper route. Use for low-risk work only until provider and Pi routing are owner-reviewed.",
+        "note": "Candidate external helper route. Use for low-risk work only until provider and Pi routing are owner-reviewed.",
     }
 
 
 def _freellmapi_headers() -> dict[str, str]:
-    api_key = os.environ.get("FREE_LLM_API_KEY") or os.environ.get("FREELLMAPI_API_KEY") or ""
+    api_key = (
+        os.environ.get("FREE_LLM_API_KEY")
+        or os.environ.get("FREELLMAPI_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
+        or ""
+    )
     if not api_key:
         return {}
     return {"Authorization": f"Bearer {api_key}"}
+
+
+def _model_gateway_config() -> dict[str, str]:
+    openrouter_url = os.environ.get("OPENROUTER_BASE_URL", "").rstrip("/")
+    freeapi_url = os.environ.get("FREE_LLM_API_URL", "").rstrip("/")
+    has_free_key = bool(os.environ.get("FREE_LLM_API_KEY") or os.environ.get("FREELLMAPI_API_KEY"))
+    has_openrouter_route = bool(os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OX_ALPHA_MODEL") or openrouter_url)
+    if freeapi_url and (has_free_key or not has_openrouter_route):
+        return {
+            "provider_id": "freellmapi",
+            "name": "FreeLLMAPI",
+            "api_url": freeapi_url,
+            "source": "free_llm_api",
+        }
+    if has_openrouter_route:
+        return {
+            "provider_id": "openrouter",
+            "name": "OpenRouter",
+            "api_url": openrouter_url or "https://openrouter.ai/api/v1",
+            "source": "openrouter",
+        }
+    return {
+        "provider_id": "freellmapi",
+        "name": "FreeLLMAPI",
+        "api_url": "http://127.0.0.1:3001",
+        "source": "local_default",
+    }
+
+
+def _gateway_models_url(api_url: str) -> str:
+    base = api_url.rstrip("/")
+    if base.endswith("/v1") or base.endswith("/api/v1"):
+        return f"{base}/models"
+    return f"{base}/v1/models"
 
 
 def _free_model_gateway_setup_payload(
     *,
     api_url_configured: bool,
     api_key_configured: bool,
+    provider_name: str = "FreeLLMAPI",
     health_status: str = "unchecked",
     models_status: str = "not_checked",
     models_visible: bool = False,
@@ -8587,9 +8627,9 @@ def _free_model_gateway_setup_payload(
 ) -> dict[str, Any]:
     blockers: list[str] = []
     if not api_url_configured:
-        blockers.append("FREE_LLM_API_URL is using the local default; confirm a gateway is running there or set it server-side.")
+        blockers.append("Gateway API URL is using a default; confirm the gateway source or set it server-side.")
     if not api_key_configured:
-        blockers.append("FREE_LLM_API_KEY or FREELLMAPI_API_KEY is missing server-side.")
+        blockers.append("Gateway API key is missing server-side.")
     if health_status not in {"ok", "unchecked"}:
         blockers.append("Gateway health check is not passing from the adapter.")
     if api_key_configured and models_status != "ok":
@@ -8600,8 +8640,9 @@ def _free_model_gateway_setup_payload(
         blockers.append("Gateway setup is incomplete.")
     return {
         "schema": "agentgate.free_model_gateway.setup.v1",
-        "required_env": ["FREE_LLM_API_URL", "FREE_LLM_API_KEY"],
-        "accepted_key_env": ["FREE_LLM_API_KEY", "FREELLMAPI_API_KEY"],
+        "provider": provider_name,
+        "required_env": ["FREE_LLM_API_URL or OPENROUTER_BASE_URL", "FREE_LLM_API_KEY, FREELLMAPI_API_KEY, or OPENROUTER_API_KEY"],
+        "accepted_key_env": ["FREE_LLM_API_KEY", "FREELLMAPI_API_KEY", "OPENROUTER_API_KEY"],
         "configured": {
             "api_url_configured": api_url_configured,
             "api_key_configured": api_key_configured,
@@ -8611,8 +8652,8 @@ def _free_model_gateway_setup_payload(
             "candidate_count": candidate_count,
         },
         "next_steps": [
-            "Run or configure the FreeLLMAPI-compatible gateway on the host.",
-            "Set FREE_LLM_API_URL and one accepted key env server-side, never in the browser.",
+            "Run or configure the external model gateway server-side.",
+            "Set gateway URL and one accepted key env server-side, never in the browser.",
             "Restart the Pi adapter after changing env, then refresh this dashboard.",
             "Stage visible candidates only as disabled low-risk helper-route metadata until owner review.",
         ],
@@ -8631,20 +8672,23 @@ def _free_model_gateway_setup_payload(
 
 
 def _free_model_gateway_candidates_payload() -> dict[str, Any]:
-    api_url_configured = bool(os.environ.get("FREE_LLM_API_URL"))
-    freeapi_url = os.environ.get("FREE_LLM_API_URL", "http://127.0.0.1:3001").rstrip("/")
+    config = _model_gateway_config()
+    provider_id = config["provider_id"]
+    provider_name = config["name"]
+    api_url_configured = config["source"] != "local_default"
+    freeapi_url = config["api_url"].rstrip("/")
     headers = _freellmapi_headers()
     result: dict[str, Any] = {
         "gateway": {
-            "id": "freellmapi",
-            "name": "FreeLLMAPI",
+            "id": provider_id,
+            "name": provider_name,
             "status": "unavailable",
             "configured": bool(headers),
             "auth_status": "configured" if headers else "missing",
             "models_visible": False,
             "risk": "external",
             "policy": "low_risk_only",
-            "setup_hint": "Set the FreeLLMAPI gateway key server-side after configuring the gateway, then restart the adapter.",
+            "setup_hint": "Set the external model gateway key server-side after configuring the gateway, then restart the adapter.",
         },
         "candidates": [],
         "candidate_count": 0,
@@ -8653,6 +8697,7 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
     result["setup"] = _free_model_gateway_setup_payload(
         api_url_configured=api_url_configured,
         api_key_configured=bool(headers),
+        provider_name=provider_name,
     )
     try:
         ping = httpx.get(f"{freeapi_url}/health", timeout=3)
@@ -8661,21 +8706,23 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
             result["setup"] = _free_model_gateway_setup_payload(
                 api_url_configured=api_url_configured,
                 api_key_configured=bool(headers),
+                provider_name=provider_name,
                 health_status="ok",
             )
     except httpx.HTTPError:
         result["setup"] = _free_model_gateway_setup_payload(
             api_url_configured=api_url_configured,
             api_key_configured=bool(headers),
+            provider_name=provider_name,
             health_status="unavailable",
         )
-        return result
     try:
-        response = httpx.get(f"{freeapi_url}/v1/models", headers=headers, timeout=5)
+        response = httpx.get(_gateway_models_url(freeapi_url), headers=headers, timeout=5)
     except httpx.HTTPError:
         result["setup"] = _free_model_gateway_setup_payload(
             api_url_configured=api_url_configured,
             api_key_configured=bool(headers),
+            provider_name=provider_name,
             health_status=str(result["setup"]["configured"]["health_status"]),
             models_status="unavailable",
         )
@@ -8687,6 +8734,7 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
         result["setup"] = _free_model_gateway_setup_payload(
             api_url_configured=api_url_configured,
             api_key_configured=bool(headers),
+            provider_name=provider_name,
             health_status=str(result["setup"]["configured"]["health_status"]),
             models_status="auth_required",
         )
@@ -8697,6 +8745,7 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
         result["setup"] = _free_model_gateway_setup_payload(
             api_url_configured=api_url_configured,
             api_key_configured=bool(headers),
+            provider_name=provider_name,
             health_status=str(result["setup"]["configured"]["health_status"]),
             models_status="unavailable",
         )
@@ -8708,22 +8757,33 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
         result["setup"] = _free_model_gateway_setup_payload(
             api_url_configured=api_url_configured,
             api_key_configured=bool(headers),
+            provider_name=provider_name,
             health_status=str(result["setup"]["configured"]["health_status"]),
             models_status="invalid_response",
         )
         return result
     rows = payload.get("data", []) if isinstance(payload, dict) else []
     candidates = []
+    ox_model = os.environ.get("OX_ALPHA_MODEL", "").strip()
+    if provider_id == "openrouter" and ox_model:
+        safe_ox = _safe_gateway_model(
+            {"id": ox_model, "name": ox_model, "provider": "openrouter", "available": None},
+            provider_id=provider_id,
+        )
+        if safe_ox:
+            safe_ox["note"] = "Configured OxAlpha helper route from server-side OpenRouter env. Stage disabled and review before use."
+            candidates.append(safe_ox)
     for row in rows:
         if not isinstance(row, dict):
             continue
-        safe = _safe_gateway_model(row)
-        if safe:
+        safe = _safe_gateway_model(row, provider_id=provider_id)
+        if safe and safe["id"] not in {candidate["id"] for candidate in candidates}:
             candidates.append(safe)
         if len(candidates) >= 60:
             break
     result["gateway"]["configured"] = True
     result["gateway"]["auth_status"] = "ok"
+    result["gateway"]["status"] = "ok"
     result["gateway"]["models_visible"] = bool(candidates)
     result["gateway"]["model_count"] = len(candidates)
     result["candidate_count"] = len(candidates)
@@ -8731,6 +8791,7 @@ def _free_model_gateway_candidates_payload() -> dict[str, Any]:
     result["setup"] = _free_model_gateway_setup_payload(
         api_url_configured=api_url_configured,
         api_key_configured=bool(headers),
+        provider_name=provider_name,
         health_status=str(result["setup"]["configured"]["health_status"]),
         models_status="ok",
         models_visible=bool(candidates),
@@ -8760,9 +8821,11 @@ def _model_providers_payload(gateway_payload: dict[str, Any] | None = None) -> d
     ]
     gateway_payload = gateway_payload if isinstance(gateway_payload, dict) else _free_model_gateway_candidates_payload()
     gateway = gateway_payload.get("gateway") if isinstance(gateway_payload.get("gateway"), dict) else {}
+    provider_id = _safe_summary(gateway.get("id") or "freellmapi", limit=60)
+    provider_name = _safe_summary(gateway.get("name") or "FreeLLMAPI", limit=80)
     freeapi = {
-        "id": "freellmapi",
-        "name": "FreeLLMAPI",
+        "id": provider_id,
+        "name": provider_name,
         "kind": "free-model-gateway",
         "status": _safe_summary(gateway.get("status") or "unavailable", limit=60),
         "privacy": "external free providers; use only for low-risk helper tasks until reviewed",
@@ -8772,7 +8835,7 @@ def _model_providers_payload(gateway_payload: dict[str, Any] | None = None) -> d
         "models_status": _safe_summary(gateway.get("models_status") or gateway.get("auth_status") or "", limit=60) or None,
         "risk": "external",
         "policy": "low_risk_only",
-        "setup_hint": "Configure FreeLLMAPI provider credentials server-side before using it.",
+        "setup_hint": "Configure external provider credentials server-side before using it.",
     }
     providers.append(freeapi)
     return {"providers": providers}

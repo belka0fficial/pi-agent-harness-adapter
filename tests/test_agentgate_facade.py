@@ -4536,6 +4536,70 @@ def test_model_providers_use_gateway_key_without_leaking_it(monkeypatch, tmp_pat
     assert "authorization" not in visible
 
 
+def test_openrouter_oxalpha_gateway_candidate_is_safe_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("FREE_LLM_API_URL", "http://freellmapi:3001")
+    monkeypatch.delenv("FREE_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("FREELLMAPI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.invalid/api/v1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("OX_ALPHA_MODEL", "stealth/ox-alpha")
+    reset_state()
+    calls = []
+
+    class Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        calls.append({"url": url, "headers": kwargs.get("headers") or {}})
+        if url.endswith("/health"):
+            return Response(404, {})
+        if url.endswith("/models"):
+            if kwargs.get("headers", {}).get("Authorization") == "Bearer openrouter-secret":
+                return Response(
+                    200,
+                    {
+                        "data": [
+                            {"id": "stealth/ox-alpha", "owned_by": "Stealth"},
+                            {"id": "openai/gpt-oss", "owned_by": "OpenRouter"},
+                        ]
+                    },
+                )
+            return Response(401, {"error": "missing key"})
+        return Response(404, {})
+
+    monkeypatch.setattr(main.httpx, "get", fake_get)
+
+    with TestClient(app) as client:
+        providers = client.get("/api/model/providers")
+        candidates = client.get("/api/model/gateway-candidates")
+
+    assert providers.status_code == 200
+    assert candidates.status_code == 200
+    openrouter = next(item for item in providers.json()["providers"] if item["id"] == "openrouter")
+    assert openrouter["name"] == "OpenRouter"
+    assert openrouter["configured"] is True
+    assert openrouter["models_visible"] is True
+    payload = candidates.json()
+    assert payload["gateway"]["id"] == "openrouter"
+    assert payload["candidate_count"] == 2
+    assert payload["candidates"][0]["provider"] == "openrouter"
+    assert payload["candidates"][0]["model"] == "stealth/ox-alpha"
+    model_urls = [item["url"] for item in calls if item["url"].endswith("/models")]
+    assert model_urls
+    assert set(model_urls) == {"https://openrouter.invalid/api/v1/models"}
+    visible = json.dumps({"providers": providers.json(), "candidates": payload}).lower()
+    assert "openrouter-secret" not in visible
+    assert "openrouter.invalid" not in visible
+    assert "authorization" not in visible
+
+
 def test_model_route_approval_applies_and_rejects_metadata_only(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
