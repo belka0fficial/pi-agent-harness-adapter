@@ -69,6 +69,13 @@ class NotificationChannelInput(BaseModel):
     requires_owner_confirmation: bool = True
 
 
+class AccessBoundaryRepairInput(BaseModel):
+    agent_id: str | None = None
+    team_id: str | None = None
+    scope: str = "all"
+    dry_run: bool = False
+
+
 class MemoryCandidateInput(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     session_id: str | None = None
@@ -2179,6 +2186,132 @@ def _sync_toolgate_execution_scopes() -> None:
                     )
     except (RuntimeError, AttributeError):
         return
+
+
+def _repair_native_access_boundaries(payload: AccessBoundaryRepairInput | None = None) -> dict[str, Any]:
+    _ensure_registry_seeded()
+    payload = payload or AccessBoundaryRepairInput()
+    scope = str(payload.scope or "all").strip().lower().replace("-", "_")
+    if scope not in {"all", "toolgate", "memorygate"}:
+        raise HTTPException(422, "scope must be all, toolgate, or memorygate")
+    if payload.agent_id and payload.agent_id not in app.state.agents:
+        raise HTTPException(404, "agent not found")
+    if payload.team_id and payload.team_id not in app.state.teams:
+        raise HTTPException(404, "team not found")
+    before = _native_access_boundaries()
+    repaired = {
+        "toolgate_contexts_checked": 0,
+        "toolgate_contexts_repaired": 0,
+        "memorygate_contexts_checked": 0,
+        "memorygate_contexts_repaired": 0,
+        "skipped_empty_contexts": 0,
+        "errors": [],
+    }
+    context_rows: list[dict[str, Any]] = []
+    if scope in {"all", "toolgate"} and not payload.dry_run:
+        try:
+            _sync_toolgate_execution_scopes()
+        except (RuntimeError, AttributeError) as exc:
+            repaired["errors"].append(_safe_summary(f"ToolGate sync unavailable: {exc}", limit=120))
+    for agent_id in sorted(app.state.agents):
+        if payload.agent_id and agent_id != payload.agent_id:
+            continue
+        for context in _expected_toolgate_contexts_for_actor(agent_id):
+            team_id = context.get("team_id")
+            if payload.team_id and team_id != payload.team_id:
+                continue
+            scopes = [str(scope_value) for scope_value in context.get("scopes") or [] if str(scope_value).strip()]
+            if not scopes:
+                repaired["skipped_empty_contexts"] += 1
+                continue
+            if scope not in {"all", "toolgate"}:
+                continue
+            repaired["toolgate_contexts_checked"] += 1
+            row = {
+                "agent_id": agent_id,
+                "team_id": team_id,
+                "toolgate": "would_repair" if payload.dry_run else "pending",
+                "memorygate": "not_requested",
+                "issues": [],
+            }
+            if not payload.dry_run:
+                try:
+                    result = app.state.gates.ensure_toolgate_agent_execution_key(
+                        agent_id,
+                        scopes,
+                        team_id=team_id,
+                    )
+                    if str((result or {}).get("status") or "") in {"created", "cached"}:
+                        repaired["toolgate_contexts_repaired"] += 1
+                    row["toolgate"] = str((result or {}).get("status") or "updated")
+                except (RuntimeError, AttributeError) as exc:
+                    issue = _safe_summary(f"ToolGate context repair failed for {agent_id}: {exc}", limit=120)
+                    repaired["errors"].append(issue)
+                    row["toolgate"] = "failed"
+                    row["issues"].append(issue)
+            context_rows.append(row)
+        for context in _expected_memory_contexts_for_actor(agent_id):
+            team_id = context.get("team_id")
+            if payload.team_id and team_id != payload.team_id:
+                continue
+            scopes = [str(scope_value) for scope_value in context.get("scopes") or [] if str(scope_value).strip()]
+            if not scopes:
+                repaired["skipped_empty_contexts"] += 1
+                continue
+            if scope not in {"all", "memorygate"}:
+                continue
+            repaired["memorygate_contexts_checked"] += 1
+            row = {
+                "agent_id": agent_id,
+                "team_id": team_id,
+                "toolgate": "not_requested",
+                "memorygate": "would_repair" if payload.dry_run else "pending",
+                "issues": [],
+            }
+            if not payload.dry_run:
+                try:
+                    result = app.state.gates.ensure_memorygate_agent_read_key(
+                        agent_id,
+                        team_id=team_id,
+                    )
+                    if str((result or {}).get("status") or "") in {"created", "cached"}:
+                        repaired["memorygate_contexts_repaired"] += 1
+                    row["memorygate"] = str((result or {}).get("status") or "created")
+                except (RuntimeError, AttributeError) as exc:
+                    issue = _safe_summary(f"MemoryGate context repair failed for {agent_id}: {exc}", limit=120)
+                    repaired["errors"].append(issue)
+                    row["memorygate"] = "failed"
+                    row["issues"].append(issue)
+            context_rows.append(row)
+    after = _native_access_boundaries() if not payload.dry_run else before
+    if not payload.dry_run:
+        _record_activity(
+            "agent_pi_operator",
+            event_type="access_boundaries.repair",
+            status="completed" if not repaired["errors"] else "partial",
+            source="AgentGate",
+            summary=(
+                "Access boundary repair checked "
+                f"{repaired['toolgate_contexts_checked']} ToolGate and "
+                f"{repaired['memorygate_contexts_checked']} MemoryGate contexts"
+            ),
+            ref_type="system",
+            ref_id="access_boundaries",
+        )
+    return {
+        "status": "dry_run" if payload.dry_run else "ok" if not repaired["errors"] else "partial",
+        "dry_run": bool(payload.dry_run),
+        "metadata_only": True,
+        "safe_metadata_only": True,
+        "credentials_included": False,
+        "before": before["summary"],
+        "after": after["summary"],
+        "repair": {
+            **repaired,
+            "errors": repaired["errors"][:6],
+        },
+        "contexts": context_rows[:40],
+    }
 
 
 def _sync_loaded_jobs() -> None:
@@ -5190,6 +5323,11 @@ def agentgate_system():
         **system,
         "access_boundaries": _native_access_boundaries(),
     }
+
+
+@app.post("/api/system/access-boundaries/repair")
+def repair_agentgate_access_boundaries(payload: AccessBoundaryRepairInput | None = None):
+    return _repair_native_access_boundaries(payload)
 
 
 @app.get("/api/approvals")

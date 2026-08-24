@@ -671,6 +671,43 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
     assert "mg_" + "read_" not in str(boundaries)
 
 
+def test_system_access_boundary_repair_syncs_native_gate_contexts_without_keys(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.gates.toolgate_keys = []
+    app.state.gates.memorygate_keys = []
+    app.state.gates.toolgate_private_keys = {}
+    app.state.gates.toolgate_private_key_scopes = {}
+    app.state.gates.memorygate_private_keys = set()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = ["echo"]
+        app.state.agents["agent_pi_operator"]["memory_scopes"] = ["briefing"]
+        app.state.teams["team_core"]["tool_ids"] = ["approval.test-echo"]
+        app.state.teams["team_core"]["memory_scopes"] = ["project-context"]
+        before = client.get("/api/system").json()["access_boundaries"]["summary"]
+        repaired = client.post("/api/system/access-boundaries/repair").json()
+        after = client.get("/api/system").json()["access_boundaries"]["summary"]
+
+    assert before["drift"] == 1
+    assert repaired["metadata_only"] is True
+    assert repaired["status"] == "ok"
+    assert repaired["repair"]["toolgate_contexts_checked"] == 2
+    assert repaired["repair"]["memorygate_contexts_checked"] == 2
+    assert repaired["repair"]["toolgate_contexts_repaired"] == 2
+    assert repaired["repair"]["memorygate_contexts_repaired"] == 2
+    assert repaired["after"]["drift"] == 0
+    assert after["drift"] == 0
+    assert app.state.gates.toolgate_private_keys
+    assert app.state.gates.memorygate_private_keys
+    assert not any(
+        word in str(repaired).lower()
+        for word in ["tgx_", "mg_read_", "api_key", "password", "secret", "bearer"]
+    )
+
+
 def test_memorygate_boundary_requires_adapter_read_credential(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
