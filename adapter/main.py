@@ -147,6 +147,7 @@ class AgentInput(BaseModel):
     mode: str = "professional"
     soul: str = Field(default="", max_length=12000)
     voice: str = Field(default="", max_length=1000)
+    voice_profile: dict[str, Any] = Field(default_factory=dict)
     personality: list[str] = Field(default_factory=list)
     appearance: dict[str, Any] = Field(default_factory=dict)
     story: str = Field(default="", max_length=4000)
@@ -452,6 +453,20 @@ AGENT_APPEARANCE_FIELDS = {
     "body_type": 120,
     "palette": 160,
     "avatar_hint": 240,
+    "age_range": 80,
+    "attire": 240,
+    "distinguishing_features": 300,
+    "expression_style": 240,
+    "motion_style": 240,
+}
+
+AGENT_VOICE_PROFILE_FIELDS = {
+    "tone": 200,
+    "pace": 120,
+    "formality": 120,
+    "interaction_style": 300,
+    "tts_hint": 240,
+    "call_behavior": 300,
 }
 
 AGENT_PROFILE_PROVENANCE_FIELDS = {
@@ -500,7 +515,19 @@ def _safe_appearance(value: Any) -> dict[str, str]:
     source = value if isinstance(value, dict) else {}
     result: dict[str, str] = {}
     for key, limit in AGENT_APPEARANCE_FIELDS.items():
-        text = _safe_text(source.get(key), limit=limit)
+        text = _redact_profile_metadata_text(source.get(key), limit=limit)
+        text = re.sub(r"(?i)\b(asset|file|path|sample)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+        if text:
+            result[key] = text
+    return result
+
+
+def _safe_voice_profile(value: Any) -> dict[str, str]:
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, str] = {}
+    for key, limit in AGENT_VOICE_PROFILE_FIELDS.items():
+        text = _redact_profile_metadata_text(source.get(key), limit=limit)
+        text = re.sub(r"(?i)\b(sample|file|path|asset|voiceprint)\s*[:=]\s*\S+", r"\1=[redacted]", text)
         if text:
             result[key] = text
     return result
@@ -534,11 +561,12 @@ def _safe_profile_provenance(value: Any) -> dict[str, Any]:
 
 def _agent_profile_readiness(item: dict[str, Any]) -> dict[str, Any]:
     appearance = item.get("appearance") if isinstance(item.get("appearance"), dict) else {}
+    voice_profile = item.get("voice_profile") if isinstance(item.get("voice_profile"), dict) else {}
     provenance = item.get("profile_provenance") if isinstance(item.get("profile_provenance"), dict) else {}
     checks = {
         "purpose": bool(str(item.get("purpose") or "").strip()),
         "soul": bool(str(item.get("soul") or "").strip()),
-        "voice": bool(str(item.get("voice") or "").strip()),
+        "voice": bool(str(item.get("voice") or "").strip() or voice_profile),
         "personality": bool(item.get("personality")),
         "appearance": bool(appearance.get("visual_summary") or appearance.get("style")),
         "model_route": bool(str(item.get("primary_provider") or "").strip() and str(item.get("primary_model") or "").strip()),
@@ -691,6 +719,8 @@ def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
             cleaned[field] = _safe_text(cleaned.get(field), limit=limit)
     if "personality" in cleaned:
         cleaned["personality"] = _safe_profile_list(cleaned.get("personality"))
+    if "voice_profile" in cleaned:
+        cleaned["voice_profile"] = _safe_voice_profile(cleaned.get("voice_profile"))
     if "appearance" in cleaned:
         cleaned["appearance"] = _safe_appearance(cleaned.get("appearance"))
     if "profile_provenance" in cleaned:
@@ -730,6 +760,7 @@ def _portable_agent(item: dict[str, Any]) -> dict[str, Any]:
         "mode",
         "soul",
         "voice",
+        "voice_profile",
         "personality",
         "appearance",
         "story",

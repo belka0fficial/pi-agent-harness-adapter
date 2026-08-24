@@ -469,6 +469,15 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
                 "title": "Persona agent",
                 "purpose": "Shape safe character profiles.",
                 "voice": "Warm\x00, precise, and short.\\u0000",
+                "voice_profile": {
+                    "tone": "warm guide",
+                    "pace": "measured",
+                    "formality": "casual professional",
+                    "interaction_style": "asks one clear question when blocked",
+                    "tts_hint": "sample=/home/private/voice.wav",
+                    "call_behavior": "token=abc123 should disappear",
+                    "raw_sample_path": "/tmp/nope.wav",
+                },
                 "personality": ["kind", "kind", "evidence-first", ""],
                 "appearance": {
                     "mode": "character",
@@ -476,6 +485,11 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
                     "height": "170 cm",
                     "body_type": "athletic",
                     "palette": "warm neutrals",
+                    "age_range": "adult-coded",
+                    "attire": "simple jacket",
+                    "distinguishing_features": "bright eyes, file=/home/private/avatar.png",
+                    "expression_style": "calm focus",
+                    "motion_style": "small idle gestures",
                     "raw_asset_path": "should-not-persist",
                 },
                 "profile_provenance": {
@@ -493,14 +507,26 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
                 "personality": ["steady", "steady", "playful"],
                 "appearance": {
                     "visual_summary": "Simple professional portrait with no generated asset yet.",
-                    "avatar_hint": "future optional avatar sidecar",
+                    "avatar_hint": "future optional avatar sidecar at https://private.example/avatar.png",
                     "raw_tool_args": {"not": "stored"},
+                },
+                "voice_profile": {
+                    "tone": "steady",
+                    "tts_hint": "voiceprint=abc123",
                 },
             },
         )
 
     assert created.status_code == 200
     assert created.json()["voice"] == "Warm, precise, and short."
+    assert created.json()["voice_profile"] == {
+        "tone": "warm guide",
+        "pace": "measured",
+        "formality": "casual professional",
+        "interaction_style": "asks one clear question when blocked",
+        "tts_hint": "sample=[redacted]",
+        "call_behavior": "token=[redacted] should disappear",
+    }
     assert created.json()["personality"] == ["kind", "evidence-first"]
     assert created.json()["appearance"] == {
         "mode": "character",
@@ -508,6 +534,11 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
         "height": "170 cm",
         "body_type": "athletic",
         "palette": "warm neutrals",
+        "age_range": "adult-coded",
+        "attire": "simple jacket",
+        "distinguishing_features": "bright eyes, file=[redacted]",
+        "expression_style": "calm focus",
+        "motion_style": "small idle gestures",
     }
     assert created.json()["profile_provenance"]["review_status"] == "owner_reviewed"
     assert created.json()["profile_provenance"]["source_labels"] == ["owner seed", "[redacted-url]"]
@@ -516,7 +547,11 @@ def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
     assert patched.json()["personality"] == ["steady", "playful"]
     assert patched.json()["appearance"] == {
         "visual_summary": "Simple professional portrait with no generated asset yet.",
-        "avatar_hint": "future optional avatar sidecar",
+        "avatar_hint": "future optional avatar sidecar at [redacted-url]",
+    }
+    assert patched.json()["voice_profile"] == {
+        "tone": "steady",
+        "tts_hint": "voiceprint=[redacted]",
     }
     assert patched.json()["profile_readiness"]["review_status"] == "owner_reviewed"
     payload = str(patched.json()).lower()
