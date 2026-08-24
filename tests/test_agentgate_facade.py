@@ -343,6 +343,17 @@ def reset_state():
     app.state.owner_sessions = {}
 
 
+def approve_team_policy(client: TestClient, team_id: str) -> dict:
+    review = client.post(f"/api/teams/{team_id}/policy-review", json={}).json()
+    assert review["team_policy_review"]["status"] == "pending"
+    decided = client.post(
+        f"/api/approvals/{review['toolgate_request']['id']}/decision",
+        json={"decision": "approved"},
+    ).json()
+    assert decided["team_policy_status"] == "owner_reviewed"
+    return client.get(f"/api/teams/{team_id}").json()
+
+
 def test_agentgate_facade_exposes_real_sessions_messages_and_jobs():
     reset_state()
     with TestClient(app) as client:
@@ -2963,7 +2974,7 @@ def test_verification_snapshot_reports_team_execution_policy_counts(monkeypatch,
                 "purpose": "Participate in policy snapshot checks.",
             },
         ).json()
-        client.post(
+        reviewed_team = client.post(
             "/api/teams",
             json={
                 "name": "Snapshot Reviewed Team",
@@ -2975,6 +2986,11 @@ def test_verification_snapshot_reports_team_execution_policy_counts(monkeypatch,
                     "review_status": "owner_reviewed",
                 },
             },
+        ).json()
+        review = client.post(f"/api/teams/{reviewed_team['id']}/policy-review", json={}).json()
+        client.post(
+            f"/api/approvals/{review['toolgate_request']['id']}/decision",
+            json={"decision": "approved"},
         )
         client.post(
             "/api/teams",
@@ -3608,6 +3624,7 @@ def test_team_orchestration_readiness_redacts_public_surfaces(monkeypatch, tmp_p
                 }
             },
         ).json()
+        patched = approve_team_policy(client, created["id"])
         listed = client.get("/api/teams").json()["teams"]
         fetched = client.get(f"/api/teams/{created['id']}").json()
         workrooms = client.get("/api/workrooms").json()["workrooms"]
@@ -5849,6 +5866,7 @@ def test_group_round_runs_each_roster_speaker_once(monkeypatch, tmp_path):
                 },
             },
         ).json()
+        team = approve_team_policy(client, team["id"])
         session = client.post(
             "/api/sessions",
             json={
@@ -5930,6 +5948,101 @@ def test_group_round_requires_owner_reviewed_team_policy(monkeypatch, tmp_path):
     assert "private marker" not in str(detail)
 
 
+def test_team_policy_review_requires_toolgate_decision(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={"name": "Policy Teammate", "purpose": "Participate after review."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Policy Review Team",
+                "purpose": "Needs ToolGate policy review before group runs.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                },
+            },
+        ).json()
+        patched = client.patch(
+            f"/api/teams/{team['id']}",
+            json={
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                }
+            },
+        ).json()
+        review = client.post(
+            f"/api/teams/{team['id']}/policy-review",
+            json={"owner_note": "Approve bounded execution. token=policy-secret https://policy.example/path"},
+        ).json()
+        decided = client.post(
+            f"/api/approvals/{review['toolgate_request']['id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        fetched = client.get(f"/api/teams/{team['id']}").json()
+
+    assert team["orchestrator_policy"]["review_status"] == "needs_review"
+    assert patched["orchestrator_policy"]["review_status"] != "owner_reviewed"
+    assert review["orchestrator_policy"]["review_status"] == "needs_review"
+    assert review["team_policy_review"]["status"] == "pending"
+    assert decided["team_policy_status"] == "owner_reviewed"
+    assert fetched["orchestrator_policy"]["review_status"] == "owner_reviewed"
+    assert fetched["orchestration_readiness"]["ready"] is True
+    forbidden = re.compile(r"policy-secret|https://policy\\.example|token=", re.I)
+    assert not forbidden.search(str(review))
+
+
+def test_team_policy_review_goes_stale_after_policy_change(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={"name": "Stale Policy Teammate", "purpose": "Participate after review."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Stale Policy Team",
+                "purpose": "Needs fresh policy review after edits.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                "orchestrator_policy": {"approval_mode": "toolgate_required"},
+            },
+        ).json()
+        review = client.post(f"/api/teams/{team['id']}/policy-review", json={}).json()
+        changed = client.patch(
+            f"/api/teams/{team['id']}",
+            json={
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "turn_order": "reverse_roster",
+                }
+            },
+        ).json()
+        decided = client.post(
+            f"/api/approvals/{review['toolgate_request']['id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        fetched = client.get(f"/api/teams/{team['id']}").json()
+
+    assert changed["team_policy_review"]["status"] == "stale"
+    assert decided["team_policy_status"] == "stale"
+    assert fetched["orchestrator_policy"]["review_status"] == "needs_review"
+    assert fetched["orchestration_readiness"]["ready"] is False
+
+
 def test_group_round_stream_emits_live_speaker_events(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
@@ -5954,6 +6067,7 @@ def test_group_round_stream_emits_live_speaker_events(monkeypatch, tmp_path):
                 },
             },
         ).json()
+        team = approve_team_policy(client, team["id"])
         session = client.post(
             "/api/sessions",
             json={
@@ -6007,6 +6121,7 @@ def test_group_sequence_runs_bounded_rounds_for_each_speaker(monkeypatch, tmp_pa
                 },
             },
         ).json()
+        team = approve_team_policy(client, team["id"])
         session = client.post(
             "/api/sessions",
             json={
@@ -6121,6 +6236,7 @@ def test_group_sequence_obeys_team_turn_policy(monkeypatch, tmp_path):
                 },
             },
         ).json()
+        team = approve_team_policy(client, team["id"])
         session = client.post(
             "/api/sessions",
             json={
@@ -6173,6 +6289,7 @@ def test_group_sequence_stream_emits_sequence_metadata(monkeypatch, tmp_path):
                 },
             },
         ).json()
+        team = approve_team_policy(client, team["id"])
         session = client.post(
             "/api/sessions",
             json={

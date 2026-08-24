@@ -234,6 +234,10 @@ class TeamInput(BaseModel):
     orchestrator_policy: dict[str, Any] = Field(default_factory=dict)
 
 
+class TeamPolicyReviewInput(BaseModel):
+    owner_note: str = Field(default="", max_length=600)
+
+
 class RegistryImportInput(BaseModel):
     schema_version: int = 1
     agents: list[dict[str, Any]] = Field(default_factory=list)
@@ -1341,7 +1345,45 @@ def _safe_orchestrator_policy(value: Any) -> dict[str, Any]:
     return result
 
 
-def _sanitize_team_profile(payload: dict[str, Any]) -> dict[str, Any]:
+def _team_policy_digest(team: dict[str, Any], policy: dict[str, Any] | None = None) -> str:
+    safe_policy = _safe_orchestrator_policy(policy if policy is not None else team.get("orchestrator_policy"))
+    payload = {
+        "team_id": _safe_text(team.get("id"), limit=120),
+        "orchestrator_agent_id": _safe_text(team.get("orchestrator_agent_id"), limit=120),
+        "member_agent_ids": sorted(_clean_list(team.get("member_agent_ids"))),
+        "memory_scope_count": len(_clean_list(team.get("memory_scopes"))),
+        "tool_count": len(_clean_list(team.get("tool_ids"))),
+        "skill_count": len(_clean_list(team.get("skill_ids"))),
+        "handoff_mode": safe_policy.get("handoff_mode"),
+        "approval_mode": safe_policy.get("approval_mode"),
+        "turn_order": safe_policy.get("turn_order"),
+        "max_parallel_tasks": safe_policy.get("max_parallel_tasks"),
+        "max_sequence_rounds": safe_policy.get("max_sequence_rounds"),
+        "max_speakers_per_round": safe_policy.get("max_speakers_per_round"),
+        "escalation_summary_digest": _job_prompt_digest(safe_policy.get("escalation_summary") or ""),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _strip_team_policy_direct_review_status(cleaned: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    policy = cleaned.get("orchestrator_policy")
+    if not isinstance(policy, dict):
+        return cleaned
+    existing_policy = _safe_orchestrator_policy((existing or {}).get("orchestrator_policy"))
+    previous_status = existing_policy.get("review_status") if existing else "unreviewed"
+    requested_status = str(policy.get("review_status") or "").strip()
+    policy = dict(policy)
+    if requested_status == "owner_reviewed" and previous_status != "owner_reviewed":
+        policy["review_status"] = "needs_review"
+    elif existing is not None:
+        policy["review_status"] = previous_status or "unreviewed"
+    else:
+        policy["review_status"] = "unreviewed"
+    cleaned["orchestrator_policy"] = policy
+    return cleaned
+
+
+def _sanitize_team_profile(payload: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
     cleaned = dict(payload)
     for field, limit in {
         "name": 80,
@@ -1360,6 +1402,7 @@ def _sanitize_team_profile(payload: dict[str, Any]) -> dict[str, Any]:
             ]
     if "orchestrator_policy" in cleaned:
         cleaned["orchestrator_policy"] = _safe_orchestrator_policy(cleaned.get("orchestrator_policy"))
+        cleaned = _strip_team_policy_direct_review_status(cleaned, existing=existing)
     return cleaned
 
 
@@ -1402,6 +1445,24 @@ def _team_orchestration_readiness(item: dict[str, Any]) -> dict[str, Any]:
         "max_speakers_per_round": policy.get("max_speakers_per_round") or 6,
         "member_count": len(member_ids),
         "shared_access_count": len(_clean_list(item.get("memory_scopes"))) + len(_clean_list(item.get("tool_ids"))) + len(_clean_list(item.get("skill_ids"))),
+    }
+
+
+def _team_policy_review_summary(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "request_id": item.get("team_policy_review_request_id"),
+        "status": item.get("team_policy_review_status") or "not_requested",
+        "requested_at": item.get("team_policy_review_requested_at"),
+        "decided_at": item.get("team_policy_review_decided_at"),
+        "stale_reason": item.get("team_policy_review_stale_reason"),
+        "digest_ready": bool(item.get("team_policy_digest")),
+        "metadata_only": True,
+        "raw_policy_included": False,
+        "memory_contents_included": False,
+        "tool_arguments_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
     }
 
 
@@ -1449,8 +1510,126 @@ def _public_team(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str, 
         "memory_scopes": _clean_list(item.get("memory_scopes")),
         "orchestrator_policy": _safe_orchestrator_policy(item.get("orchestrator_policy")),
         "orchestration_readiness": _team_orchestration_readiness(item),
+        "team_policy_review": _team_policy_review_summary(item),
         "recent_activity": _list_activity(team_id=item.get("id"), limit=activity_limit),
     }
+
+
+def _create_team_policy_review_request(team_id: str, payload: TeamPolicyReviewInput | None = None) -> dict[str, Any]:
+    _ensure_registry_seeded()
+    item = app.state.teams.get(team_id)
+    if not item:
+        raise HTTPException(404, "team not found")
+    readiness = _team_orchestration_readiness(item)
+    missing = set(_clean_list(readiness.get("missing_fields")))
+    hard_missing = [field for field in ("orchestrator", "orchestrator_member", "toolgate_boundary") if field in missing]
+    if hard_missing:
+        raise HTTPException(409, {
+            "reason": "team_policy_not_reviewable",
+            "missing_fields": hard_missing,
+            "metadata_only": True,
+        })
+    policy = _safe_orchestrator_policy(item.get("orchestrator_policy"))
+    digest = _team_policy_digest(item, policy)
+    existing_request_id = item.get("team_policy_review_request_id")
+    if existing_request_id and item.get("team_policy_digest") == digest:
+        request = app.state.gates.request_status(str(existing_request_id))
+        if request and str(request.get("status") or "pending") == "pending":
+            return request
+    owner_note = _redact_profile_metadata_text((payload or TeamPolicyReviewInput()).owner_note, limit=600)
+    request_payload = {
+        "subject_type": "team_policy",
+        "subject_id": team_id,
+        "action": "review_team_execution_policy",
+        "team_id": team_id,
+        "policy_digest": digest,
+        "orchestrator_agent_id": _safe_text(item.get("orchestrator_agent_id"), limit=120),
+        "member_count": len(_clean_list(item.get("member_agent_ids"))),
+        "memory_scope_count": len(_clean_list(item.get("memory_scopes"))),
+        "tool_count": len(_clean_list(item.get("tool_ids"))),
+        "skill_count": len(_clean_list(item.get("skill_ids"))),
+        "handoff_mode": policy.get("handoff_mode"),
+        "approval_mode": policy.get("approval_mode"),
+        "turn_order": policy.get("turn_order"),
+        "max_parallel_tasks": policy.get("max_parallel_tasks"),
+        "max_sequence_rounds": policy.get("max_sequence_rounds"),
+        "max_speakers_per_round": policy.get("max_speakers_per_round"),
+        "escalation_summary_digest": _job_prompt_digest(policy.get("escalation_summary") or ""),
+        "owner_note_digest": _job_prompt_digest(owner_note),
+        "metadata_only": True,
+        "toolgate_is_action_boundary": policy.get("approval_mode") == "toolgate_required",
+    }
+    request = app.state.gates.create_admin_request(
+        kind="team_policy_review",
+        title=f"Review team execution policy: {_redact_profile_metadata_text(item.get('name') or team_id, limit=120)}",
+        details=(
+            "Owner review requested before AgentGate can run a multi-agent group team. "
+            f"Handoff: {policy.get('handoff_mode')}. Approval boundary: {policy.get('approval_mode')}. "
+            f"Turn order: {policy.get('turn_order')}. Members: {len(_clean_list(item.get('member_agent_ids')))}. "
+            f"Owner note: {owner_note or 'none'}. "
+            "No prompts, memory contents, tool arguments, credentials, provider URLs, host paths, or raw escalation policy were sent."
+        ),
+        payload=request_payload,
+        severity="warning",
+    )
+    policy["review_status"] = "needs_review"
+    item["orchestrator_policy"] = policy
+    item["team_policy_digest"] = digest
+    item["team_policy_review_request_id"] = request.get("id")
+    item["team_policy_review_status"] = str(request.get("status") or "pending")
+    item["team_policy_review_requested_at"] = now()
+    item["team_policy_review_decided_at"] = None
+    item["team_policy_review_stale_reason"] = None
+    item["updated_at"] = now()
+    app.state.teams[team_id] = item
+    _save_registry_item("team", item)
+    _record_activity(
+        item.get("orchestrator_agent_id") or "agent_pi_operator",
+        event_type="team.policy_review_requested",
+        status="pending",
+        source="ToolGate",
+        summary=f"Team policy queued for owner review: {item.get('name') or team_id}",
+        team_id=team_id,
+        ref_type="approval",
+        ref_id=str(request.get("id") or ""),
+    )
+    return request
+
+
+def _apply_team_policy_review_request(result: dict[str, Any], decision: str) -> None:
+    request_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    team_id = str(request_payload.get("subject_id") or request_payload.get("team_id") or "")
+    item = app.state.teams.get(team_id)
+    if not item:
+        result["team_policy_status"] = "team_missing"
+        return
+    digest = _team_policy_digest(item)
+    expected_digest = str(request_payload.get("policy_digest") or "")
+    policy = _safe_orchestrator_policy(item.get("orchestrator_policy"))
+    item["team_policy_review_request_id"] = result.get("id") or item.get("team_policy_review_request_id")
+    item["team_policy_review_decided_at"] = now()
+    if decision == "approved":
+        if expected_digest and digest != expected_digest:
+            policy["review_status"] = "needs_review"
+            item["team_policy_review_status"] = "stale"
+            item["team_policy_review_stale_reason"] = "team policy changed after ToolGate review was requested"
+            result["team_policy_status"] = "stale"
+            result["team_policy_stale_reason"] = item["team_policy_review_stale_reason"]
+        else:
+            policy["review_status"] = "owner_reviewed"
+            item["team_policy_digest"] = digest
+            item["team_policy_review_status"] = "approved"
+            item["team_policy_review_stale_reason"] = None
+            result["team_policy_status"] = "owner_reviewed"
+    else:
+        policy["review_status"] = "needs_review"
+        item["team_policy_review_status"] = "rejected"
+        item["team_policy_review_stale_reason"] = None
+        result["team_policy_status"] = "rejected"
+    item["orchestrator_policy"] = policy
+    item["updated_at"] = now()
+    app.state.teams[team_id] = item
+    _save_registry_item("team", item)
 
 
 def _sanitize_agent_profile(payload: dict[str, Any]) -> dict[str, Any]:
@@ -8943,6 +9122,8 @@ def create_team(payload: TeamInput):
         **profile,
         "member_agent_ids": member_agent_ids,
         "orchestrator_policy": _safe_orchestrator_policy(profile.get("orchestrator_policy")),
+        "team_policy_review_status": "not_requested",
+        "team_policy_digest": "",
         "status": "draft",
         "created_at": now(),
         "updated_at": now(),
@@ -8972,12 +9153,26 @@ def update_team(team_id: str, payload: dict[str, Any]):
     if not item:
         raise HTTPException(404, "team not found")
     previous_member_agent_ids = list(item.get("member_agent_ids", []))
+    previous_policy_digest = _team_policy_digest(item)
     allowed = set(TeamInput.model_fields) | {"status"}
     if "member_agent_ids" in payload or "orchestrator_agent_id" in payload:
         next_member_ids = payload.get("member_agent_ids", item.get("member_agent_ids", []))
         next_orchestrator = payload.get("orchestrator_agent_id", item.get("orchestrator_agent_id", ""))
         payload = {**payload, "member_agent_ids": _normalized_team_member_ids(next_member_ids, next_orchestrator)}
-    item.update(_sanitize_team_profile({key: value for key, value in payload.items() if key in allowed}))
+    item.update(_sanitize_team_profile({key: value for key, value in payload.items() if key in allowed}, existing=item))
+    next_policy_digest = _team_policy_digest(item)
+    if next_policy_digest != previous_policy_digest:
+        policy = _safe_orchestrator_policy(item.get("orchestrator_policy"))
+        policy["review_status"] = "needs_review"
+        item["orchestrator_policy"] = policy
+        item["team_policy_digest"] = next_policy_digest
+        if item.get("team_policy_review_request_id"):
+            item["team_policy_review_status"] = "stale"
+            item["team_policy_review_stale_reason"] = "team policy changed after ToolGate review was requested"
+        else:
+            item["team_policy_review_status"] = "not_requested"
+            item["team_policy_review_stale_reason"] = None
+        item["team_policy_review_decided_at"] = None
     item["updated_at"] = now()
     _save_registry_item("team", item)
     if "member_agent_ids" in payload:
@@ -8995,6 +9190,23 @@ def update_team(team_id: str, payload: dict[str, Any]):
         ref_id=team_id,
     )
     return _public_team(item, activity_limit=10)
+
+
+@app.post("/api/teams/{team_id}/policy-review")
+def request_team_policy_review(team_id: str, payload: TeamPolicyReviewInput | None = None):
+    request = _create_team_policy_review_request(team_id, payload)
+    team = app.state.teams.get(team_id)
+    if not team:
+        raise HTTPException(404, "team not found")
+    public = _public_team(team, activity_limit=10)
+    return {
+        **public,
+        "toolgate_request": {
+            "id": request.get("id") or team.get("team_policy_review_request_id"),
+            "status": request.get("status") or team.get("team_policy_review_status") or "pending",
+        },
+        "safe_metadata_only": True,
+    }
 
 
 @app.delete("/api/teams/{team_id}")
@@ -10720,6 +10932,8 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
         _apply_model_route_request(result, decision)
     if result.get("kind") == "app_preview_promotion_review" and request_payload.get("subject_type") == "app_preview_proposal":
         _apply_app_preview_promotion_approval_request(result, decision)
+    if result.get("kind") == "team_policy_review" and request_payload.get("subject_type") == "team_policy":
+        _apply_team_policy_review_request(result, decision)
     if result.get("kind") == "task_checkpoint_review" and request_payload.get("subject_type") == "task_checkpoint":
         _apply_task_checkpoint_approval_request(result, decision)
     if result.get("kind") == "notification_test_send" and request_payload.get("subject_type") == "notification_channel":
