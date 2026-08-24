@@ -3698,8 +3698,22 @@ def test_team_templates_create_metadata_only_team(monkeypatch, tmp_path):
     reset_state()
 
     with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        critic = client.post("/api/agent-templates/critic-reviewer/create").json()
+        tester = client.post("/api/agent-templates/dashboard-tester/create").json()
         templates = client.get("/api/team-templates").json()["templates"]
         created = client.post("/api/team-templates/security/create").json()
+        build_team = client.post(
+            "/api/team-templates/agentgate-build-review/create",
+            json={
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": [
+                    "agent_pi_operator",
+                    critic["id"],
+                    tester["id"],
+                ],
+            },
+        ).json()
         updated_templates = client.get("/api/team-templates").json()["templates"]
 
     security_template = next(
@@ -3718,6 +3732,17 @@ def test_team_templates_create_metadata_only_team(monkeypatch, tmp_path):
     assert created["memory_scopes"] == ["system-summary"]
     assert created["id"] in app.state.agents["agent_pi_operator"]["team_ids"]
     assert updated_security["already_created"] is True
+    assert build_team["name"] == "AgentGate Build Review Team"
+    assert build_team["member_agent_ids"] == [
+        "agent_pi_operator",
+        critic["id"],
+        tester["id"],
+    ]
+    assert build_team["tool_ids"] == []
+    assert build_team["skill_ids"] == []
+    assert build_team["memory_scopes"] == ["project-context", "system-summary"]
+    assert build_team["orchestration_readiness"]["review_status"] == "unreviewed"
+    assert build_team["orchestration_readiness"]["approval_mode"] == "toolgate_required"
 
 
 def test_team_orchestration_readiness_redacts_public_surfaces(monkeypatch, tmp_path):

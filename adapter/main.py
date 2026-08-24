@@ -380,6 +380,15 @@ TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
         "purpose": "Invent, build, test, and document software ideas for the private AgentGate stack and owner projects.",
         "memory_scopes": ["project-context"],
     },
+    "agentgate-build-review": {
+        "id": "agentgate-build-review",
+        "name": "AgentGate Build Review Team",
+        "purpose": (
+            "Coordinate AgentGate implementation review with the operator, Critic, and Tester roles "
+            "while keeping execution gated by ToolGate and memory access explicitly scoped."
+        ),
+        "memory_scopes": ["project-context", "system-summary"],
+    },
     "automation": {
         "id": "automation",
         "name": "Automation Team",
