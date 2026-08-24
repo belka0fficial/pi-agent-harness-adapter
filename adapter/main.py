@@ -9081,6 +9081,101 @@ def _skill_permission_summary(
     }
 
 
+def _capability_grant_boundary_summary() -> dict[str, Any]:
+    try:
+        tools = list(app.state.gates.tools())
+        skills = list(app.state.gates.skills())
+    except (RuntimeError, AttributeError):
+        return {
+            "catalog_status": "unavailable",
+            "metadata_only": True,
+            "raw_tool_arguments_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+        }
+    tool_catalog_ids = {str(item.get("id") or "") for item in tools if str(item.get("id") or "").strip()}
+    skill_catalog_ids = {str(item.get("id") or "") for item in skills if str(item.get("id") or "").strip()}
+    skill_by_id = {str(item.get("id") or ""): item for item in skills if str(item.get("id") or "").strip()}
+    subjects = [*app.state.agents.values(), *app.state.teams.values()]
+    direct_tool_grants = [
+        tool_id
+        for item in subjects
+        for tool_id in _clean_list(item.get("tool_ids"))
+    ]
+    direct_skill_grants = [
+        skill_id
+        for item in subjects
+        for skill_id in _clean_list(item.get("skill_ids"))
+    ]
+    unknown_tool_grants = [
+        tool_id
+        for tool_id in direct_tool_grants
+        if tool_id not in tool_catalog_ids and tool_id != "*"
+    ]
+    unknown_skill_grants = [
+        skill_id
+        for skill_id in direct_skill_grants
+        if skill_id not in skill_catalog_ids and skill_id != "*"
+    ]
+    wildcard_tool_grants = sum(1 for tool_id in direct_tool_grants if tool_id == "*")
+    wildcard_skill_grants = sum(1 for skill_id in direct_skill_grants if skill_id == "*")
+    linked_tool_refs = [
+        tool_id
+        for skill in skills
+        for tool_id in _clean_list(skill.get("linked_tools"))
+    ]
+    missing_catalog_linked_tools = [
+        tool_id for tool_id in linked_tool_refs if tool_id not in tool_catalog_ids
+    ]
+    effective_contexts = 0
+    effective_missing_linked_tools = 0
+    for agent in app.state.agents.values():
+        agent_id = str(agent.get("id") or "").strip()
+        team_ids = _clean_list(agent.get("team_ids")) or [None]
+        for team_id in team_ids:
+            try:
+                actor = _permission_context(agent_id, team_id)
+            except HTTPException:
+                continue
+            effective_contexts += 1
+            for skill_id in actor["skill_ids"]:
+                skill = skill_by_id.get(str(skill_id))
+                if not skill:
+                    continue
+                for linked_tool_id in _clean_list(skill.get("linked_tools")):
+                    if not _capability_allowed(linked_tool_id, actor["tool_ids"]):
+                        effective_missing_linked_tools += 1
+    warning_count = (
+        len(unknown_tool_grants)
+        + len(unknown_skill_grants)
+        + wildcard_tool_grants
+        + wildcard_skill_grants
+        + len(missing_catalog_linked_tools)
+        + effective_missing_linked_tools
+    )
+    return {
+        "catalog_status": "ok",
+        "tool_catalog_count": len(tool_catalog_ids),
+        "skill_catalog_count": len(skill_catalog_ids),
+        "grant_subject_count": len(subjects),
+        "direct_tool_grant_count": len(direct_tool_grants),
+        "direct_skill_grant_count": len(direct_skill_grants),
+        "unknown_tool_grants": len(unknown_tool_grants),
+        "unknown_skill_grants": len(unknown_skill_grants),
+        "wildcard_tool_grants": wildcard_tool_grants,
+        "wildcard_skill_grants": wildcard_skill_grants,
+        "skill_linked_tool_refs": len(linked_tool_refs),
+        "missing_catalog_linked_tool_refs": len(missing_catalog_linked_tools),
+        "effective_context_count": effective_contexts,
+        "effective_skill_missing_linked_tool_refs": effective_missing_linked_tools,
+        "warning_count": warning_count,
+        "metadata_only": True,
+        "raw_tool_arguments_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+    }
+
+
 @app.post("/v1/runs/{run_id}/stop")
 async def stop_run(run_id: str):
     try:
@@ -9490,6 +9585,23 @@ def _verification_snapshot() -> dict[str, Any]:
             "orphaned_keys": orphaned,
             "manual_review": boundary_summary.get("unsafe_to_touch", 0),
         },
+    ))
+
+    capability_boundary = _capability_grant_boundary_summary()
+    capability_catalog_ok = capability_boundary.get("catalog_status") == "ok"
+    capability_warning_count = int(capability_boundary.get("warning_count") or 0)
+    checks.append(_verification_check(
+        "capability-grant-boundary",
+        "Capability grant boundary",
+        "pass" if capability_catalog_ok and capability_warning_count == 0 else "warn",
+        (
+            "Tool and skill grants match available catalogs and linked-tool requirements."
+            if capability_catalog_ok and capability_warning_count == 0
+            else "Tool/skill grant metadata needs owner review before higher-trust delegation."
+        ),
+        source="AgentGate Capabilities",
+        severity="warning" if not capability_catalog_ok or capability_warning_count else "info",
+        detail=capability_boundary,
     ))
 
     teams = list(app.state.teams.values())

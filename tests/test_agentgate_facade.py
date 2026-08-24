@@ -1996,6 +1996,81 @@ def test_verification_snapshot_reports_missing_gateway_key_as_safe_warning(monke
     assert "authorization" not in visible
 
 
+def test_verification_snapshot_reports_capability_grant_boundary_clean(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "g" * 40)
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = ["echo"]
+        app.state.teams["team_core"]["skill_ids"] = ["skill-1"]
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "capability-grant-boundary")
+    assert check["status"] == "pass"
+    assert check["detail"]["catalog_status"] == "ok"
+    assert check["detail"]["tool_catalog_count"] == 3
+    assert check["detail"]["skill_catalog_count"] == 2
+    assert check["detail"]["unknown_tool_grants"] == 0
+    assert check["detail"]["unknown_skill_grants"] == 0
+    assert check["detail"]["wildcard_tool_grants"] == 0
+    assert check["detail"]["wildcard_skill_grants"] == 0
+    assert check["detail"]["effective_skill_missing_linked_tool_refs"] == 0
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["raw_tool_arguments_included"] is False
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    visible = json.dumps(check).lower()
+    assert "echo" not in visible
+    assert "skill-1" not in visible
+
+
+def test_verification_snapshot_warns_on_capability_grant_drift_without_ids(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", "h" * 40)
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["tool_ids"] = []
+        app.state.agents["agent_pi_operator"]["skill_ids"] = ["skill-1"]
+        app.state.agents["agent_wildcard_probe"] = {
+            "id": "agent_wildcard_probe",
+            "name": "Wildcard Probe",
+            "tool_ids": ["*"],
+            "skill_ids": [],
+            "memory_scopes": [],
+            "team_ids": [],
+        }
+        app.state.teams["team_core"]["tool_ids"] = ["ghost.tool"]
+        app.state.teams["team_core"]["skill_ids"] = ["ghost-skill", "*"]
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "capability-grant-boundary")
+    assert check["status"] == "warn"
+    assert check["severity"] == "warning"
+    assert check["detail"]["catalog_status"] == "ok"
+    assert check["detail"]["unknown_tool_grants"] == 1
+    assert check["detail"]["unknown_skill_grants"] == 1
+    assert check["detail"]["wildcard_tool_grants"] == 1
+    assert check["detail"]["wildcard_skill_grants"] == 1
+    assert check["detail"]["effective_skill_missing_linked_tool_refs"] == 1
+    assert check["detail"]["warning_count"] >= 5
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["raw_tool_arguments_included"] is False
+    assert check["detail"]["credentials_included"] is False
+    assert check["detail"]["provider_urls_included"] is False
+    visible = json.dumps(check).lower()
+    assert "ghost.tool" not in visible
+    assert "ghost-skill" not in visible
+    assert "skill-1" not in visible
+    assert "echo" not in visible
+    assert "danger.write" not in visible
+
+
 def test_verification_snapshot_reports_notification_delivery_boundary(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
