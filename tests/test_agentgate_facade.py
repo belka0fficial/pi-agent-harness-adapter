@@ -2337,6 +2337,7 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
         "model-provider-metadata",
         "free-model-gateway-boundary",
         "automation-approval-boundary",
+        "open-loop-boundary",
     } <= check_ids
     owner_auth = next(item for item in snapshot["checks"] if item["id"] == "owner-authentication")
     assert owner_auth["status"] == "pass"
@@ -2350,6 +2351,85 @@ def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
         re.I,
     )
     assert not forbidden.search(str(snapshot))
+
+
+def test_verification_snapshot_reports_open_loop_boundary_without_loop_payloads(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    def approvals(*, history: bool = False):
+        if history:
+            return []
+        return [{
+            "id": "req-open-loop-secret",
+            "source": "ToolGate",
+            "severity": "high",
+            "title": "Approval title token=open-loop-title-secret",
+            "details": "Approval details api_key=open-loop-detail-secret https://open-loop.example/path",
+            "binding": {
+                "type": "tool",
+                "id": "approval.test-echo token=open-loop-binding-secret",
+                "version": "1",
+                "digest": "sha256:openloop",
+            },
+            "created_at": "2026-01-02T00:00:00+00:00",
+        }]
+
+    monkeypatch.setattr(app.state.gates, "approvals", approvals)
+    with TestClient(app) as client:
+        app.state.memory_candidates = {
+            "mem-open-loop-secret": {
+                "id": "mem-open-loop-secret",
+                "text": "memory token=open-loop-memory-secret https://memory-open-loop.example/path /home/alexey/private",
+                "status": "pending",
+                "memory_type": "preference",
+                "confidence": "high",
+                "created_at": "2026-01-03T00:00:00+00:00",
+            }
+        }
+        snapshot = client.get("/api/verification/snapshot").json()
+
+    check = next(item for item in snapshot["checks"] if item["id"] == "open-loop-boundary")
+    assert check["status"] == "warn"
+    assert check["severity"] == "warning"
+    assert check["detail"]["schema"] == "agentgate.open_loop_boundary.v1"
+    assert check["detail"]["total"] >= 2
+    assert check["detail"]["needs_approval"] == 1
+    assert check["detail"]["owner_review"] >= 1
+    assert check["detail"]["metadata_only"] is True
+    assert check["detail"]["actions_executed"] is False
+    assert check["detail"]["approvals_decided"] is False
+    assert check["detail"]["memory_written"] is False
+    assert check["detail"]["ref_ids_included"] is False
+    assert check["detail"]["titles_included"] is False
+    assert check["detail"]["evidence_included"] is False
+    assert "toolgate-approval" in check["detail"]["by_source_kind"]
+    assert "/approvals" in check["detail"]["by_target_path"]
+    assert "high" in check["detail"]["by_priority"]
+
+    joined = json.dumps(check).lower()
+    for forbidden in [
+        "open-loop-title-secret",
+        "open-loop-detail-secret",
+        "open-loop-binding-secret",
+        "open-loop-memory-secret",
+        "req-open-loop-secret",
+        "mem-open-loop-secret",
+        "approval.test-echo",
+        "https://open-loop.example",
+        "https://memory-open-loop.example",
+        "/home/alexey",
+        "api_key=open-loop",
+        "\"title\":",
+        "\"evidence\":",
+        "\"ref_id\":",
+        "\"text\":",
+        "\"content\":",
+        "\"run_id\":",
+        "\"provider_url\":",
+    ]:
+        assert forbidden not in joined
 
 
 def test_verification_snapshot_reports_free_model_gateway_boundary_without_secrets(monkeypatch, tmp_path):

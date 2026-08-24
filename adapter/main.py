@@ -2386,6 +2386,57 @@ def _open_loops(limit: int = 12) -> dict[str, Any]:
     }
 
 
+def _open_loop_boundary_summary() -> dict[str, Any]:
+    payload = _open_loops(limit=24)
+    loops = payload.get("loops") if isinstance(payload.get("loops"), list) else []
+
+    def counts_for(key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in loops:
+            value = _safe_summary(item.get(key) or "unknown", limit=80)
+            counts[value] = counts.get(value, 0) + 1
+        return counts
+
+    source_counts: dict[str, int] = {}
+    target_counts: dict[str, int] = {}
+    for item in loops:
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        source_kind = _safe_summary(source.get("kind") or "unknown", limit=80)
+        source_counts[source_kind] = source_counts.get(source_kind, 0) + 1
+        target = _safe_summary(item.get("target_path") or "/", limit=80)
+        target_counts[target] = target_counts.get(target, 0) + 1
+
+    total = len(loops)
+    needs_approval = len([item for item in loops if item.get("approval_required") is True])
+    owner_review = total - needs_approval
+    return {
+        "schema": "agentgate.open_loop_boundary.v1",
+        "total": total,
+        "needs_approval": needs_approval,
+        "owner_review": owner_review,
+        "by_priority": counts_for("priority"),
+        "by_status": counts_for("status"),
+        "by_source_kind": source_counts,
+        "by_target_path": target_counts,
+        "warning_count": total,
+        "metadata_only": True,
+        "actions_executed": False,
+        "approvals_decided": False,
+        "jobs_started": False,
+        "memory_written": False,
+        "tools_installed": False,
+        "raw_prompts_included": False,
+        "memory_contents_included": False,
+        "tool_arguments_included": False,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
+        "ref_ids_included": False,
+        "titles_included": False,
+        "evidence_included": False,
+    }
+
+
 def _safe_session_detail(session_id: str) -> dict[str, Any]:
     item = app.state.sessions.get(session_id)
     if not item:
@@ -10487,6 +10538,22 @@ def _verification_snapshot() -> dict[str, Any]:
             "job_count": len(jobs),
             "pending_risky_jobs": len(risky_jobs),
         },
+    ))
+
+    open_loop_boundary = _open_loop_boundary_summary()
+    open_loop_warning_count = int(open_loop_boundary.get("warning_count") or 0)
+    checks.append(_verification_check(
+        "open-loop-boundary",
+        "Open-loop boundary",
+        "pass" if open_loop_warning_count == 0 else "warn",
+        (
+            "No backend radar loops currently need owner attention."
+            if open_loop_warning_count == 0
+            else "Backend radar has owner attention loops; review Command or the owning screens before treating the stack as calm."
+        ),
+        source="AgentGate Command",
+        severity="warning" if open_loop_warning_count else "info",
+        detail=open_loop_boundary,
     ))
 
     notification_boundary = _notification_delivery_boundary_summary()
