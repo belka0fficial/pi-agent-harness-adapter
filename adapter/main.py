@@ -354,6 +354,7 @@ app.state.app_artifacts = {}
 app.state.app_preview_proposals = {}
 app.state.model_route_proposals = {}
 app.state.notification_channels = {}
+app.state.notification_deliveries = {}
 app.state.active_runs = {}
 app.state.active_job_runs = {}
 app.state.approval_runs = {}
@@ -460,6 +461,7 @@ def _load_registry() -> None:
     app.state.app_preview_proposals = {}
     app.state.model_route_proposals = {}
     app.state.notification_channels = {}
+    app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
     for row in rows:
         try:
@@ -486,6 +488,8 @@ def _load_registry() -> None:
             app.state.model_route_proposals[row["id"]] = item
         elif row["kind"] == "notification_channel":
             app.state.notification_channels[row["id"]] = item
+        elif row["kind"] == "notification_delivery":
+            app.state.notification_deliveries[row["id"]] = item
         elif row["kind"] == "memory_candidate":
             app.state.memory_candidates[row["id"]] = item
     _normalize_agent_model_defaults()
@@ -512,7 +516,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "notification_channel", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "notification_channel", "notification_delivery", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -528,7 +532,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "notification_delivery", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -3644,6 +3648,26 @@ def _public_notification_channel(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _public_notification_delivery(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "channel_label": item.get("channel_label"),
+        "channel_kind": item.get("channel_kind", "local_log"),
+        "status": item.get("status", "queued"),
+        "source": item.get("source", "automation"),
+        "job_id": item.get("job_id"),
+        "agent_id": item.get("agent_id"),
+        "team_id": item.get("team_id"),
+        "summary": _redact_audit_text(item.get("summary") or "", limit=240),
+        "result_status": item.get("result_status"),
+        "result_output_chars": int(item.get("result_output_chars") or 0),
+        "created_at": item.get("created_at"),
+        "metadata_only": True,
+        "local_only": True,
+        "external_delivery": False,
+    }
+
+
 def _ensure_notification_channels_seeded() -> None:
     if getattr(app.state, "notification_channels", None) is None:
         app.state.notification_channels = {}
@@ -3723,6 +3747,55 @@ def _validate_delivery_targets_against_channels(policy: str, targets: list[str])
     if blocked:
         raise HTTPException(422, f"delivery targets must reference configured non-disabled channel labels: {', '.join(blocked[:6])}")
     return targets
+
+
+def _record_local_notification_delivery(item: dict[str, Any], result: dict[str, Any]) -> list[dict[str, Any]]:
+    _ensure_notification_channels_seeded()
+    if str(item.get("delivery_policy") or "disabled") == "disabled":
+        return []
+    deliveries: list[dict[str, Any]] = []
+    for label in item.get("delivery_targets") or []:
+        channel = _notification_channel_by_label(label)
+        if not channel or channel.get("status") != "available":
+            continue
+        kind = str(channel.get("kind") or "manual")
+        if kind != "local_log":
+            continue
+        created_at = now()
+        delivery = {
+            "id": f"notif_{uuid.uuid4().hex[:12]}",
+            "channel_id": channel.get("id"),
+            "channel_label": channel.get("label"),
+            "channel_kind": kind,
+            "status": "delivered",
+            "source": "automation",
+            "job_id": item.get("id"),
+            "agent_id": item.get("agent_id"),
+            "team_id": item.get("team_id"),
+            "summary": _redact_audit_text(
+                f"Automation {item.get('name') or item.get('id')} finished with {result.get('status') or 'unknown'}: {result.get('output_summary') or ''}",
+                limit=240,
+            ),
+            "result_status": result.get("status"),
+            "result_output_chars": int(result.get("output_chars") or 0),
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        app.state.notification_deliveries[delivery["id"]] = delivery
+        _save_registry_item("notification_delivery", delivery)
+        deliveries.append(_public_notification_delivery(delivery))
+    if len(app.state.notification_deliveries) > 200:
+        rows = sorted(
+            app.state.notification_deliveries.values(),
+            key=lambda row: row.get("created_at") or "",
+            reverse=True,
+        )
+        keep = {row["id"] for row in rows[:200]}
+        for delivery_id in list(app.state.notification_deliveries):
+            if delivery_id not in keep:
+                app.state.notification_deliveries.pop(delivery_id, None)
+                _delete_registry_item("notification_delivery", delivery_id)
+    return deliveries
 
 
 def _sanitize_task_status(value: Any) -> str:
@@ -4236,11 +4309,19 @@ async def run_job(job_id: str):
     result = {
         "job_id": job_id,
         "status": status,
-        "output_summary": _summarize_job_output(output),
+        "output_summary": _redact_audit_text(_summarize_job_output(output), limit=240),
         "output_chars": len(output),
         "error": error,
         "completed_at": now(),
     }
+    try:
+        deliveries = _record_local_notification_delivery(item, result)
+    except sqlite3.OperationalError:
+        deliveries = []
+        _note_persistence_failure(job_id, "registry unavailable: notification delivery not persisted")
+    if deliveries:
+        result["notification_delivery_count"] = len(deliveries)
+        result["notification_channels"] = [row["channel_label"] for row in deliveries[:6]]
     item["last_result"] = result
     _append_job_run_history(item, result)
     if status == "failed":
@@ -6819,6 +6900,41 @@ def list_notification_channels():
             "disabled": sum(1 for row in rows if row.get("status") == "disabled"),
             "metadata_only": True,
         },
+    }
+
+
+@app.get("/api/notification-deliveries")
+def list_notification_deliveries():
+    _ensure_registry_seeded()
+    rows = [_public_notification_delivery(item) for item in app.state.notification_deliveries.values()]
+    rows.sort(key=lambda row: row.get("created_at") or "", reverse=True)
+    rows = rows[:50]
+    return {
+        "deliveries": rows,
+        "summary": {
+            "total": len(app.state.notification_deliveries),
+            "returned": len(rows),
+            "delivered": sum(1 for row in rows if row.get("status") == "delivered"),
+            "failed": sum(1 for row in rows if row.get("status") == "failed"),
+            "metadata_only": True,
+            "local_only": True,
+            "external_delivery": False,
+        },
+    }
+
+
+@app.delete("/api/notification-deliveries/{delivery_id}")
+def delete_notification_delivery(delivery_id: str):
+    _ensure_registry_seeded()
+    if delivery_id not in app.state.notification_deliveries:
+        raise HTTPException(404, "notification delivery not found")
+    app.state.notification_deliveries.pop(delivery_id, None)
+    _delete_registry_item("notification_delivery", delivery_id)
+    return {
+        "deleted": True,
+        "metadata_only": True,
+        "local_only": True,
+        "external_delivery": False,
     }
 
 

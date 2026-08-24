@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from adapter import main
 from adapter.gates import GateClients
 from adapter.main import app
+from adapter.pi_client import PiEvent
 
 
 class FakeGates:
@@ -286,6 +287,21 @@ class FakeGates:
         return {"status": "ok"}
 
 
+class LocalNotificationPi:
+    async def stream(self, prompt: str, *, session_id: str, options: dict | None = None):
+        yield PiEvent("run.started", {"run_id": "run-local-notification", "session_id": session_id})
+        yield PiEvent(
+            "message.delta",
+            {
+                "delta": (
+                    "brief ready without secrets "
+                    "api_key=abc123 https://private.invalid/raw"
+                )
+            },
+        )
+        yield PiEvent("message.completed", {"message_id": "msg-local-notification"})
+
+
 def reset_state():
     app.state.sessions = {"sess-1": {"id": "sess-1", "title": "Real session", "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-02T00:00:00+00:00"}}
     app.state.messages = {"sess-1": [{"id": "u1", "role": "user", "content": "hello", "created_at": "2026-01-01T00:00:00+00:00"}, {"id": "a1", "role": "assistant", "content": "hi", "created_at": "2026-01-01T00:01:00+00:00"}]}
@@ -298,6 +314,7 @@ def reset_state():
     app.state.app_artifacts = {}
     app.state.app_preview_proposals = {}
     app.state.notification_channels = {}
+    app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
     app.state.active_job_runs = {}
     app.state.approval_runs = {}
@@ -3707,6 +3724,51 @@ def test_notification_channels_are_metadata_only_and_reject_sensitive_targets(mo
     assert unsafe_secret.status_code == 422
     assert unsafe_description.status_code == 422
     assert "https://private.invalid" not in str(listed)
+
+
+def test_local_notification_delivery_records_safe_automation_inbox(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = LocalNotificationPi()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Local Inbox Proof",
+                "schedule": "0 9 * * *",
+                "prompt": "private prompt with token=secret-value",
+                "delivery_policy": "allowlisted",
+                "delivery_targets": ["local dashboard inbox"],
+            },
+        ).json()
+        app.state.gates.decide_approval(created["approval_request_id"], "approved")
+        resumed = client.post(f"/api/jobs/{created['id']}/resume").json()
+        ran = client.post(f"/api/jobs/{created['id']}/run").json()
+        inbox = client.get("/api/notification-deliveries").json()
+        deleted = client.delete(f"/api/notification-deliveries/{inbox['deliveries'][0]['id']}").json()
+        cleaned = client.get("/api/notification-deliveries").json()
+
+    assert resumed["approval_status"] == "approved"
+    assert ran["last_result"]["notification_delivery_count"] == 1
+    assert ran["last_result"]["notification_channels"] == ["local dashboard inbox"]
+    assert "https://private.invalid" not in json.dumps(ran["last_result"]).lower()
+    assert "api_key=abc123" not in json.dumps(ran["last_result"]).lower()
+    assert inbox["summary"]["metadata_only"] is True
+    assert inbox["summary"]["local_only"] is True
+    assert inbox["summary"]["external_delivery"] is False
+    assert inbox["deliveries"][0]["channel_kind"] == "local_log"
+    assert inbox["deliveries"][0]["status"] == "delivered"
+    assert inbox["deliveries"][0]["external_delivery"] is False
+    assert inbox["deliveries"][0]["result_output_chars"] > 0
+    visible = json.dumps(inbox).lower()
+    assert "private prompt" not in visible
+    assert "secret-value" not in visible
+    assert "https://private.invalid" not in visible
+    assert "api_key=abc123" not in visible
+    assert deleted["deleted"] is True
+    assert deleted["metadata_only"] is True
+    assert cleaned["summary"]["total"] == 0
 
 
 def test_automation_auto_policy_requires_toolgate_for_tools_memory_and_delivery(monkeypatch, tmp_path):
