@@ -8303,6 +8303,11 @@ def _safe_auxiliary_model_route(task_id: str, value: Any | None = None) -> dict[
         "purpose": purpose,
         "risk_policy": risk_policy,
         "owner_review_status": review_status,
+        "review_request_id": _safe_text(source.get("review_request_id"), limit=120),
+        "review_status": _safe_text(source.get("review_status") or "", limit=40),
+        "review_requested_at": source.get("review_requested_at"),
+        "review_decided_at": source.get("review_decided_at"),
+        "review_stale_reason": _safe_summary(source.get("review_stale_reason") or "", limit=160),
         "updated_at": source.get("updated_at"),
     }
 
@@ -8359,6 +8364,152 @@ def _public_auxiliary_model_route(task_id: str, value: Any | None = None, *, pro
             "provider_urls_included": False,
         },
     }
+
+
+def _auxiliary_route_review_values(task_id: str, value: Any | None = None) -> dict[str, Any]:
+    row = _safe_auxiliary_model_route(task_id, value)
+    if not row.get("provider") or not row.get("model"):
+        raise HTTPException(409, "provider and model labels are required before ToolGate review")
+    return {
+        "provider": row["provider"],
+        "model": row["model"],
+        "enabled": bool(row["enabled"]),
+        "purpose": row["purpose"],
+        "risk_policy": "owner_reviewed",
+        "owner_review_status": "owner_reviewed",
+    }
+
+
+def _auxiliary_route_digest(task_id: str, route: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        {
+            "task_id": task_id,
+            "provider": route.get("provider") or "",
+            "model": route.get("model") or "",
+            "enabled": bool(route.get("enabled")),
+            "purpose": route.get("purpose") or "",
+            "risk_policy": route.get("risk_policy") or "",
+            "owner_review_status": route.get("owner_review_status") or "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _current_auxiliary_route_digest(task_id: str) -> str:
+    current = _safe_auxiliary_model_route(task_id, app.state.auxiliary_model_routes.get(task_id))
+    return _auxiliary_route_digest(task_id, current)
+
+
+def _create_auxiliary_route_review_request(task_id: str, route: dict[str, Any]) -> dict[str, Any]:
+    task = AUXILIARY_MODEL_TASKS[task_id]
+    route_digest = _auxiliary_route_digest(task_id, route)
+    current_route_digest = _current_auxiliary_route_digest(task_id)
+    current = app.state.auxiliary_model_routes.get(task_id)
+    existing_request_id = str((current or {}).get("review_request_id") or "")
+    if existing_request_id:
+        try:
+            existing = app.state.gates.request_status(existing_request_id)
+        except Exception:
+            existing = None
+        if (
+            existing
+            and str(existing.get("status") or "") == "pending"
+            and (current or {}).get("review_route_digest") == route_digest
+            and (current or {}).get("review_current_route_digest") == current_route_digest
+        ):
+            return {"route": current, "request": existing}
+    payload = {
+        "subject_type": "auxiliary_model_route",
+        "subject_id": task_id,
+        "action": "approve_auxiliary_model_route",
+        "task_id": task_id,
+        "route": route,
+        "route_digest": route_digest,
+        "current_route_digest": current_route_digest,
+        "route_summary": {
+            "schema": "agentgate.auxiliary_model_route_review.v1",
+            "task_id": task_id,
+            "label": task["label"],
+            "provider": route.get("provider") or "",
+            "model": route.get("model") or "",
+            "enabled": bool(route.get("enabled")),
+            "purpose_chars": len(str(route.get("purpose") or "")),
+            "risk_policy": route.get("risk_policy") or "",
+            "owner_review_status": route.get("owner_review_status") or "",
+            "metadata_only": True,
+            "credentials_included": False,
+            "provider_urls_included": False,
+            "raw_prompts_included": False,
+            "memory_contents_included": False,
+            "tool_arguments_included": False,
+        },
+        "metadata_only": True,
+    }
+    request = app.state.gates.create_admin_request(
+        kind="auxiliary_model_route_review",
+        title=f"Approve helper model route: {task['label']}",
+        details=(
+            "Owner approval required before AgentGate marks this auxiliary helper route as reviewed. "
+            "Only provider/model labels, task label, purpose length, and safe route metadata were sent; "
+            "provider URLs, credentials, prompts, memory contents, and tool arguments stay server-side."
+        ),
+        payload=payload,
+        severity="warning",
+    )
+    item = _safe_auxiliary_model_route(task_id, app.state.auxiliary_model_routes.get(task_id))
+    item["review_request_id"] = request.get("id")
+    item["review_status"] = str(request.get("status") or "pending")
+    item["review_route_digest"] = route_digest
+    item["review_current_route_digest"] = current_route_digest
+    item["review_requested_at"] = now()
+    item["updated_at"] = now()
+    app.state.auxiliary_model_routes[task_id] = item
+    _save_registry_item("auxiliary_model_route", item)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="model.auxiliary_route_review_requested",
+        status="pending",
+        source="ToolGate",
+        summary=f"Auxiliary helper route sent to ToolGate review: {task['label']}",
+        ref_type="approval",
+        ref_id=str(request.get("id") or ""),
+    )
+    return {"route": item, "request": request}
+
+
+def _apply_auxiliary_model_route_request(result: dict[str, Any], decision: str) -> None:
+    request_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    task_id = str(request_payload.get("subject_id") or "")
+    current = app.state.auxiliary_model_routes.get(task_id)
+    if task_id not in AUXILIARY_MODEL_TASKS or not isinstance(current, dict):
+        return
+    if decision == "approved":
+        route = request_payload.get("route") if isinstance(request_payload.get("route"), dict) else {}
+        if _auxiliary_route_digest(task_id, route) != request_payload.get("route_digest"):
+            current["review_status"] = "digest_mismatch"
+            result["auxiliary_model_route_status"] = "digest_mismatch"
+        elif _current_auxiliary_route_digest(task_id) != request_payload.get("current_route_digest"):
+            current["review_status"] = "stale"
+            current["review_stale_reason"] = "helper route metadata changed after ToolGate review was requested"
+            result["auxiliary_model_route_status"] = "stale"
+            result["auxiliary_model_route_stale_reason"] = current["review_stale_reason"]
+        else:
+            applied = _safe_auxiliary_model_route(task_id, route)
+            applied["review_request_id"] = result.get("id") or current.get("review_request_id")
+            applied["review_status"] = "approved"
+            applied["review_decided_at"] = now()
+            applied["updated_at"] = now()
+            current = applied
+            result["auxiliary_model_route_status"] = "applied"
+    else:
+        current["review_status"] = "rejected"
+        current["review_decided_at"] = now()
+        result["auxiliary_model_route_status"] = "rejected"
+    current["updated_at"] = now()
+    app.state.auxiliary_model_routes[task_id] = current
+    _save_registry_item("auxiliary_model_route", current)
 
 
 def _auxiliary_routes_payload(*, probe_routes: bool = True) -> dict[str, Any]:
@@ -8666,6 +8817,29 @@ def update_auxiliary_model_route(task_id: str, payload: AuxiliaryModelRouteInput
         ref_id=task_id,
     )
     return _public_auxiliary_model_route(task_id, item)
+
+
+@app.post("/api/model/auxiliary-routes/{task_id}/review")
+def queue_auxiliary_model_route_review(task_id: str):
+    _ensure_registry_seeded()
+    if task_id not in AUXILIARY_MODEL_TASKS:
+        raise HTTPException(404, "auxiliary model task not found")
+    route = _auxiliary_route_review_values(task_id, app.state.auxiliary_model_routes.get(task_id))
+    created = _create_auxiliary_route_review_request(task_id, route)
+    request = created["request"]
+    return {
+        "status": "pending_approval",
+        "request_id": request.get("id"),
+        "task_id": task_id,
+        "route": _public_auxiliary_model_route(task_id, created["route"]),
+        "requires_approval": True,
+        "safe_metadata_only": True,
+        "credentials_included": False,
+        "provider_urls_included": False,
+        "raw_prompts_included": False,
+        "memory_contents_included": False,
+        "tool_arguments_included": False,
+    }
 
 
 @app.post("/api/model/route-check")
@@ -11411,6 +11585,8 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
                 result["automation_status"] = "rejected"
     if result.get("kind") == "model_route_change" and request_payload.get("subject_type") == "model_route":
         _apply_model_route_request(result, decision)
+    if result.get("kind") == "auxiliary_model_route_review" and request_payload.get("subject_type") == "auxiliary_model_route":
+        _apply_auxiliary_model_route_request(result, decision)
     if result.get("kind") == "app_preview_promotion_review" and request_payload.get("subject_type") == "app_preview_proposal":
         _apply_app_preview_promotion_approval_request(result, decision)
     if result.get("kind") == "capability_grant_change" and request_payload.get("subject_type") == "capability_grant":

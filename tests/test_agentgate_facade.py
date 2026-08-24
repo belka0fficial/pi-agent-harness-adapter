@@ -4337,6 +4337,72 @@ def test_auxiliary_model_routes_are_metadata_only(monkeypatch, tmp_path):
     assert "private.example" not in str(listed)
 
 
+def test_auxiliary_model_route_review_uses_toolgate(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        saved = client.patch(
+            "/api/model/auxiliary-routes/summary",
+            json={
+                "provider": "freellmapi",
+                "model": "stealth/ox-alpha",
+                "enabled": True,
+                "purpose": "Summaries only token=must-not-render https://private.example/raw.",
+                "risk_policy": "low_risk_only",
+                "owner_review_status": "needs_review",
+            },
+        )
+        queued = client.post("/api/model/auxiliary-routes/summary/review").json()
+        request = app.state.gates.requests[queued["request_id"]]
+        approved = client.post(
+            f"/api/approvals/{queued['request_id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        reviewed = client.get("/api/model/auxiliary-routes").json()
+        rejected = client.patch(
+            "/api/model/auxiliary-routes/classification",
+            json={
+                "provider": "freellmapi",
+                "model": "stealth/reject-me",
+                "enabled": True,
+                "risk_policy": "low_risk_only",
+                "owner_review_status": "needs_review",
+            },
+        )
+        rejected_queue = client.post("/api/model/auxiliary-routes/classification/review").json()
+        reject_decision = client.post(
+            f"/api/approvals/{rejected_queue['request_id']}/decision",
+            json={"decision": "rejected"},
+        ).json()
+        after_reject = client.get("/api/model/auxiliary-routes").json()
+
+    visible = json.dumps({"queued": queued, "request": request, "approved": approved}).lower()
+    summary_route = next(item for item in reviewed["routes"] if item["task_id"] == "summary")
+    classification_route = next(item for item in after_reject["routes"] if item["task_id"] == "classification")
+
+    assert saved.status_code == 200
+    assert queued["status"] == "pending_approval"
+    assert queued["safe_metadata_only"] is True
+    assert queued["credentials_included"] is False
+    assert queued["provider_urls_included"] is False
+    assert queued["raw_prompts_included"] is False
+    assert request["kind"] == "auxiliary_model_route_review"
+    assert request["payload"]["metadata_only"] is True
+    assert request["payload"]["route_digest"]
+    assert request["payload"]["current_route_digest"]
+    assert request["payload"]["route_summary"]["purpose_chars"] > 0
+    assert "token=must-not-render" not in visible
+    assert "private.example" not in visible
+    assert approved["auxiliary_model_route_status"] == "applied"
+    assert summary_route["owner_review_status"] == "owner_reviewed"
+    assert summary_route["risk_policy"] == "owner_reviewed"
+    assert rejected.status_code == 200
+    assert reject_decision["auxiliary_model_route_status"] == "rejected"
+    assert classification_route["owner_review_status"] == "needs_review"
+
+
 def test_model_route_labels_reject_urls_and_credentials_before_toolgate(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
