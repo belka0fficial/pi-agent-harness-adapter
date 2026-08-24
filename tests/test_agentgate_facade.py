@@ -3090,13 +3090,91 @@ def test_audit_timeline_merges_redacted_approvals_and_activity(monkeypatch, tmp_
 
     assert audit
     assert {"time", "risk", "source", "status", "event_type", "action_summary"} <= set(audit[0])
+    pending = next(item for item in audit if item["event_type"] == "approval.pending")
+    assert pending["ref_type"] == "approval"
+    assert pending["ref_id"] == "req-pending"
     joined = str(audit)
     assert "token=abc123" not in joined
     assert "https://private.example" not in joined
+
+
+def test_workstream_approval_ref_is_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    def approvals(*, history: bool = False):
+        if history:
+            return [{
+                "id": "req-decided",
+                "source": "ToolGate",
+                "severity": "low",
+                "title": "Completed request",
+                "details": "Already reviewed token=old-secret https://old.example/path",
+                "binding": {"type": "tool", "id": "echo", "version": "1", "digest": "sha256:old"},
+                "decision": "approved",
+                "decided_at": "2026-01-01T00:00:00+00:00",
+                "decided_by": "Owner",
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }]
+        return [{
+            "id": "req-pending",
+            "source": "ToolGate",
+            "severity": "high",
+            "title": "Run echo token=approval-secret",
+            "details": "Raw prompt and tool arguments api_key=abc123 https://private.example/path",
+            "binding": {
+                "type": "tool",
+                "id": "echo token=binding-secret",
+                "version": "1",
+                "digest": "sha256:abc",
+            },
+            "created_at": "2026-01-02T00:00:00+00:00",
+        }]
+
+    monkeypatch.setattr(app.state.gates, "approvals", approvals)
+
+    with TestClient(app) as client:
+        response = client.get("/api/workstream?limit=20")
+        detail = client.get("/api/workstream/refs/approval/req-pending")
+        decided_detail = client.get("/api/workstream/refs/approval/req-decided")
+
+    assert response.status_code == 200
+    approval_event = next(item for item in response.json()["events"] if item["ref_id"] == "req-pending")
+    assert approval_event["ref_type"] == "approval"
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["ref_type"] == "approval"
+    assert body["detail"]["schema"] == "agentgate.approval_ref_detail.v1"
+    assert body["detail"]["details"] == "Stored in ToolGate"
+    assert body["detail"]["details_chars"] > 0
+    assert body["detail"]["request_fields_redacted"] is True
+    assert body["insight"]["controls"]["schema"] == "agentgate.approval_controls.v1"
+    assert body["insight"]["controls"]["metadata_only"] is True
+    assert body["insight"]["controls"]["executes_from_drilldown"] is False
+    assert body["insight"]["controls"]["approve"]["enabled"] is True
+    assert body["insight"]["controls"]["approve"]["reason_code"] == "pending_owner_review"
+    assert body["insight"]["controls"]["reject"]["enabled"] is True
+    assert body["insight"]["controls"]["reject"]["reason_code"] == "pending_owner_review"
+    decided_controls = decided_detail.json()["insight"]["controls"]
+    assert decided_controls["approve"]["enabled"] is False
+    assert decided_controls["approve"]["reason_code"] == "already_decided"
+    assert decided_controls["reject"]["enabled"] is False
+    joined = json.dumps(body).lower()
+    for forbidden in [
+        "approval-secret",
+        "binding-secret",
+        "old-secret",
+        "api_key=abc123",
+        "https://private.example",
+        "raw prompt",
+        "tool arguments",
+        "payload",
+        "/api/",
+        "/v2/",
+    ]:
+        assert forbidden not in joined
     assert "raw tool arguments" not in joined.lower()
-    assert any(item["event_type"] == "approval.pending" for item in audit)
-    assert any(item["event_type"] == "approval.decided" for item in audit)
-    assert any(item["event_type"] == "tool.arguments" for item in audit)
 
 
 def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, tmp_path):

@@ -1599,7 +1599,7 @@ def _approval_audit_event(item: dict[str, Any], *, pending: bool) -> dict[str, A
         "status": status,
         "event_type": "approval.pending" if pending else "approval.decided",
         "action_summary": action_summary,
-        "ref_type": _safe_summary(binding.get("type") or "approval", limit=80),
+        "ref_type": "approval",
         "ref_id": _redact_audit_text(item.get("id") or "", limit=120),
         "digest": _redact_audit_text(binding.get("digest") or "", limit=80),
     }
@@ -1932,6 +1932,43 @@ def _safe_workstream_task_detail(task_id: str) -> dict[str, Any]:
     }
 
 
+def _safe_workstream_approval_detail(request_id: str) -> dict[str, Any]:
+    rows = [
+        *app.state.gates.approvals(history=False),
+        *app.state.gates.approvals(history=True),
+    ]
+    for item in rows:
+        if str(item.get("id") or "") != request_id:
+            continue
+        binding = item.get("binding") if isinstance(item.get("binding"), dict) else {}
+        pending = "decision" not in item
+        status = "pending" if pending else _safe_summary(item.get("decision") or "decided", limit=60)
+        return {
+            "schema": "agentgate.approval_ref_detail.v1",
+            "id": _safe_summary(item.get("id") or request_id, limit=120),
+            "status": status,
+            "source": _safe_summary(item.get("source") or "ToolGate", limit=80),
+            "severity": _safe_summary(item.get("severity") or "low", limit=40),
+            "kind": _safe_summary(binding.get("type") or "request", limit=80),
+            "title": _redact_audit_text(item.get("title") or "ToolGate approval request", limit=180),
+            "details": "Stored in ToolGate",
+            "details_digest": hashlib.sha256(str(item.get("details") or "").encode("utf-8")).hexdigest(),
+            "details_chars": len(str(item.get("details") or "")),
+            "binding": {
+                "subject_type": _safe_summary(binding.get("type") or "request", limit=80),
+                "subject_id_label": _redact_audit_text(binding.get("id") or "", limit=120),
+                "subject_version": _safe_summary(binding.get("version") or "", limit=80),
+                "digest": _redact_audit_text(binding.get("digest") or "", limit=120),
+            },
+            "request_body_present": True,
+            "request_fields_redacted": True,
+            "created_at": item.get("created_at"),
+            "decided_at": item.get("decided_at"),
+            "decided_by": _safe_summary(item.get("decided_by") or "", limit=80) or None,
+        }
+    raise HTTPException(404, "workstream reference not found")
+
+
 def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], events: list[dict[str, Any]], activity: list[dict[str, Any]]) -> dict[str, Any]:
     available = detail.get("available") is not False
     status = _safe_summary(detail.get("status") or detail.get("state") or detail.get("review_status") or detail.get("approval_status") or "metadata", limit=80)
@@ -1943,6 +1980,14 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
             "history": len(detail.get("history") or []),
             "required_tools": len(detail.get("required_tool_ids") or []),
             "required_memory": len(detail.get("required_memory_scopes") or []),
+        }
+    elif ref_type == "approval":
+        owner_next_step = "Open Approvals to approve or reject this ToolGate request."
+        review_state = detail.get("status") or "pending"
+        signal_counts = {
+            "pending": 1 if detail.get("status") == "pending" else 0,
+            "decided": 0 if detail.get("status") == "pending" else 1,
+            "binding": 1 if detail.get("request_body_present") else 0,
         }
     elif ref_type == "task":
         owner_next_step = "Open Tasks to review checkpoint state, dependencies, or the scoped task room."
@@ -2043,6 +2088,8 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
     }
     if ref_type == "job":
         insight["controls"] = _workstream_job_controls(ref_id, detail)
+    if ref_type == "approval":
+        insight["controls"] = _workstream_approval_controls(detail)
     if ref_type == "task":
         insight["controls"] = _workstream_task_controls(detail)
     return insight
@@ -2207,6 +2254,44 @@ def _workstream_task_controls(detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _workstream_approval_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    pending = detail.get("status") == "pending"
+    request_id = str(detail.get("id") or "")
+    runtime_binding = app.state.approval_runs.get(request_id)
+    approval_allowed = True
+    if pending and runtime_binding:
+        approval_allowed = _tool_allowed(runtime_binding.get("tool_id"), runtime_binding.get("tool_ids", []))
+    approve_reason_code = (
+        "pending_owner_review" if pending and approval_allowed else "approval_not_allowed" if pending else "already_decided"
+    )
+    reject_reason_code = "pending_owner_review" if pending else "already_decided"
+    return {
+        "schema": "agentgate.approval_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "approve": _workstream_control(
+            pending and approval_allowed,
+            approve_reason_code,
+            (
+                "Open Approvals to approve this ToolGate request."
+                if pending and approval_allowed
+                else "The originating actor is no longer allowed to approve this tool request."
+                if pending
+                else "This ToolGate request already has an owner decision."
+            ),
+        ),
+        "reject": _workstream_control(
+            pending,
+            reject_reason_code,
+            (
+                "Open Approvals to reject this ToolGate request."
+                if pending
+                else "This ToolGate request already has an owner decision."
+            ),
+        ),
+    }
+
+
 def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_type = _safe_summary(ref_type, limit=80)
     clean_id = _safe_summary(ref_id, limit=160)
@@ -2214,6 +2299,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
         raise HTTPException(422, "ref_type and ref_id are required")
     supported_types = {
         "agent",
+        "approval",
         "team",
         "job",
         "task",
@@ -2247,6 +2333,8 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
             }
         else:
             detail = _public_agent(app.state.agents[clean_id], activity_limit=5)
+    elif clean_type == "approval":
+        detail = _safe_workstream_approval_detail(clean_id)
     elif clean_type == "team":
         if clean_id not in app.state.teams:
             detail = {
