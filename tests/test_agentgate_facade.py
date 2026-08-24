@@ -5673,8 +5673,12 @@ def test_workroom_handoff_plan_creates_checkpointed_safe_task_shells(monkeypatch
     assert plan["policy"]["handoff_mode"] == "bounded_auto"
     assert all(task["owner_checkpoint"] for task in plan["tasks"])
     assert all(task["checkpoint_status"] == "pending" for task in plan["tasks"])
+    assert all(task["handoff_digest_ready"] for task in plan["tasks"])
+    assert {task["handoff_digest_prefix"] for task in plan["tasks"]} == {plan["objective_digest"][:16]}
     assert {task["agent_id"] for task in plan["tasks"]} == {"agent_pi_operator", helper["id"]}
     assert workroom["readiness"]["task_count"] == 2
+    assert all(task["handoff_digest_ready"] for task in workroom["tasks"])
+    assert {task["handoff_digest_prefix"] for task in workroom["tasks"]} == {plan["objective_digest"][:16]}
     assert rejected.status_code == 403
     combined = f"{plan} {workroom}".lower()
     assert "abc123" not in combined

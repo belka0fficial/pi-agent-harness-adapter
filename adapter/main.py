@@ -7014,6 +7014,8 @@ def _public_task(item: dict[str, Any]) -> dict[str, Any]:
         "execution_summary": item.get("execution_summary") or "",
         "execution_history": item.get("execution_history") or [],
         "source": item.get("source") or "AgentGate",
+        "handoff_digest_ready": bool(item.get("handoff_digest")),
+        "handoff_digest_prefix": str(item.get("handoff_digest") or "")[:16],
         "source_session_id": item.get("source_session_id"),
         "source_message_id": item.get("source_message_id"),
         "session_id": item.get("session_id"),
