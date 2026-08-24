@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from adapter import main
 from adapter.main import app
-from adapter.pi_client import PiEvent, _build_rpc_command, _pi_session_id, _pi_subprocess_env, translate_pi_item
+from adapter.pi_client import PiClient, PiEvent, _build_rpc_command, _pi_session_id, _pi_subprocess_env, translate_pi_item
 
 
 @dataclass
@@ -770,6 +770,59 @@ def test_pi_subprocess_environment_uses_per_run_toolgate_key(monkeypatch):
     empty_env = _pi_subprocess_env({"TOOLGATE_EXECUTION_KEY": None})
     assert scoped_env["TOOLGATE_EXECUTION_KEY"] == "actor-scoped-key"
     assert "TOOLGATE_EXECUTION_KEY" not in empty_env
+
+
+def test_pi_client_serializes_streams_by_default(monkeypatch):
+    monkeypatch.delenv("PI_MAX_CONCURRENT_RUNS", raising=False)
+
+    async def scenario():
+        client = PiClient(command="fake-pi")
+
+        class GatedRuntime:
+            def __init__(self):
+                self.current_run = None
+                self.session_file = None
+                self.entered = 0
+                self.active = 0
+                self.max_active = 0
+                self.release_first = asyncio.Event()
+                self.first_entered = asyncio.Event()
+
+            async def start_run(self, run, prompt, options):
+                self.current_run = run
+                self.entered += 1
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await run.queue.put(PiEvent("run.started", {"run_id": run.run_id, "prompt": prompt}))
+                if self.entered == 1:
+                    self.first_entered.set()
+                    await self.release_first.wait()
+                await run.queue.put(PiEvent("message.completed", {"message_id": f"done-{self.entered}"}))
+                await run.queue.put(None)
+                self.active -= 1
+
+        runtime = GatedRuntime()
+        client._get_or_create_runtime = lambda _session_id: runtime  # type: ignore[method-assign]
+
+        async def consume(prompt: str):
+            return [event.event async for event in client.stream(prompt, session_id=prompt)]
+
+        first = asyncio.create_task(consume("first"))
+        await asyncio.wait_for(runtime.first_entered.wait(), timeout=1)
+        second = asyncio.create_task(consume("second"))
+        await asyncio.sleep(0.05)
+
+        assert runtime.entered == 1
+        assert runtime.max_active == 1
+
+        runtime.release_first.set()
+        assert await asyncio.wait_for(first, timeout=1) == ["run.started", "message.completed"]
+        assert await asyncio.wait_for(second, timeout=1) == ["run.started", "message.completed"]
+        assert runtime.entered == 2
+        assert runtime.max_active == 1
+        assert client._run_limit == 1
+
+    asyncio.run(scenario())
 
 
 class DecisionGates:

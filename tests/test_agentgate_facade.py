@@ -643,6 +643,124 @@ def test_legacy_bearer_still_allows_mutating_requests_without_csrf(monkeypatch):
     assert owner_secret not in accepted.text
 
 
+def test_owner_session_requires_csrf_for_job_control_endpoints(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+    owner_secret = "job-csrf-owner-token-" + "k" * 32
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+
+    with TestClient(app) as client:
+        login = client.post("/api/auth/login", json={"owner_token": owner_secret})
+        csrf_token = login.json()["csrf_token"]
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "CSRF protected job",
+                "schedule": "0 9 * * *",
+                "prompt": "private command job prompt",
+            },
+            headers={"X-AgentGate-CSRF": csrf_token},
+        ).json()
+        job_id = created["id"]
+        blocked = [
+            client.post(f"/api/jobs/{job_id}/pause"),
+            client.post(f"/api/jobs/{job_id}/resume"),
+            client.post(f"/api/jobs/{job_id}/run"),
+            client.post(f"/api/jobs/{job_id}/stop"),
+        ]
+        wrong = client.post(
+            f"/api/jobs/{job_id}/pause",
+            headers={"X-AgentGate-CSRF": "wrong"},
+        )
+        accepted_pause = client.post(
+            f"/api/jobs/{job_id}/pause",
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+        accepted_resume = client.post(
+            f"/api/jobs/{job_id}/resume",
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+        accepted_run = client.post(
+            f"/api/jobs/{job_id}/run",
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+        accepted_stop = client.post(
+            f"/api/jobs/{job_id}/stop",
+            headers={"X-AgentGate-CSRF": csrf_token},
+        )
+
+    assert login.status_code == 200
+    assert created["status"] == "active"
+    assert [response.status_code for response in blocked] == [403, 403, 403, 403]
+    assert all(response.json() == {"detail": "owner csrf token required"} for response in blocked)
+    assert wrong.status_code == 403
+    assert accepted_pause.status_code == 200
+    assert accepted_pause.json()["status"] == "paused"
+    assert accepted_resume.status_code == 200
+    assert accepted_resume.json()["status"] == "active"
+    assert accepted_run.status_code == 200
+    assert accepted_run.json()["last_result"]["status"] == "ok"
+    assert accepted_stop.status_code == 404
+    assert accepted_stop.json() == {"detail": "active job run not found"}
+    combined = " ".join(
+        [
+            login.text,
+            str(created),
+            *(response.text for response in blocked),
+            wrong.text,
+            accepted_pause.text,
+            accepted_resume.text,
+            accepted_run.text,
+            accepted_stop.text,
+        ]
+    )
+    assert owner_secret not in combined
+    assert "private command job prompt" not in combined
+
+
+def test_legacy_bearer_allows_job_controls_without_csrf(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = CapturingPi()
+    owner_secret = "legacy-job-owner-token-" + "l" * 32
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("AGENTGATE_OWNER_TOKEN", owner_secret)
+    headers = {"Authorization": f"Bearer {owner_secret}"}
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Legacy job controls",
+                "schedule": "0 9 * * *",
+                "prompt": "private legacy job prompt",
+            },
+            headers=headers,
+        ).json()
+        job_id = created["id"]
+        paused = client.post(f"/api/jobs/{job_id}/pause", headers=headers)
+        resumed = client.post(f"/api/jobs/{job_id}/resume", headers=headers)
+        ran = client.post(f"/api/jobs/{job_id}/run", headers=headers)
+        stopped = client.post(f"/api/jobs/{job_id}/stop", headers=headers)
+
+    assert created["status"] == "active"
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "active"
+    assert ran.status_code == 200
+    assert ran.json()["last_result"]["status"] == "ok"
+    assert stopped.status_code == 404
+    assert stopped.json() == {"detail": "active job run not found"}
+    combined = f"{created} {paused.text} {resumed.text} {ran.text} {stopped.text}"
+    assert owner_secret not in combined
+    assert "private legacy job prompt" not in combined
+
+
 def test_owner_logout_removes_session_cookie_and_server_session(monkeypatch):
     reset_state()
     owner_secret = "logout-owner-token-" + "h" * 32

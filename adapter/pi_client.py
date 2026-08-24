@@ -22,6 +22,14 @@ _PI_BLOCKED_ENV = {
 }
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _pi_subprocess_env(overrides: dict[str, str | None] | None = None) -> dict[str, str]:
     """Keep owner/admin gate credentials out of the agent runtime process."""
     env = {key: value for key, value in os.environ.items() if key not in _PI_BLOCKED_ENV}
@@ -372,8 +380,9 @@ class SessionRuntime:
 
     async def _reader(self) -> None:
         assert self.process and self.process.stdout
+        process = self.process
         try:
-            async for raw in self.process.stdout:
+            async for raw in process.stdout:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -390,6 +399,12 @@ class SessionRuntime:
                     continue
                 await self._dispatch_event(item)
         finally:
+            if process.returncode is None:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(RuntimeError("Pi RPC process exited"))
@@ -468,6 +483,8 @@ class PiClient:
         self.toolgate = toolgate or ToolGateBridge()
         self._sessions: dict[str, SessionRuntime] = {}
         self._runs: dict[str, tuple[RunContext, SessionRuntime]] = {}
+        self._run_limit = _positive_int_env("PI_MAX_CONCURRENT_RUNS", 1)
+        self._run_semaphore = asyncio.Semaphore(self._run_limit)
 
     def _get_or_create_runtime(self, session_id: str) -> SessionRuntime:
         runtime = self._sessions.get(session_id)
@@ -478,20 +495,21 @@ class PiClient:
 
     async def stream(self, prompt: str, *, session_id: str, options: dict[str, Any] | None = None) -> AsyncIterator[PiEvent]:
         run = RunContext(run_id=f"run_{uuid.uuid4().hex[:12]}", session_id=session_id)
-        runtime = self._get_or_create_runtime(session_id)
-        self._runs[run.run_id] = (run, runtime)
-        try:
-            await runtime.start_run(run, prompt, options)
-            while True:
-                event = await run.queue.get()
-                if event is None:
-                    break
-                yield event
-        finally:
-            run.completed = True
-            self._runs.pop(run.run_id, None)
-            if runtime.current_run is run:
-                runtime.current_run = None
+        async with self._run_semaphore:
+            runtime = self._get_or_create_runtime(session_id)
+            self._runs[run.run_id] = (run, runtime)
+            try:
+                await runtime.start_run(run, prompt, options)
+                while True:
+                    event = await run.queue.get()
+                    if event is None:
+                        break
+                    yield event
+            finally:
+                run.completed = True
+                self._runs.pop(run.run_id, None)
+                if runtime.current_run is run:
+                    runtime.current_run = None
 
     async def stop_run(self, run_id: str) -> dict[str, Any]:
         run, runtime = self._require_run(run_id)
