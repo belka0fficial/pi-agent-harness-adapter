@@ -1783,7 +1783,7 @@ def _object_workstream_events() -> list[dict[str, Any]]:
             status=item.get("status") or "draft",
             risk=item.get("risk_level") or "medium",
             source="AgentGate",
-            summary=f"App workspace: {item.get('name') or item.get('id')} · {item.get('progress_summary') or 'metadata only'}",
+            summary=f"App workspace metadata: {item.get('id')} · status:{item.get('status') or 'draft'}",
             agent_id=item.get("owner_agent_id"),
             team_id=item.get("team_id"),
             ref_type="app_workspace",
@@ -2094,6 +2094,10 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         insight["controls"] = _workstream_task_controls(detail)
     if ref_type == "tool_draft":
         insight["controls"] = _workstream_tool_draft_controls(detail)
+    if ref_type == "app_workspace":
+        insight["controls"] = _workstream_app_workspace_controls(detail)
+    if ref_type == "app_artifact":
+        insight["controls"] = _workstream_app_artifact_controls(detail)
     if ref_type == "app_preview_proposal":
         insight["controls"] = _workstream_app_preview_proposal_controls(detail)
     if ref_type == "agent":
@@ -2560,6 +2564,129 @@ def _workstream_app_preview_proposal_controls(detail: dict[str, Any]) -> dict[st
     }
 
 
+def _workstream_app_workspace_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    status = str(detail.get("status") or "draft")
+    review_status = str(detail.get("review_status") or "unreviewed")
+    artifact_count = int(detail.get("artifact_count") or 0)
+    preview_count = int(detail.get("preview_proposal_count") or 0)
+    archived = status == "archived"
+    reviewed = review_status in {"reviewed", "approved_metadata"}
+
+    if not available:
+        return {
+            "schema": "agentgate.app_workspace_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "workspace_readiness": _workstream_control(False, "audit_only", "App workspace exists only in audit history."),
+            "artifact_boundary": _workstream_control(False, "audit_only", "App workspace exists only in audit history."),
+            "preview_boundary": _workstream_control(False, "audit_only", "App workspace exists only in audit history."),
+            "lifecycle_boundary": _workstream_control(False, "audit_only", "App workspace exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.app_workspace_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "workspace_readiness": _workstream_control(
+            not reviewed and not archived,
+            "needs_owner_review" if not reviewed and not archived else "owner_reviewed" if reviewed else "archived",
+            (
+                "Open Apps to review workspace purpose, scope, and metadata."
+                if not reviewed and not archived
+                else "Workspace metadata has already been reviewed."
+                if reviewed
+                else "Archived workspaces cannot be prepared for review."
+            ),
+        ),
+        "artifact_boundary": _workstream_control(
+            artifact_count > 0,
+            "artifacts_present" if artifact_count > 0 else "no_artifacts",
+            (
+                "Open Apps to review artifact metadata and safety state."
+                if artifact_count > 0
+                else "No app artifacts are attached to this workspace."
+            ),
+        ),
+        "preview_boundary": _workstream_control(
+            preview_count > 0,
+            "preview_proposals_present" if preview_count > 0 else "no_preview_proposals",
+            (
+                "Open Apps to review preview/package proposals through ToolGate."
+                if preview_count > 0
+                else "No preview or package proposal metadata is attached."
+            ),
+        ),
+        "lifecycle_boundary": _workstream_control(
+            not archived and preview_count == 0,
+            "safe_metadata_record" if not archived and preview_count == 0 else "preview_history_present" if not archived else "archived",
+            (
+                "Open Apps to review this metadata-only workspace lifecycle state."
+                if not archived and preview_count == 0
+                else "Preview proposal history should be reviewed before lifecycle changes."
+                if not archived
+                else "Workspace is already archived."
+            ),
+        ),
+    }
+
+
+def _workstream_app_artifact_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    status = str(detail.get("status") or "draft")
+    review_status = str(detail.get("review_status") or "unreviewed")
+    preview_count = int(detail.get("linked_preview_proposal_count") or 0)
+    archived = status == "archived"
+    reviewed = review_status in {"reviewed", "approved_metadata"}
+
+    if not available:
+        return {
+            "schema": "agentgate.app_artifact_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "artifact_readiness": _workstream_control(False, "audit_only", "App artifact exists only in audit history."),
+            "preview_boundary": _workstream_control(False, "audit_only", "App artifact exists only in audit history."),
+            "lifecycle_boundary": _workstream_control(False, "audit_only", "App artifact exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.app_artifact_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "artifact_readiness": _workstream_control(
+            not reviewed and not archived,
+            "needs_owner_review" if not reviewed and not archived else "owner_reviewed" if reviewed else "archived",
+            (
+                "Open Apps to review artifact summary, type, and metadata."
+                if not reviewed and not archived
+                else "Artifact metadata has already been reviewed."
+                if reviewed
+                else "Archived artifacts cannot be prepared for review."
+            ),
+        ),
+        "preview_boundary": _workstream_control(
+            preview_count > 0,
+            "preview_proposals_present" if preview_count > 0 else "no_preview_proposals",
+            (
+                "Open Apps to review preview/package proposals linked to this artifact."
+                if preview_count > 0
+                else "No preview or package proposal metadata links this artifact."
+            ),
+        ),
+        "lifecycle_boundary": _workstream_control(
+            not archived and preview_count == 0,
+            "safe_metadata_record" if not archived and preview_count == 0 else "preview_history_present" if not archived else "archived",
+            (
+                "Open Apps to review this metadata-only artifact lifecycle state."
+                if not archived and preview_count == 0
+                else "Preview proposal history should be reviewed before lifecycle changes."
+                if not archived
+                else "Artifact is already archived."
+            ),
+        ),
+    }
+
+
 def _workstream_agent_controls(detail: dict[str, Any]) -> dict[str, Any]:
     available = detail.get("available") is not False
     readiness = detail.get("profile_readiness") if isinstance(detail.get("profile_readiness"), dict) else {}
@@ -2753,6 +2880,71 @@ def _safe_workstream_team_detail(team_id: str) -> dict[str, Any]:
     }
 
 
+def _safe_workstream_app_workspace_detail(workspace_id: str) -> dict[str, Any]:
+    item = app.state.app_workspaces[workspace_id]
+    purpose = str(item.get("purpose") or "")
+    progress = str(item.get("progress_summary") or "")
+    artifacts = [
+        artifact
+        for artifact in getattr(app.state, "app_artifacts", {}).values()
+        if artifact.get("workspace_id") == workspace_id
+    ]
+    proposals = [
+        proposal
+        for proposal in getattr(app.state, "app_preview_proposals", {}).values()
+        if proposal.get("workspace_id") == workspace_id
+    ]
+    return {
+        "schema": "agentgate.app_workspace_ref_detail.v1",
+        "id": item.get("id"),
+        "status": _sanitize_app_workspace_status(item.get("status")),
+        "app_type": _redact_app_workspace_text(item.get("app_type"), limit=80),
+        "risk_level": _sanitize_app_workspace_risk(item.get("risk_level")),
+        "review_status": _sanitize_app_workspace_review_status(item.get("review_status")),
+        "owner_agent_present": bool(item.get("owner_agent_id")),
+        "team_ref_present": bool(item.get("team_id")),
+        "purpose_present": bool(purpose),
+        "purpose_digest": hashlib.sha256(purpose.encode("utf-8")).hexdigest() if purpose else "",
+        "purpose_chars": len(purpose),
+        "progress_summary_present": bool(progress),
+        "progress_summary_digest": hashlib.sha256(progress.encode("utf-8")).hexdigest() if progress else "",
+        "progress_summary_chars": len(progress),
+        "required_tool_count": len(_clean_list(item.get("required_tool_ids"))[:24]),
+        "required_memory_scope_count": len(_clean_list(item.get("required_memory_scopes"))[:24]),
+        "artifact_count": len(artifacts),
+        "preview_proposal_count": len(proposals),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _safe_workstream_app_artifact_detail(artifact_id: str) -> dict[str, Any]:
+    item = app.state.app_artifacts[artifact_id]
+    summary = str(item.get("summary") or "")
+    linked_preview_count = sum(
+        1
+        for proposal in getattr(app.state, "app_preview_proposals", {}).values()
+        if artifact_id in _clean_list(proposal.get("linked_artifact_ids"))
+    )
+    return {
+        "schema": "agentgate.app_artifact_ref_detail.v1",
+        "id": item.get("id"),
+        "workspace_ref_present": bool(item.get("workspace_id")),
+        "artifact_type": _sanitize_app_artifact_type(item.get("artifact_type")),
+        "status": _sanitize_app_artifact_status(item.get("status")),
+        "risk_level": _sanitize_app_workspace_risk(item.get("risk_level")),
+        "review_status": _sanitize_app_artifact_review_status(item.get("review_status")),
+        "created_by_agent_present": bool(item.get("created_by_agent_id")),
+        "team_ref_present": bool(item.get("team_id")),
+        "summary_present": bool(summary),
+        "summary_digest": hashlib.sha256(summary.encode("utf-8")).hexdigest() if summary else "",
+        "summary_chars": len(summary),
+        "linked_preview_proposal_count": linked_preview_count,
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
 def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_type = _safe_summary(ref_type, limit=80)
     clean_id = _safe_summary(ref_id, limit=160)
@@ -2878,7 +3070,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
                 "summary": "Reference is present in audit history but not in current runtime state.",
             }
         else:
-            detail = _public_app_workspace(app.state.app_workspaces[clean_id], activity_limit=5)
+            detail = _safe_workstream_app_workspace_detail(clean_id)
     elif clean_type == "app_artifact":
         if clean_id not in getattr(app.state, "app_artifacts", {}):
             detail = {
@@ -2888,7 +3080,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
                 "summary": "Reference is present in audit history but not in current runtime state.",
             }
         else:
-            detail = _public_app_artifact(app.state.app_artifacts[clean_id])
+            detail = _safe_workstream_app_artifact_detail(clean_id)
     elif clean_type == "app_preview_proposal":
         if clean_id not in getattr(app.state, "app_preview_proposals", {}):
             detail = {

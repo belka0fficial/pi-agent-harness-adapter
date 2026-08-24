@@ -626,6 +626,65 @@ def test_app_workspace_responses_redact_prompts_secrets_paths_and_urls(monkeypat
     assert "[redacted" in body
 
 
+def test_workstream_app_workspace_detail_is_digest_count_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["echo"], "memory_scopes": ["project-context"]},
+        )
+        created = client.post(
+            "/api/app-workspaces",
+            json={
+                "name": "Private Workspace",
+                "purpose": "build with token=workspace-secret https://private.example/app path=/home/alexey/private",
+                "app_type": "dashboard",
+                "required_tool_ids": ["echo"],
+                "required_memory_scopes": ["project-context"],
+                "progress_summary": "progress bearer workspace-secret file=/tmp/private-workspace",
+            },
+        )
+        workspace = created.json()
+        drilldown = client.get(f"/api/workstream/refs/app_workspace/{workspace['id']}")
+        workstream = client.get("/api/workstream")
+
+    assert created.status_code == 200
+    assert drilldown.status_code == 200
+    detail = drilldown.json()["detail"]
+    assert detail["schema"] == "agentgate.app_workspace_ref_detail.v1"
+    assert detail["id"] == workspace["id"]
+    assert detail["purpose_present"] is True
+    assert detail["purpose_digest"]
+    assert detail["purpose_chars"] > 0
+    assert detail["progress_summary_present"] is True
+    assert detail["progress_summary_digest"]
+    assert detail["progress_summary_chars"] > 0
+    assert detail["required_tool_count"] == 1
+    assert detail["required_memory_scope_count"] == 1
+    assert detail["artifact_count"] == 0
+    assert detail["preview_proposal_count"] == 0
+    assert drilldown.json()["insight"]["controls"]["schema"] == "agentgate.app_workspace_controls.v1"
+    assert drilldown.json()["insight"]["controls"]["executes_from_drilldown"] is False
+    serialized = json.dumps({"drilldown": drilldown.json(), "workstream": workstream.json()}).lower()
+    for forbidden in [
+        "workspace-secret",
+        "https://private.example",
+        "/home/alexey/private",
+        "/tmp/private-workspace",
+        "bearer workspace-secret",
+        "build with token",
+        "progress bearer",
+        "required_tool_ids",
+        "required_memory_scopes",
+        "project-context",
+    ]:
+        assert forbidden not in serialized
+
+
 def test_app_workspace_artifact_registry_create_list_patch_delete(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
@@ -669,8 +728,15 @@ def test_app_workspace_artifact_registry_create_list_patch_delete(monkeypatch, t
     assert patched.json()["summary"]["review_ready"] == 1
     assert patched.json()["artifacts"][0]["summary"] == "Ready for metadata review."
     assert drilldown.status_code == 200
+    assert drilldown.json()["detail"]["schema"] == "agentgate.app_artifact_ref_detail.v1"
     assert drilldown.json()["detail"]["id"] == artifact["id"]
-    assert drilldown.json()["detail"]["workspace_id"] == workspace["id"]
+    assert drilldown.json()["detail"]["workspace_ref_present"] is True
+    assert "workspace_id" not in drilldown.json()["detail"]
+    assert "summary" not in drilldown.json()["detail"]
+    assert drilldown.json()["detail"]["summary_digest"]
+    assert drilldown.json()["detail"]["summary_chars"] > 0
+    assert drilldown.json()["insight"]["controls"]["schema"] == "agentgate.app_artifact_controls.v1"
+    assert drilldown.json()["insight"]["controls"]["executes_from_drilldown"] is False
     assert drilldown.json()["safety"]["mode"] == "metadata_only"
 
     app.state.app_artifacts = {}
@@ -686,6 +752,53 @@ def test_app_workspace_artifact_registry_create_list_patch_delete(monkeypatch, t
     app.state.app_artifacts = {}
     main._load_registry()
     assert artifact["id"] not in app.state.app_artifacts
+
+
+def test_workstream_app_artifact_detail_is_digest_count_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post(
+            "/api/app-workspaces",
+            json={"name": "Artifact Host", "purpose": "Metadata-only artifact host."},
+        ).json()
+        created = client.post(
+            f"/api/app-workspaces/{workspace['id']}/artifacts",
+            json={
+                "name": "Private Spec",
+                "artifact_type": "spec",
+                "summary": "raw_code=print('artifact-secret') token=artifact-secret https://private.example/spec path=/home/alexey/spec",
+            },
+        )
+        artifact = created.json()["artifacts"][0]
+        drilldown = client.get(f"/api/workstream/refs/app_artifact/{artifact['id']}")
+        workstream = client.get("/api/workstream")
+
+    assert created.status_code == 200
+    assert drilldown.status_code == 200
+    detail = drilldown.json()["detail"]
+    assert detail["schema"] == "agentgate.app_artifact_ref_detail.v1"
+    assert detail["id"] == artifact["id"]
+    assert detail["workspace_ref_present"] is True
+    assert detail["summary_present"] is True
+    assert detail["summary_digest"]
+    assert detail["summary_chars"] > 0
+    assert detail["linked_preview_proposal_count"] == 0
+    assert drilldown.json()["insight"]["controls"]["schema"] == "agentgate.app_artifact_controls.v1"
+    assert drilldown.json()["insight"]["controls"]["executes_from_drilldown"] is False
+    serialized = json.dumps({"drilldown": drilldown.json(), "workstream": workstream.json()}).lower()
+    for forbidden in [
+        "artifact-secret",
+        "raw_code",
+        "https://private.example",
+        "/home/alexey/spec",
+        "print('artifact-secret')",
+        "workspace_id",
+    ]:
+        assert forbidden not in serialized
 
 
 def test_app_workspace_artifacts_missing_workspace_404(monkeypatch, tmp_path):
