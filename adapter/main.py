@@ -5519,13 +5519,28 @@ def _safe_auxiliary_model_route(task_id: str, value: Any | None = None) -> dict[
     }
 
 
-def _public_auxiliary_model_route(task_id: str, value: Any | None = None) -> dict[str, Any]:
+def _public_auxiliary_model_route(task_id: str, value: Any | None = None, *, probe_route: bool = True) -> dict[str, Any]:
     row = _safe_auxiliary_model_route(task_id, value)
-    probe = (
-        _safe_route_probe("auxiliary", row["provider"], row["model"], optional=True)
-        if row.get("provider") or row.get("model")
-        else _empty_route_probe("auxiliary", optional=True)
-    )
+    if probe_route:
+        probe = (
+            _safe_route_probe("auxiliary", row["provider"], row["model"], optional=True)
+            if row.get("provider") or row.get("model")
+            else _empty_route_probe("auxiliary", optional=True)
+        )
+    else:
+        risk = _provider_risk(row["provider"]) if row.get("provider") else {"risk": "none", "policy": "disabled", "note": "Route disabled."}
+        probe = {
+            "label": "auxiliary",
+            "provider": row["provider"],
+            "model": row["model"],
+            "status": "metadata_only" if row.get("provider") and row.get("model") else "disabled",
+            "model_visible": False,
+            "provider_status": "not_checked",
+            "configured": False,
+            "risk": risk["risk"],
+            "policy": risk["policy"],
+            "note": "Verification snapshot uses saved metadata only; live route probing is skipped.",
+        }
     blocked: list[str] = []
     if row["enabled"] and probe.get("status") != "ready":
         blocked.append(f"route is {probe.get('status')}")
@@ -5558,10 +5573,10 @@ def _public_auxiliary_model_route(task_id: str, value: Any | None = None) -> dic
     }
 
 
-def _auxiliary_routes_payload() -> dict[str, Any]:
+def _auxiliary_routes_payload(*, probe_routes: bool = True) -> dict[str, Any]:
     _ensure_registry_seeded()
     routes = [
-        _public_auxiliary_model_route(task_id, app.state.auxiliary_model_routes.get(task_id))
+        _public_auxiliary_model_route(task_id, app.state.auxiliary_model_routes.get(task_id), probe_route=probe_routes)
         for task_id in AUXILIARY_MODEL_TASKS
     ]
     return {
@@ -5577,6 +5592,7 @@ def _auxiliary_routes_payload() -> dict[str, Any]:
             "metadata_only": True,
             "execution_enabled": False,
             "automatic_prompt_routing": False,
+            "route_probe_executed": bool(probe_routes),
             "allowed_tasks": list(AUXILIARY_MODEL_TASKS),
             "excludes": ["provider URLs", "credentials", "raw prompts", "memory contents", "tool arguments"],
         },
@@ -7663,12 +7679,210 @@ def agentgate_workstream_ref(ref_type: str, ref_id: str):
     return _safe_workstream_ref_detail(ref_type, ref_id)
 
 
+def _verification_check(check_id: str, label: str, status: str, summary: str, *, source: str, severity: str = "info", detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    allowed_status = status if status in {"pass", "warn", "fail"} else "warn"
+    allowed_severity = severity if severity in {"info", "warning", "critical"} else "info"
+    return {
+        "id": check_id,
+        "label": _safe_summary(label, limit=120),
+        "status": allowed_status,
+        "severity": allowed_severity,
+        "source": _safe_summary(source, limit=80),
+        "summary": _redact_profile_metadata_text(summary, limit=240),
+        "detail": detail or {},
+    }
+
+
+def _verification_snapshot() -> dict[str, Any]:
+    _ensure_registry_seeded()
+    checks: list[dict[str, Any]] = []
+    gates = app.state.gates
+    health = {"pi": {"status": "ok"}, **gates.health()}
+    unhealthy = [
+        name
+        for name, item in health.items()
+        if str((item or {}).get("status") or "").lower() not in {"ok", "healthy", "ready"}
+    ]
+    checks.append(_verification_check(
+        "service-health",
+        "Service health",
+        "pass" if not unhealthy else "fail",
+        "All core services report healthy metadata." if not unhealthy else f"Unhealthy services: {', '.join(unhealthy[:5])}",
+        source="AgentGate",
+        severity="critical" if unhealthy else "info",
+        detail={
+            "services": sorted(health),
+            "unhealthy_count": len(unhealthy),
+        },
+    ))
+
+    system = gates.system_overview()
+    service_rows = system.get("containers", []) if isinstance(system, dict) else []
+    unsafe_listener_count = 0
+    for row in service_rows:
+        listeners = row.get("listeners") if isinstance(row, dict) else []
+        if any(str(item) not in {"loopback", "container-internal", "tailscale"} for item in (listeners or [])):
+            unsafe_listener_count += 1
+    checks.append(_verification_check(
+        "listener-scope",
+        "Listener scope",
+        "pass" if unsafe_listener_count == 0 else "warn",
+        "SystemGate reported only scoped listener labels." if unsafe_listener_count == 0 else "Some listener labels need owner review.",
+        source="SystemGate",
+        severity="warning" if unsafe_listener_count else "info",
+        detail={
+            "service_count": len(service_rows),
+            "unsafe_listener_count": unsafe_listener_count,
+        },
+    ))
+
+    boundaries = _native_access_boundaries()
+    boundary_summary = boundaries.get("summary", {})
+    drift = int(boundary_summary.get("drift") or 0)
+    orphaned = int(boundary_summary.get("orphaned_keys") or 0)
+    inventory_ok = (
+        boundary_summary.get("toolgate_inventory") == "ok"
+        and boundary_summary.get("memorygate_inventory") == "ok"
+    )
+    checks.append(_verification_check(
+        "access-boundaries",
+        "Access boundaries",
+        "pass" if drift == 0 and inventory_ok else "fail",
+        "ToolGate/MemoryGate native key metadata matches registry grants." if drift == 0 and inventory_ok else "Access-boundary drift or unavailable inventory needs repair.",
+        source="ToolGate/MemoryGate",
+        severity="critical" if drift or not inventory_ok else "info",
+        detail={
+            "agents": boundary_summary.get("agents", 0),
+            "ready": boundary_summary.get("ready", 0),
+            "drift": drift,
+            "toolgate_inventory": boundary_summary.get("toolgate_inventory"),
+            "memorygate_inventory": boundary_summary.get("memorygate_inventory"),
+        },
+    ))
+    checks.append(_verification_check(
+        "orphan-keys",
+        "Orphan native keys",
+        "pass" if orphaned == 0 else "warn",
+        "No exact AgentGate-owned orphan keys reported." if orphaned == 0 else "Exact AgentGate-owned orphan keys are available for preview-first cleanup.",
+        source="ToolGate/MemoryGate",
+        severity="warning" if orphaned else "info",
+        detail={
+            "orphaned_keys": orphaned,
+            "manual_review": boundary_summary.get("unsafe_to_touch", 0),
+        },
+    ))
+
+    aux = _auxiliary_routes_payload(probe_routes=False)
+    aux_safety = aux.get("safety", {})
+    aux_safe = bool(aux_safety.get("metadata_only")) and not bool(aux_safety.get("execution_enabled")) and not bool(aux_safety.get("automatic_prompt_routing"))
+    checks.append(_verification_check(
+        "auxiliary-model-routes",
+        "Auxiliary model routes",
+        "pass" if aux_safe else "fail",
+        "Auxiliary helper routes are metadata-only with execution and automatic routing off." if aux_safe else "Auxiliary route safety flags need review.",
+        source="AgentGate Models",
+        severity="critical" if not aux_safe else "info",
+        detail={
+            "total": (aux.get("summary") or {}).get("total", 0),
+            "enabled": (aux.get("summary") or {}).get("enabled", 0),
+            "ready": (aux.get("summary") or {}).get("ready", 0),
+            "execution_enabled": bool(aux_safety.get("execution_enabled")),
+            "automatic_prompt_routing": bool(aux_safety.get("automatic_prompt_routing")),
+        },
+    ))
+
+    model_summary = _safe_model_summary()
+    providers = model_summary.get("providers", [])
+    providers_visible = sum(1 for item in providers if item.get("models_visible"))
+    checks.append(_verification_check(
+        "model-provider-metadata",
+        "Model provider metadata",
+        "pass" if providers else "warn",
+        "Model providers are visible as safe metadata." if providers else "No model provider metadata is currently visible.",
+        source="Pi adapter",
+        severity="warning" if not providers else "info",
+        detail={
+            "provider_count": len(providers),
+            "providers_visible": providers_visible,
+            "default_agent_id": (model_summary.get("default_route") or {}).get("agent_id"),
+        },
+    ))
+
+    jobs = list(app.state.jobs.values())
+    risky_jobs = [
+        job for job in jobs
+        if (job.get("required_tool_ids") or job.get("required_memory_scopes") or job.get("delivery_targets"))
+        and job.get("approval_status") not in {"approved", "not_required"}
+    ]
+    checks.append(_verification_check(
+        "automation-approval-boundary",
+        "Automation approval boundary",
+        "pass" if not risky_jobs else "warn",
+        "No risky automation metadata is waiting outside the approval boundary." if not risky_jobs else "Some automation jobs need owner approval before running risky metadata.",
+        source="AgentGate Automations",
+        severity="warning" if risky_jobs else "info",
+        detail={
+            "job_count": len(jobs),
+            "pending_risky_jobs": len(risky_jobs),
+        },
+    ))
+
+    backup = _safe_backup_summary(system)
+    checks.append(_verification_check(
+        "backup-metadata",
+        "Backup metadata",
+        "pass" if backup.get("latest") else "warn",
+        "Latest backup archive metadata is visible." if backup.get("latest") else "No latest backup metadata is currently visible.",
+        source="SystemGate",
+        severity="warning" if not backup.get("latest") else "info",
+        detail={
+            "status": backup.get("status"),
+            "latest_name": (backup.get("latest") or {}).get("name"),
+            "latest_created_at": (backup.get("latest") or {}).get("created_at"),
+        },
+    ))
+
+    counts = {
+        "pass": sum(1 for item in checks if item["status"] == "pass"),
+        "warn": sum(1 for item in checks if item["status"] == "warn"),
+        "fail": sum(1 for item in checks if item["status"] == "fail"),
+    }
+    overall = "fail" if counts["fail"] else "warn" if counts["warn"] else "pass"
+    return {
+        "schema": "agentgate.verification_snapshot.v1",
+        "status": overall,
+        "generated_at": now(),
+        "summary": {
+            **counts,
+            "total": len(checks),
+        },
+        "checks": checks,
+        "safety": {
+            "metadata_only": True,
+            "commands_executed": False,
+            "docker_socket_access": False,
+            "secrets_included": False,
+            "raw_prompts_included": False,
+            "memory_contents_included": False,
+            "tool_arguments_included": False,
+            "host_paths_included": False,
+            "provider_urls_included": False,
+        },
+    }
+
+
+@app.get("/api/verification/snapshot")
+def agentgate_verification_snapshot():
+    return _verification_snapshot()
+
+
 @app.get("/api/system")
 def agentgate_system():
     system = app.state.gates.system_overview()
     return {
         **system,
         "access_boundaries": _native_access_boundaries(),
+        "verification": _verification_snapshot(),
     }
 
 

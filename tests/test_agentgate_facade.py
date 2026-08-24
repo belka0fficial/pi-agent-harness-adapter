@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import threading
 
@@ -1456,8 +1457,8 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
         },
     ]
     app.state.gates.toolgate_private_keys = {
-        "agent_pi_operator": "tgx_fake_private_key_agent_pi_operator_1234567890",
-        "agent_pi_operator@team_core": "tgx_fake_private_key_agent_pi_operator_team_core_1234567890",
+        "agent_pi_operator": "toolgate-private-test-placeholder",
+        "agent_pi_operator@team_core": "toolgate-team-private-test-placeholder",
     }
     app.state.gates.toolgate_private_key_scopes = {
         "agent_pi_operator": ["tool:echo"],
@@ -1478,6 +1479,18 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
         },
     ]
     app.state.gates.memorygate_private_keys = {"agent_pi_operator", "agent_pi_operator@team_core"}
+    app.state.auxiliary_model_routes["summary"] = {
+        "provider": "openrouter",
+        "model": "safe-helper",
+        "enabled": True,
+        "risk_policy": "low_risk_only",
+        "owner_review_status": "owner_reviewed",
+    }
+
+    def fail_subprocess(*_args, **_kwargs):
+        raise AssertionError("verification snapshot must not execute local commands")
+
+    monkeypatch.setattr(main.subprocess, "run", fail_subprocess)
 
     with TestClient(app) as client:
         client.patch(
@@ -1529,6 +1542,80 @@ def test_system_access_boundaries_report_native_key_readiness(monkeypatch, tmp_p
     assert "raw" not in str(boundaries).lower()
     assert "tgx_" not in str(boundaries)
     assert "mg_" + "read_" not in str(boundaries)
+
+
+def test_verification_snapshot_uses_safe_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.gates.toolgate_keys = [
+        {
+            "id": "tg-ready",
+            "name": "AgentGate:agent_pi_operator",
+            "scopes": ["tool:echo"],
+            "status": "active",
+        },
+        {
+            "id": "tg-ready-team",
+            "name": "AgentGate:agent_pi_operator@team_core",
+            "scopes": ["tool:echo"],
+            "status": "active",
+        },
+    ]
+    app.state.gates.toolgate_private_keys = {
+        "agent_pi_operator": "toolgate-private-test-placeholder",
+        "agent_pi_operator@team_core": "toolgate-team-private-test-placeholder",
+    }
+    app.state.gates.toolgate_private_key_scopes = {
+        "agent_pi_operator": ["tool:echo"],
+        "agent_pi_operator@team_core": ["tool:echo"],
+    }
+    app.state.gates.memorygate_keys = [
+        {
+            "id": "mg-ready",
+            "label": "AgentGate:agent_pi_operator",
+            "agent_id": "agent_pi_operator",
+            "revoked": False,
+        },
+        {
+            "id": "mg-ready-team",
+            "label": "AgentGate:agent_pi_operator@team_core",
+            "agent_id": "agent_pi_operator@team_core",
+            "revoked": False,
+        },
+    ]
+    app.state.gates.memorygate_private_keys = {"agent_pi_operator", "agent_pi_operator@team_core"}
+
+    with TestClient(app) as client:
+        client.patch(
+            "/api/agents/agent_pi_operator",
+            json={"tool_ids": ["echo"], "memory_scopes": ["briefing"]},
+        )
+        snapshot = client.get("/api/verification/snapshot").json()
+        system = client.get("/api/system").json()
+
+    assert snapshot["schema"] == "agentgate.verification_snapshot.v1"
+    assert snapshot["safety"]["metadata_only"] is True
+    assert snapshot["safety"]["commands_executed"] is False
+    assert snapshot["safety"]["docker_socket_access"] is False
+    assert snapshot["summary"]["total"] >= 6
+    check_ids = {item["id"] for item in snapshot["checks"]}
+    assert {
+        "service-health",
+        "listener-scope",
+        "access-boundaries",
+        "auxiliary-model-routes",
+        "model-provider-metadata",
+        "automation-approval-boundary",
+    } <= check_ids
+    access = next(item for item in snapshot["checks"] if item["id"] == "access-boundaries")
+    assert access["detail"]["drift"] == 0
+    assert system["verification"]["schema"] == snapshot["schema"]
+    forbidden = re.compile(
+        r"tgx_|mg_read_|api[_-]?key|token=|secret=|password=|bearer\s+|/home/|/srv/|docker\\.sock|https?://",
+        re.I,
+    )
+    assert not forbidden.search(str(snapshot))
 
 
 def test_system_access_boundary_repair_syncs_native_gate_contexts_without_keys(monkeypatch, tmp_path):
