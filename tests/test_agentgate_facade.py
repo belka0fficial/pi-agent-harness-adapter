@@ -3213,6 +3213,16 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert job_body["insight"]["safety"]["jobs_started"] is False
     assert job_body["insight"]["signal_counts"]["runs"] == 0
     assert "Open Automations" in job_body["insight"]["owner_next_step"]
+    controls = job_body["insight"]["controls"]
+    assert controls["schema"] == "agentgate.job_controls.v1"
+    assert controls["metadata_only"] is True
+    assert controls["executes_from_drilldown"] is False
+    assert controls["pause"]["enabled"] is True
+    assert controls["pause"]["reason_code"] == "schedule_active"
+    assert controls["run_now"]["enabled"] is True
+    assert controls["run_now"]["reason_code"] == "ready"
+    assert controls["stop"]["enabled"] is False
+    assert controls["stop"]["reason_code"] == "no_active_run"
     assert job_body["safety"]["mode"] == "metadata_only"
     task_body = task_detail.json()
     assert task_body["ref_type"] == "task"
@@ -3247,6 +3257,42 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert "orchestration_readiness" in team_body["detail"]
     assert "Open the Team workroom" in team_body["insight"]["owner_next_step"]
     assert team_body["safety"]["mode"] == "metadata_only"
+
+
+def test_workstream_job_controls_hide_raw_active_run_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Running proof",
+                "schedule": "0 9 * * *",
+                "prompt": "private job prompt token=job-secret https://job.example/path",
+            },
+        ).json()
+        app.state.active_job_runs[created["id"]] = {
+            "run_id": "pi_raw_run_secret_123",
+            "started_at": main.now(),
+        }
+        detail = client.get(f"/api/workstream/refs/job/{created['id']}")
+
+    assert detail.status_code == 200
+    body = detail.json()
+    controls = body["insight"]["controls"]
+    assert controls["stop"]["enabled"] is True
+    assert controls["stop"]["reason_code"] == "active_run"
+    assert controls["run_now"]["enabled"] is False
+    assert controls["run_now"]["reason_code"] == "already_running"
+    assert controls["pause"]["enabled"] is True
+    joined = json.dumps(body).lower()
+    assert "pi_raw_run_secret_123" not in joined
+    assert "run_id" not in json.dumps(controls).lower()
+    assert "job-secret" not in joined
+    assert "https://job.example" not in joined
+    assert "private job prompt" not in joined
 
 
 def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):

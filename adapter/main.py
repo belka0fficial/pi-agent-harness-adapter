@@ -2011,7 +2011,7 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         ]
         if item
     ][:6]
-    return {
+    insight = {
         "schema": "agentgate.workstream_ref_insight.v1",
         "available": bool(available),
         "status": status,
@@ -2034,6 +2034,90 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
             "credentials_included": False,
             "provider_urls_included": False,
         },
+    }
+    if ref_type == "job":
+        insight["controls"] = _workstream_job_controls(ref_id, detail)
+    return insight
+
+
+def _workstream_control(enabled: bool, reason_code: str, reason: str) -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "reason_code": _safe_summary(reason_code, limit=60),
+        "reason": _safe_summary(reason, limit=180),
+    }
+
+
+def _workstream_job_controls(job_id: str, detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    paused = bool(detail.get("paused"))
+    running = bool(detail.get("is_running"))
+    approval_status = str(detail.get("approval_status") or "")
+    approval_pending = approval_status == "pending"
+    if not available:
+        return {
+            "schema": "agentgate.job_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "pause": _workstream_control(False, "audit_only", "Job exists only in audit history."),
+            "resume": _workstream_control(False, "audit_only", "Job exists only in audit history."),
+            "run_now": _workstream_control(False, "audit_only", "Job exists only in audit history."),
+            "stop": _workstream_control(False, "audit_only", "Job exists only in audit history."),
+        }
+    return {
+        "schema": "agentgate.job_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "pause": _workstream_control(
+            not paused,
+            "schedule_active" if not paused else "schedule_already_paused",
+            "Pauses future scheduled runs. Active runs are not stopped."
+            if not paused
+            else "Schedule is already paused.",
+        ),
+        "resume": _workstream_control(
+            paused and not approval_pending,
+            (
+                "ready"
+                if paused and not approval_pending
+                else "waiting_for_approval"
+                if approval_pending
+                else "schedule_already_active"
+            ),
+            (
+                "Resumes future scheduled runs."
+                if paused and not approval_pending
+                else "Waiting for ToolGate approval."
+                if approval_pending
+                else "Job schedule is already active."
+            ),
+        ),
+        "run_now": _workstream_control(
+            not running and not paused and not approval_pending,
+            (
+                "ready"
+                if not running and not paused and not approval_pending
+                else "already_running"
+                if running
+                else "waiting_for_approval"
+                if approval_pending
+                else "schedule_paused"
+            ),
+            (
+                "Runs the job once using server-side job configuration."
+                if not running and not paused and not approval_pending
+                else "Job is already running."
+                if running
+                else "Waiting for ToolGate approval."
+                if approval_pending
+                else "Resume the schedule before manual runs."
+            ),
+        ),
+        "stop": _workstream_control(
+            running,
+            "active_run" if running else "no_active_run",
+            "Stops the currently tracked active run." if running else "No active run is tracked for this job.",
+        ),
     }
 
 
