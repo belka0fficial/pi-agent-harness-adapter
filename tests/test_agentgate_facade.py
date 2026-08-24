@@ -4239,6 +4239,159 @@ def test_local_notification_delivery_records_safe_automation_inbox(monkeypatch, 
     assert cleaned["summary"]["total"] == 0
 
 
+def test_notification_channel_test_send_approval_is_metadata_only_and_redacted(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    forbidden = [
+        "https://private.invalid/hook",
+        "token=secret-value",
+        "webhook",
+        "+1 555 010 9999",
+    ]
+    with TestClient(app) as client:
+        channels = client.get("/api/notification-channels").json()["channels"]
+        channel = next(row for row in channels if row["label"] == "local dashboard inbox")
+        queued = client.post(
+            f"/api/notification-channels/{channel['id']}/setup-approval",
+            json={
+                "summary": "Send test to https://private.invalid/hook with token=secret-value webhook +1 555 010 9999",
+                "requested_by_agent_id": "agent_pi_operator",
+            },
+        ).json()
+        public_channel = next(
+            row for row in client.get("/api/notification-channels").json()["channels"]
+            if row["id"] == channel["id"]
+        )
+        request = app.state.gates.requests[queued["approval_request_id"]]
+
+    visible = json.dumps({"queued": queued, "request": request, "channel": public_channel}).lower()
+    assert queued["approval_status"] == "pending"
+    assert queued["channel_id"] == channel["id"]
+    assert queued["metadata_only"] is True
+    assert queued["external_delivery"] is False
+    assert queued["test_send"]["metadata_only"] is True
+    assert queued["test_send"]["external_delivery"] is False
+    assert queued["test_send"]["raw_args_included"] is False
+    assert public_channel["setup_approval_request_id"] == queued["approval_request_id"]
+    assert public_channel["setup_approval_status"] == "pending"
+    assert request["kind"] == "notification_test_send"
+    assert request["payload"]["channel_label"] == "local dashboard inbox"
+    assert request["payload"]["channel_kind"] == "local_log"
+    assert request["payload"]["channel_status"] == "available"
+    assert request["payload"]["channel_fingerprint"]
+    assert request["payload"]["metadata_only"] is True
+    assert request["payload"]["external_delivery"] is False
+    assert request["payload"]["raw_args_included"] is False
+    assert request["payload"]["summary_digest"]
+    assert "summary" not in request["payload"]
+    for value in forbidden:
+        assert value.lower() not in visible
+
+
+def test_notification_channel_setup_approval_goes_stale_after_channel_change(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    with TestClient(app) as client:
+        channel = next(
+            row for row in client.get("/api/notification-channels").json()["channels"]
+            if row["label"] == "local dashboard inbox"
+        )
+        queued = client.post(
+            f"/api/notification-channels/{channel['id']}/setup-approval",
+            json={"summary": "Safe local dashboard readiness check."},
+        ).json()
+        client.patch(
+            f"/api/notification-channels/{channel['id']}",
+            json={"status": "needs_setup"},
+        )
+        decision = client.post(
+            f"/api/approvals/{queued['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        after = client.get("/api/notification-deliveries").json()
+        public_channel = next(
+            row for row in client.get("/api/notification-channels").json()["channels"]
+            if row["id"] == channel["id"]
+        )
+
+    assert decision["notification_test_status"] == "stale"
+    assert decision["notification_test_stale_reason"]
+    assert "notification_delivery" not in decision
+    assert after["summary"]["total"] == 0
+    assert public_channel["setup_approval_status"] == "stale"
+
+
+def test_notification_channel_test_send_approval_records_local_log_after_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    with TestClient(app) as client:
+        channel = next(
+            row for row in client.get("/api/notification-channels").json()["channels"]
+            if row["label"] == "local dashboard inbox"
+        )
+        queued = client.post(
+            f"/api/notification-channels/{channel['id']}/test-send-approval",
+            json={"summary": "Safe local dashboard readiness check."},
+        ).json()
+        before = client.get("/api/notification-deliveries").json()
+        decision = client.post(
+            f"/api/approvals/{queued['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        after = client.get("/api/notification-deliveries").json()
+
+    assert before["summary"]["total"] == 0
+    assert decision["notification_test_status"] == "delivered_local_log"
+    assert decision["notification_delivery"]["channel_kind"] == "local_log"
+    assert decision["notification_delivery"]["status"] == "delivered"
+    assert decision["notification_delivery"]["source"] == "channel_test"
+    assert decision["notification_delivery"]["external_delivery"] is False
+    assert after["summary"]["total"] == 1
+    assert after["deliveries"][0]["status"] == "delivered"
+    assert after["deliveries"][0]["metadata_only"] is True
+
+
+def test_notification_channel_test_send_reject_and_desktop_approval_do_not_send_external(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    with TestClient(app) as client:
+        channels = client.get("/api/notification-channels").json()["channels"]
+        local_channel = next(row for row in channels if row["label"] == "local dashboard inbox")
+        desktop_channel = next(row for row in channels if row["label"] == "desktop-main")
+        rejected = client.post(
+            f"/api/notification-channels/{local_channel['id']}/test-send-approval",
+            json={"summary": "Reject this readiness check."},
+        ).json()
+        reject_decision = client.post(
+            f"/api/approvals/{rejected['approval_request_id']}/decision",
+            json={"decision": "rejected"},
+        ).json()
+        after_reject = client.get("/api/notification-deliveries").json()
+        desktop = client.post(
+            f"/api/notification-channels/{desktop_channel['id']}/test-send-approval",
+            json={"summary": "Desktop readiness intent only."},
+        ).json()
+        desktop_decision = client.post(
+            f"/api/approvals/{desktop['approval_request_id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        after_desktop = client.get("/api/notification-deliveries").json()
+
+    assert reject_decision["notification_test_status"] == "rejected"
+    assert "notification_delivery" not in reject_decision
+    assert after_reject["summary"]["total"] == 0
+    assert desktop_decision["notification_test_status"] == "needs_setup"
+    assert desktop_decision["notification_delivery"]["channel_kind"] == "desktop"
+    assert desktop_decision["notification_delivery"]["status"] == "needs_setup"
+    assert desktop_decision["notification_delivery"]["external_delivery"] is False
+    assert after_desktop["summary"]["total"] == 1
+    assert after_desktop["deliveries"][0]["status"] == "needs_setup"
+
+
 def test_automation_auto_policy_requires_toolgate_for_tools_memory_and_delivery(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

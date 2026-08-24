@@ -81,6 +81,12 @@ class NotificationChannelUpdateInput(BaseModel):
     requires_owner_confirmation: bool | None = None
 
 
+class NotificationTestSendApprovalInput(BaseModel):
+    requested_by_agent_id: str = "agent_pi_operator"
+    requested_by_team_id: str | None = None
+    summary: str = Field(default="Owner requested notification channel readiness test.", max_length=1000)
+
+
 class AccessBoundaryRepairInput(BaseModel):
     agent_id: str | None = None
     team_id: str | None = None
@@ -3988,6 +3994,10 @@ def _public_notification_channel(item: dict[str, Any]) -> dict[str, Any]:
         "metadata_only": True,
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
+        "setup_approval_request_id": item.get("test_send_approval_request_id"),
+        "setup_approval_status": item.get("test_send_approval_status"),
+        "setup_approval_requested_at": item.get("test_send_requested_at"),
+        "setup_approval_decided_at": item.get("test_send_decided_at"),
     }
 
 
@@ -4139,6 +4149,165 @@ def _record_local_notification_delivery(item: dict[str, Any], result: dict[str, 
                 app.state.notification_deliveries.pop(delivery_id, None)
                 _delete_registry_item("notification_delivery", delivery_id)
     return deliveries
+
+
+def _redact_notification_summary(value: Any, *, limit: int = 240) -> str:
+    text = " ".join(str(value or "").replace("\x00", "").split())
+    for pattern, replacement in (
+        (r"https?://\S+", "[redacted-url]"),
+        (r"(?i)\b(api[_-]?key|token|password|secret|bearer|webhook|endpoint|url)\s*[:=]\s*\S+", "[redacted-detail]"),
+        (r"(?i)\bbearer\s+\S+", "[redacted-detail]"),
+        (r"(?i)\b(api[_-]?key|token|password|secret|bearer|webhook|endpoint|url)\b", "redacted-detail"),
+        (r"\S+@\S+", "[redacted-contact]"),
+        (r"\+?\d[\d\s()./-]{6,}\d", "[redacted-contact]"),
+        (r"(?i)\b(raw\s+)?(tool\s+)?arguments?\b", "redacted arguments"),
+        (r"(?i)\b(prompt|memory contents?|transcript)\b", "redacted content"),
+    ):
+        text = re.sub(pattern, replacement, text)
+    return _safe_summary(text or "Notification channel readiness test requested.", limit=limit)
+
+
+def _notification_test_summary_digest(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _notification_channel_fingerprint(item: dict[str, Any]) -> str:
+    payload = {
+        "id": _safe_text(item.get("id"), limit=120),
+        "label": _safe_text(item.get("label"), limit=80),
+        "kind": _safe_text(item.get("kind") or "manual", limit=40),
+        "status": _safe_text(item.get("status") or "needs_setup", limit=40),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _create_notification_test_send_approval_request(
+    item: dict[str, Any],
+    payload: NotificationTestSendApprovalInput,
+) -> dict[str, Any]:
+    existing_request_id = item.get("test_send_approval_request_id")
+    if existing_request_id:
+        existing = app.state.gates.request_status(str(existing_request_id))
+        if existing and str(existing.get("status") or "") == "pending":
+            return existing
+    actor = _permission_context(
+        _safe_text(payload.requested_by_agent_id, limit=120) or "agent_pi_operator",
+        _safe_text(payload.requested_by_team_id, limit=120) or None,
+    )
+    channel = _public_notification_channel(item)
+    redacted_summary = _redact_notification_summary(payload.summary, limit=240)
+    request_payload = {
+        "subject_type": "notification_channel",
+        "subject_id": item["id"],
+        "action": "test_send_intention",
+        "requested_by_agent_id": actor["agent_id"],
+        "requested_by_team_id": actor.get("team_id"),
+        "channel_label": channel["label"],
+        "channel_kind": channel["kind"],
+        "channel_status": channel["status"],
+        "channel_fingerprint": _notification_channel_fingerprint(item),
+        "summary_digest": _notification_test_summary_digest(redacted_summary),
+        "metadata_only": True,
+        "external_delivery": False,
+        "raw_args_included": False,
+    }
+    request = app.state.gates.create_admin_request(
+        kind="notification_test_send",
+        title=f"Review notification readiness test: {channel['label']}",
+        details=(
+            "Owner approval requested for a metadata-only notification channel readiness test. "
+            f"Channel: {channel['label']} ({channel['kind']}, {channel['status']}). "
+            f"Summary: {redacted_summary}. "
+            "No provider connection details, private contact details, raw arguments, or external delivery data was sent."
+        ),
+        payload=request_payload,
+        severity="info" if channel["kind"] == "local_log" and channel["status"] == "available" else "warning",
+    )
+    item["test_send_approval_request_id"] = request.get("id")
+    item["test_send_approval_status"] = request.get("status") or "pending"
+    item["test_send_requested_at"] = now()
+    item["test_send_summary"] = redacted_summary
+    item["updated_at"] = now()
+    app.state.notification_channels[item["id"]] = item
+    _save_registry_item("notification_channel", item)
+    _record_activity(
+        actor["agent_id"],
+        event_type="notification.test_send_approval_requested",
+        status="pending",
+        source="ToolGate",
+        summary=f"Notification channel readiness test queued: {channel['label']}",
+        team_id=actor.get("team_id"),
+        ref_type="notification_channel",
+        ref_id=item["id"],
+    )
+    return request
+
+
+def _record_notification_test_delivery(item: dict[str, Any], *, status: str, summary: str) -> dict[str, Any]:
+    created_at = now()
+    delivery = {
+        "id": f"notif_{uuid.uuid4().hex[:12]}",
+        "channel_id": item.get("id"),
+        "channel_label": item.get("label"),
+        "channel_kind": item.get("kind") or "manual",
+        "status": status,
+        "source": "channel_test",
+        "job_id": None,
+        "agent_id": "agent_pi_operator",
+        "team_id": None,
+        "summary": _redact_notification_summary(summary, limit=240),
+        "result_status": status,
+        "result_output_chars": 0,
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    app.state.notification_deliveries[delivery["id"]] = delivery
+    _save_registry_item("notification_delivery", delivery)
+    return _public_notification_delivery(delivery)
+
+
+def _apply_notification_test_send_approval_request(result: dict[str, Any], decision: str) -> None:
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    channel_id = str(payload.get("subject_id") or "")
+    item = getattr(app.state, "notification_channels", {}).get(channel_id)
+    if not item:
+        result["notification_test_status"] = "channel_missing"
+        return
+    item["test_send_approval_request_id"] = result.get("id") or item.get("test_send_approval_request_id")
+    item["test_send_approval_status"] = decision
+    item["test_send_decided_at"] = now()
+    delivery = None
+    if decision == "approved" and payload.get("channel_fingerprint") != _notification_channel_fingerprint(item):
+        item["test_send_approval_status"] = "stale"
+        result["notification_test_status"] = "stale"
+        result["notification_test_stale_reason"] = "notification channel metadata changed after ToolGate review was requested"
+        item["updated_at"] = now()
+        app.state.notification_channels[channel_id] = item
+        _save_registry_item("notification_channel", item)
+        return
+    if decision == "approved":
+        if item.get("kind") == "local_log" and item.get("status") == "available":
+            delivery = _record_notification_test_delivery(
+                item,
+                status="delivered",
+                summary=item.get("test_send_summary") or "Local dashboard inbox readiness test approved.",
+            )
+            result["notification_test_status"] = "delivered_local_log"
+        else:
+            status = "needs_setup" if item.get("status") != "available" else "blocked"
+            delivery = _record_notification_test_delivery(
+                item,
+                status=status,
+                summary=f"Notification readiness test approved, but {item.get('kind') or 'manual'} delivery is not configured for external sending.",
+            )
+            result["notification_test_status"] = status
+    else:
+        result["notification_test_status"] = "rejected"
+    if delivery:
+        result["notification_delivery"] = delivery
+    item["updated_at"] = now()
+    app.state.notification_channels[channel_id] = item
+    _save_registry_item("notification_channel", item)
 
 
 def _sanitize_task_status(value: Any) -> str:
@@ -7820,6 +7989,45 @@ def list_notification_deliveries():
     }
 
 
+@app.post("/api/notification-channels/{channel_id}/test-send-approval")
+def queue_notification_channel_test_send_approval(
+    channel_id: str,
+    payload: NotificationTestSendApprovalInput | None = None,
+):
+    _ensure_registry_seeded()
+    item = app.state.notification_channels.get(channel_id)
+    if not item:
+        raise HTTPException(404, "notification channel not found")
+    if item.get("status") == "disabled":
+        raise HTTPException(409, "notification channel is disabled")
+    request = _create_notification_test_send_approval_request(
+        item,
+        payload or NotificationTestSendApprovalInput(),
+    )
+    return {
+        "channel_id": item.get("id"),
+        "approval_request_id": _safe_text(request.get("id"), limit=120),
+        "approval_status": _safe_text(request.get("status") or "pending", limit=40),
+        "metadata_only": True,
+        "external_delivery": False,
+        "channel": _public_notification_channel(item),
+        "test_send": {
+            "metadata_only": True,
+            "external_delivery": False,
+            "raw_args_included": False,
+            "summary": _redact_notification_summary(item.get("test_send_summary") or "Notification channel readiness test requested.", limit=240),
+        },
+    }
+
+
+@app.post("/api/notification-channels/{channel_id}/setup-approval")
+def queue_notification_channel_setup_approval(
+    channel_id: str,
+    payload: NotificationTestSendApprovalInput | None = None,
+):
+    return queue_notification_channel_test_send_approval(channel_id, payload)
+
+
 @app.delete("/api/notification-deliveries/{delivery_id}")
 def delete_notification_delivery(delivery_id: str):
     _ensure_registry_seeded()
@@ -8262,6 +8470,8 @@ async def agentgate_decide_approval(request_id: str, payload: dict[str, Any]):
         _apply_app_preview_promotion_approval_request(result, decision)
     if result.get("kind") == "task_checkpoint_review" and request_payload.get("subject_type") == "task_checkpoint":
         _apply_task_checkpoint_approval_request(result, decision)
+    if result.get("kind") == "notification_test_send" and request_payload.get("subject_type") == "notification_channel":
+        _apply_notification_test_send_approval_request(result, decision)
     _record_activity(
         "agent_pi_operator",
         event_type="approval.decided",
