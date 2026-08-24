@@ -4919,9 +4919,14 @@ async def _run_group_round(
                 "round_index": round_index,
                 "round_count": round_count,
             }))
+        active_run_id = ""
         try:
             async for event in app.state.pi.stream(payload.input, session_id=session_id, options=options):
                 event_data = event.data if isinstance(event.data, dict) else {}
+                run_id = str(event_data.get("run_id") or "")
+                if event.event == "run.started" and run_id:
+                    active_run_id = run_id
+                    app.state.active_runs[session_id] = run_id
                 if event.event == "message.delta":
                     delta = str(event_data.get("delta") or event_data.get("text") or event_data.get("content") or "")
                     collected.append(delta)
@@ -4935,9 +4940,14 @@ async def _run_group_round(
                         }))
                 if event.event in {"run.failed", "run.stopped"}:
                     run_status = "failed" if event.event == "run.failed" else "stopped"
+                if event.event in {"run.stopped", "run.failed", "message.completed"} and app.state.active_runs.get(session_id) == run_id:
+                    app.state.active_runs.pop(session_id, None)
         except Exception as exc:
             run_status = "failed"
             error_summary = _safe_error_summary(exc)
+        finally:
+            if active_run_id and app.state.active_runs.get(session_id) == active_run_id:
+                app.state.active_runs.pop(session_id, None)
         content = "".join(collected)
         if content:
             app.state.messages[session_id].append({

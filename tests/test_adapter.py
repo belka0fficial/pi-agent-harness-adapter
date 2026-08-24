@@ -167,6 +167,69 @@ def test_stop_endpoint_terminates_stream_and_session_remains_usable():
     asyncio.run(scenario())
 
 
+def test_group_round_stop_endpoint_stops_current_speaker_run():
+    async def scenario():
+        app.state.sessions = {}
+        app.state.messages = {}
+        app.state.agents = {}
+        app.state.teams = {}
+        app.state.active_runs = {}
+        app.state.pi = ControlledPi()
+        main._ensure_registry_seeded()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            teammate = (
+                await client.post(
+                    "/api/agents",
+                    json={"name": "Stop Teammate", "purpose": "Group stop proof."},
+                )
+            ).json()
+            team = (
+                await client.post(
+                    "/api/teams",
+                    json={
+                        "name": "Stop Team",
+                        "purpose": "Group stop proof.",
+                        "orchestrator_agent_id": "agent_pi_operator",
+                        "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                    },
+                )
+            ).json()
+            created = (
+                await client.post(
+                    "/api/sessions",
+                    json={
+                        "title": "Stop group",
+                        "agent_id": "agent_pi_operator",
+                        "team_id": team["id"],
+                        "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+                    },
+                )
+            ).json()
+            session_id = created["id"]
+            stream_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session_id}/group-round/stream",
+                    json={"input": "needs-stop", "max_speakers": 2},
+                )
+            )
+            await asyncio.sleep(0.05)
+            result = await client.post(f"/api/sessions/{session_id}/runs/current/stop")
+            assert result.status_code == 200
+            body = result.json()
+            assert body["session_id"] == session_id
+            assert body["status"] == "stopping"
+            assert body["active_run"]["status"] == "stopping"
+            assert "run_id" not in result.text
+            assert "run-stop" not in result.text
+            response = await asyncio.wait_for(stream_task, timeout=2)
+            assert "event: group.speaker.completed" in response.text
+            assert '"status": "stopped"' in response.text
+            assert app.state.active_runs.get(session_id) is None
+
+    asyncio.run(scenario())
+
+
 def test_approval_endpoint_supports_approve_and_reject_paths():
     async def run_decision(client: httpx.AsyncClient, session_id: str, decision: str):
         app.state.pi = ControlledPi()
