@@ -3241,6 +3241,7 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
         job_detail = client.get(f"/api/workstream/refs/job/{job.json()['id']}")
         task_detail = client.get(f"/api/workstream/refs/task/{task.json()['id']}")
         memory_detail = client.get("/api/workstream/refs/memory_candidate/memcand_workstream")
+        tool_detail = client.get(f"/api/workstream/refs/tool_draft/{draft.json()['id']}")
         ghost_detail = client.get("/api/workstream/refs/job/job_missing_from_runtime")
         agent_detail = client.get("/api/workstream/refs/agent/agent_pi_operator")
         team_detail = client.get("/api/workstream/refs/team/team_core")
@@ -3249,6 +3250,7 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert job_detail.status_code == 200
     assert task_detail.status_code == 200
     assert memory_detail.status_code == 200
+    assert tool_detail.status_code == 200
     assert ghost_detail.status_code == 200
     assert agent_detail.status_code == 200
     assert team_detail.status_code == 200
@@ -3279,6 +3281,7 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
         assert forbidden not in job_detail.text.lower()
         assert forbidden not in task_detail.text.lower()
         assert forbidden not in memory_detail.text.lower()
+        assert forbidden not in tool_detail.text.lower()
         assert forbidden not in agent_detail.text.lower()
         assert forbidden not in team_detail.text.lower()
     job_body = job_detail.json()
@@ -3336,6 +3339,20 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert "Open Memory review" in memory_body["insight"]["owner_next_step"]
     assert "text" not in memory_body["detail"]
     assert memory_body["safety"]["mode"] == "metadata_only"
+    tool_body = tool_detail.json()
+    assert tool_body["ref_type"] == "tool_draft"
+    assert tool_body["insight"]["safety"]["tools_installed"] is False
+    tool_controls = tool_body["insight"]["controls"]
+    assert tool_controls["schema"] == "agentgate.tool_draft_controls.v1"
+    assert tool_controls["metadata_only"] is True
+    assert tool_controls["executes_from_drilldown"] is False
+    assert tool_controls["review_readiness"]["enabled"] is True
+    assert tool_controls["review_readiness"]["reason_code"] == "ready_for_toolgate_review"
+    assert tool_controls["package_readiness"]["enabled"] is False
+    assert tool_controls["package_readiness"]["reason_code"] == "needs_toolgate_review"
+    assert tool_controls["lifecycle_boundary"]["enabled"] is True
+    assert tool_controls["lifecycle_boundary"]["reason_code"] == "safe_non_approved_record"
+    assert "Open Tools" in tool_body["insight"]["owner_next_step"]
     ghost_body = ghost_detail.json()
     assert ghost_body["ref_type"] == "job"
     assert ghost_body["detail"]["available"] is False
@@ -3435,6 +3452,82 @@ def test_workstream_memory_candidate_controls_are_metadata_only(monkeypatch, tmp
     assert rejected_controls["reject_memory"]["enabled"] is False
     assert rejected_controls["delete_candidate"]["enabled"] is True
     assert rejected_controls["delete_candidate"]["reason_code"] == "pending_or_rejected_record"
+
+
+def test_workstream_tool_draft_controls_are_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        pending = client.post(
+            "/api/tool-drafts",
+            json={
+                "title": "Private shell helper",
+                "purpose": "Never expose token=tool-secret https://tool.example/path raw command arguments.",
+                "proposed_tool_id": "Private Shell Helper",
+                "risk": "high",
+            },
+        ).json()
+        draft_detail = client.get(f"/api/workstream/refs/tool_draft/{pending['id']}")
+        review = client.post(f"/api/tool-drafts/{pending['id']}/toolgate-review").json()
+        pending_detail = client.get(f"/api/workstream/refs/tool_draft/{pending['id']}")
+        app.state.gates.decide_approval(review["toolgate_request_id"], "approved")
+        approved_detail = client.get(f"/api/workstream/refs/tool_draft/{pending['id']}")
+        package = client.post(f"/api/tool-drafts/{pending['id']}/package-proposal")
+        package_detail = client.get(f"/api/workstream/refs/tool_draft/{pending['id']}")
+
+    assert draft_detail.status_code == 200
+    controls = draft_detail.json()["insight"]["controls"]
+    detail = draft_detail.json()["detail"]
+    assert detail["schema"] == "agentgate.tool_draft_ref_detail.v1"
+    assert "purpose" not in detail
+    assert "package_proposal" not in detail
+    assert detail["purpose_present"] is True
+    assert detail["purpose_chars"] > 0
+    assert detail["purpose_digest"]
+    assert controls["schema"] == "agentgate.tool_draft_controls.v1"
+    assert controls["metadata_only"] is True
+    assert controls["executes_from_drilldown"] is False
+    assert controls["review_readiness"]["enabled"] is True
+    assert controls["review_readiness"]["reason_code"] == "ready_for_toolgate_review"
+    assert controls["package_readiness"]["enabled"] is False
+    assert controls["package_readiness"]["reason_code"] == "needs_toolgate_review"
+    assert controls["lifecycle_boundary"]["enabled"] is True
+    joined = json.dumps(draft_detail.json()).lower()
+    for forbidden in [
+        "tool-secret",
+        "https://tool.example",
+        "raw command",
+        "/api/tool-drafts",
+        "/v2/",
+        "register",
+    ]:
+        assert forbidden not in joined
+
+    pending_controls = pending_detail.json()["insight"]["controls"]
+    assert pending_controls["review_readiness"]["enabled"] is False
+    assert pending_controls["review_readiness"]["reason_code"] == "review_already_pending"
+    assert pending_controls["package_readiness"]["enabled"] is False
+    assert pending_controls["package_readiness"]["reason_code"] == "waiting_for_toolgate_approval"
+    assert pending_controls["lifecycle_boundary"]["enabled"] is True
+
+    approved_controls = approved_detail.json()["insight"]["controls"]
+    assert approved_controls["review_readiness"]["enabled"] is False
+    assert approved_controls["review_readiness"]["reason_code"] == "already_approved"
+    assert approved_controls["package_readiness"]["enabled"] is True
+    assert approved_controls["package_readiness"]["reason_code"] == "toolgate_approved"
+    assert approved_controls["lifecycle_boundary"]["enabled"] is False
+    assert approved_controls["lifecycle_boundary"]["reason_code"] == "approved_audit_history"
+
+    assert package.status_code == 200
+    package_controls = package_detail.json()["insight"]["controls"]
+    package_detail_body = package_detail.json()["detail"]
+    assert package_detail_body["package_proposal_present"] is True
+    assert package_detail_body["package_proposal_digest"]
+    assert "package_proposal" not in package_detail_body
+    assert package_controls["package_readiness"]["enabled"] is False
+    assert package_controls["package_readiness"]["reason_code"] == "package_already_prepared"
 
 
 def test_workstream_job_controls_hide_raw_active_run_id(monkeypatch, tmp_path):

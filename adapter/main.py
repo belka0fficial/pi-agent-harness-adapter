@@ -2092,6 +2092,8 @@ def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], 
         insight["controls"] = _workstream_approval_controls(detail)
     if ref_type == "task":
         insight["controls"] = _workstream_task_controls(detail)
+    if ref_type == "tool_draft":
+        insight["controls"] = _workstream_tool_draft_controls(detail)
     if ref_type == "memory_candidate":
         insight["controls"] = _workstream_memory_candidate_controls(detail)
     return insight
@@ -2356,6 +2358,101 @@ def _workstream_memory_candidate_controls(detail: dict[str, Any]) -> dict[str, A
     }
 
 
+def _workstream_tool_draft_controls(detail: dict[str, Any]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    status = str(detail.get("status") or "draft")
+    review_state = str(detail.get("review_state") or "needs_owner_review")
+    toolgate_status = str(detail.get("toolgate_status") or "")
+    has_package = bool(detail.get("package_proposal_present")) or isinstance(detail.get("package_proposal"), dict)
+    reviewable = status in {"draft", "rejected", "archived"} or review_state in {"needs_owner_review", "rejected", "archived"}
+    pending = toolgate_status == "pending" or review_state == "toolgate_pending"
+    approved = toolgate_status == "approved" or review_state == "toolgate_approved"
+    rejected = toolgate_status in {"rejected", "dismissed"} or review_state in {"toolgate_rejected", "rejected"}
+
+    if not available:
+        return {
+            "schema": "agentgate.tool_draft_controls.v1",
+            "metadata_only": True,
+            "executes_from_drilldown": False,
+            "review_readiness": _workstream_control(False, "audit_only", "Tool draft exists only in audit history."),
+            "package_readiness": _workstream_control(False, "audit_only", "Tool draft exists only in audit history."),
+            "lifecycle_boundary": _workstream_control(False, "audit_only", "Tool draft exists only in audit history."),
+        }
+
+    return {
+        "schema": "agentgate.tool_draft_controls.v1",
+        "metadata_only": True,
+        "executes_from_drilldown": False,
+        "review_readiness": _workstream_control(
+            reviewable and not pending,
+            (
+                "ready_for_toolgate_review"
+                if reviewable and not pending
+                else "review_already_pending"
+                if pending
+                else "already_approved"
+                if approved
+                else "package_proposal_ready"
+                if has_package
+                else "not_reviewable"
+            ),
+            (
+                "Open Tools to queue a metadata-only ToolGate owner review."
+                if reviewable and not pending
+                else "ToolGate already has a pending tool draft review."
+                if pending
+                else "ToolGate already approved this tool draft."
+                if approved
+                else "A metadata-only package proposal is already ready."
+                if has_package
+                else "This tool draft is not ready for ToolGate review."
+            ),
+        ),
+        "package_readiness": _workstream_control(
+            approved and not has_package,
+            (
+                "toolgate_approved"
+                if approved and not has_package
+                else "package_already_prepared"
+                if has_package
+                else "waiting_for_toolgate_approval"
+                if pending
+                else "toolgate_rejected"
+                if rejected
+                else "needs_toolgate_review"
+            ),
+            (
+                "Open Tools to prepare a metadata-only ToolGate package proposal."
+                if approved and not has_package
+                else "A package proposal is already prepared."
+                if has_package
+                else "Waiting for ToolGate owner approval."
+                if pending
+                else "ToolGate rejected this tool draft."
+                if rejected
+                else "Queue ToolGate owner review before preparing a package proposal."
+            ),
+        ),
+        "lifecycle_boundary": _workstream_control(
+            not approved and not has_package,
+            (
+                "safe_non_approved_record"
+                if not approved and not has_package
+                else "approved_audit_history"
+                if approved
+                else "package_proposal_ready"
+            ),
+            (
+                "Open Tools to delete this non-approved draft record."
+                if not approved and not has_package
+                else "Approved tool drafts remain review history."
+                if approved
+                else "Package proposals remain visible for owner review."
+            ),
+        ),
+    }
+
+
 def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_type = _safe_summary(ref_type, limit=80)
     clean_id = _safe_summary(ref_id, limit=160)
@@ -2449,9 +2546,28 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
             }
         else:
             draft = _public_tool_draft(app.state.tool_drafts[clean_id])
+            purpose = str(draft.get("purpose") or "")
+            proposal = draft.get("package_proposal") if isinstance(draft.get("package_proposal"), dict) else None
             detail = {
-                **draft,
-                "purpose": _redact_tool_draft_text(draft.get("purpose") or "", limit=500),
+                "schema": "agentgate.tool_draft_ref_detail.v1",
+                "id": draft.get("id"),
+                "title": _redact_tool_draft_text(draft.get("title") or "", limit=160),
+                "proposed_tool_id": _safe_summary(draft.get("proposed_tool_id") or "", limit=120),
+                "risk": _sanitize_risk(draft.get("risk")),
+                "status": _safe_summary(draft.get("status") or "draft", limit=80),
+                "review_state": _safe_summary(draft.get("review_state") or "needs_owner_review", limit=80),
+                "toolgate_status": _safe_summary(draft.get("toolgate_status") or "", limit=80) or None,
+                "toolgate_request_present": bool(draft.get("toolgate_request_id")),
+                "package_proposal_present": bool(proposal),
+                "package_proposal_digest": _safe_summary(proposal.get("digest") or "", limit=120) if proposal else None,
+                "purpose_present": bool(purpose),
+                "purpose_digest": hashlib.sha256(purpose.encode("utf-8")).hexdigest() if purpose else "",
+                "purpose_chars": len(purpose),
+                "source_session_id": _safe_text(draft.get("source_session_id"), limit=120),
+                "source_message_id": _safe_text(draft.get("source_message_id"), limit=120),
+                "source_role": _safe_text(draft.get("source_role"), limit=40) or "selected",
+                "created_at": draft.get("created_at"),
+                "updated_at": draft.get("updated_at"),
             }
     elif clean_type == "app_workspace":
         if clean_id not in getattr(app.state, "app_workspaces", {}):
