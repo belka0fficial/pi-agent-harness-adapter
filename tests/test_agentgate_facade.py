@@ -295,6 +295,7 @@ def reset_state():
     app.state.teams = {}
     app.state.tool_drafts = {}
     app.state.app_workspaces = {}
+    app.state.app_artifacts = {}
     app.state.notification_channels = {}
     app.state.memory_candidates = {}
     app.state.active_job_runs = {}
@@ -566,6 +567,128 @@ def test_app_workspace_responses_redact_prompts_secrets_paths_and_urls(monkeypat
     ]:
         assert forbidden not in body
     assert "[redacted" in body
+
+
+def test_app_workspace_artifact_registry_create_list_patch_delete(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post(
+            "/api/app-workspaces",
+            json={"name": "Gallery Host", "purpose": "Metadata-only artifact gallery."},
+        ).json()
+        created = client.post(
+            f"/api/app-workspaces/{workspace['id']}/artifacts",
+            json={
+                "name": "Dashboard Spec",
+                "artifact_type": "spec",
+                "status": "draft",
+                "risk_level": "medium",
+                "summary": "Reviewer-visible metadata only.",
+            },
+        )
+        artifact = created.json()["artifacts"][0]
+        listed = client.get(f"/api/app-workspaces/{workspace['id']}/artifacts")
+        patched = client.patch(
+            f"/api/app-workspaces/{workspace['id']}/artifacts/{artifact['id']}",
+            json={"status": "review_ready", "review_status": "needs_review", "summary": "Ready for metadata review."},
+        )
+        drilldown = client.get(f"/api/workstream/refs/app_artifact/{artifact['id']}")
+
+    assert created.status_code == 200
+    assert created.json()["summary"]["total"] == 1
+    assert artifact["workspace_id"] == workspace["id"]
+    assert artifact["artifact_type"] == "spec"
+    assert artifact["created_by_agent_id"] == "agent_pi_operator"
+    assert created.json()["safety"]["mode"] == "metadata_only"
+    assert created.json()["safety"]["files_created"] is False
+    assert created.json()["safety"]["file_contents_included"] is False
+    assert created.json()["safety"]["code_executed"] is False
+    assert listed.json()["summary"]["draft"] == 1
+    assert patched.status_code == 200
+    assert patched.json()["summary"]["review_ready"] == 1
+    assert patched.json()["artifacts"][0]["summary"] == "Ready for metadata review."
+    assert drilldown.status_code == 200
+    assert drilldown.json()["detail"]["id"] == artifact["id"]
+    assert drilldown.json()["detail"]["workspace_id"] == workspace["id"]
+    assert drilldown.json()["safety"]["mode"] == "metadata_only"
+
+    app.state.app_artifacts = {}
+    main._load_registry()
+    assert app.state.app_artifacts[artifact["id"]]["name"] == "Dashboard Spec"
+
+    with TestClient(app) as client:
+        deleted = client.delete(f"/api/app-workspaces/{workspace['id']}/artifacts/{artifact['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+    assert deleted.json()["summary"]["total"] == 0
+
+    app.state.app_artifacts = {}
+    main._load_registry()
+    assert artifact["id"] not in app.state.app_artifacts
+
+
+def test_app_workspace_artifacts_missing_workspace_404(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        listed = client.get("/api/app-workspaces/appws_missing/artifacts")
+        created = client.post(
+            "/api/app-workspaces/appws_missing/artifacts",
+            json={"name": "Missing", "artifact_type": "spec"},
+        )
+
+    assert listed.status_code == 404
+    assert created.status_code == 404
+
+
+def test_app_workspace_artifacts_redact_tokens_urls_paths_and_raw_code(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post(
+            "/api/app-workspaces",
+            json={"name": "Safe Gallery", "purpose": "Metadata only."},
+        ).json()
+        response = client.post(
+            f"/api/app-workspaces/{workspace['id']}/artifacts",
+            json={
+                "name": "Preview https://private.example/mockup token=abc123 path=/home/private/app",
+                "artifact_type": "preview_stub",
+                "summary": "raw_code=print(secret) file=/tmp/app.py bearer abc123 ```const token = 'abc123'```",
+                "review_status": "needs_review",
+                "raw_code": "print('should not persist')",
+                "host_path": "/home/private/nope",
+                "url": "https://private.example/nope",
+            },
+        )
+        listed = client.get(f"/api/app-workspaces/{workspace['id']}/artifacts")
+
+    assert response.status_code == 200
+    body = json.dumps({"created": response.json(), "listed": listed.json()}).lower()
+    for forbidden in [
+        "abc123",
+        "https://private.example",
+        "/home/private",
+        "/tmp/app.py",
+        "print('should not persist')",
+        "print(secret)",
+        "const token",
+        "bearer abc123",
+    ]:
+        assert forbidden not in body
+    assert "[redacted" in body
+    assert response.json()["safety"]["host_paths_accepted"] is False
+    assert response.json()["safety"]["raw_code_included"] is False
 
 
 def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):

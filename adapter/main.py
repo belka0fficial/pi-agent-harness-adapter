@@ -234,6 +234,28 @@ class AppWorkspaceUpdateInput(BaseModel):
     progress_summary: str | None = Field(default=None, max_length=600)
 
 
+class AppArtifactInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    artifact_type: str = "spec"
+    status: str = "draft"
+    risk_level: str = "low"
+    summary: str = Field(default="", max_length=1000)
+    review_status: str = Field(default="unreviewed", max_length=80)
+    created_by_agent_id: str | None = None
+    team_id: str | None = None
+
+
+class AppArtifactUpdateInput(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    artifact_type: str | None = None
+    status: str | None = None
+    risk_level: str | None = None
+    summary: str | None = Field(default=None, max_length=1000)
+    review_status: str | None = Field(default=None, max_length=80)
+    created_by_agent_id: str | None = None
+    team_id: str | None = None
+
+
 TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
     "persona-development": {
         "id": "persona-development",
@@ -297,6 +319,7 @@ app.state.jobs = {}
 app.state.tasks = {}
 app.state.tool_drafts = {}
 app.state.app_workspaces = {}
+app.state.app_artifacts = {}
 app.state.model_route_proposals = {}
 app.state.notification_channels = {}
 app.state.active_runs = {}
@@ -401,6 +424,7 @@ def _load_registry() -> None:
     app.state.tasks = {}
     app.state.tool_drafts = {}
     app.state.app_workspaces = {}
+    app.state.app_artifacts = {}
     app.state.model_route_proposals = {}
     app.state.notification_channels = {}
     app.state.memory_candidates = {}
@@ -421,6 +445,8 @@ def _load_registry() -> None:
             app.state.tool_drafts[row["id"]] = item
         elif row["kind"] == "app_workspace":
             app.state.app_workspaces[row["id"]] = item
+        elif row["kind"] == "app_artifact":
+            app.state.app_artifacts[row["id"]] = item
         elif row["kind"] == "model_route_proposal":
             app.state.model_route_proposals[row["id"]] = item
         elif row["kind"] == "notification_channel":
@@ -451,7 +477,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "model_route_proposal", "notification_channel", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "model_route_proposal", "notification_channel", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -467,7 +493,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "notification_channel", "memory_candidate"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "notification_channel", "memory_candidate"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -1457,6 +1483,20 @@ def _object_workstream_events() -> list[dict[str, Any]]:
             ref_type="app_workspace",
             ref_id=item.get("id"),
         ))
+    for item in getattr(app.state, "app_artifacts", {}).values():
+        rows.append(_workstream_event(
+            event_id=f"app_artifact:{item.get('id')}",
+            time=item.get("updated_at") or item.get("created_at"),
+            kind="app_builder",
+            status=item.get("status") or "draft",
+            risk=item.get("risk_level") or "low",
+            source="AgentGate",
+            summary=f"App artifact metadata: {item.get('name') or item.get('id')}",
+            agent_id=item.get("created_by_agent_id"),
+            team_id=item.get("team_id"),
+            ref_type="app_artifact",
+            ref_id=item.get("id"),
+        ))
     for item in getattr(app.state, "memory_candidates", {}).values():
         rows.append(_workstream_event(
             event_id=f"memory_candidate:{item.get('id')}",
@@ -1550,7 +1590,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_id = _safe_summary(ref_id, limit=160)
     if not clean_type or not clean_id:
         raise HTTPException(422, "ref_type and ref_id are required")
-    supported_types = {"agent", "team", "job", "task", "session", "tool_draft", "app_workspace", "memory_candidate"}
+    supported_types = {"agent", "team", "job", "task", "session", "tool_draft", "app_workspace", "app_artifact", "memory_candidate"}
     if clean_type not in supported_types:
         raise HTTPException(422, "unsupported workstream reference type")
     activity = [
@@ -1638,6 +1678,16 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
             }
         else:
             detail = _public_app_workspace(app.state.app_workspaces[clean_id], activity_limit=5)
+    elif clean_type == "app_artifact":
+        if clean_id not in getattr(app.state, "app_artifacts", {}):
+            detail = {
+                "id": clean_id,
+                "available": False,
+                "state": "audit_only",
+                "summary": "Reference is present in audit history but not in current runtime state.",
+            }
+        else:
+            detail = _public_app_artifact(app.state.app_artifacts[clean_id])
     elif clean_type == "memory_candidate":
         if clean_id not in getattr(app.state, "memory_candidates", {}):
             detail = {
@@ -1846,6 +1896,9 @@ def _validate_job_requirements(actor: dict[str, Any], required_tool_ids: list[An
 APP_WORKSPACE_STATUSES = {"draft", "planning", "review_ready", "archived"}
 APP_WORKSPACE_RISK_LEVELS = {"low", "medium", "high"}
 APP_WORKSPACE_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed", "blocked"}
+APP_ARTIFACT_TYPES = {"mockup", "spec", "component", "data_contract", "review_note", "preview_stub"}
+APP_ARTIFACT_STATUSES = {"draft", "review_ready", "approved_metadata", "archived"}
+APP_ARTIFACT_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed", "blocked", "approved_metadata"}
 
 
 def _redact_app_workspace_text(value: Any, *, limit: int) -> str:
@@ -1853,6 +1906,8 @@ def _redact_app_workspace_text(value: Any, *, limit: int) -> str:
     text = re.sub(r"(?i)\b(raw\s+)?(prompt|secret|credential|token|password|bearer)\b", "[redacted]", text)
     text = re.sub(r"(?i)\b(file|path|asset|workspace|folder|directory)\s*[:=]\s*\S+", r"\1=[redacted]", text)
     text = re.sub(r"(?<!\w)(?:/home|/app|/tmp|/var|/etc|/usr|~)/\S+", "[redacted-path]", text)
+    text = re.sub(r"(?i)\b(raw[_-]?code|source[_-]?code|code|script)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+    text = re.sub(r"```.*?```", "[redacted-code]", text, flags=re.DOTALL)
     return text[:limit]
 
 
@@ -1873,6 +1928,139 @@ def _sanitize_app_workspace_risk(value: Any) -> str:
 def _sanitize_app_workspace_review_status(value: Any) -> str:
     status = str(value or "unreviewed").strip().lower()
     return status if status in APP_WORKSPACE_REVIEW_STATUSES else "unreviewed"
+
+
+def _sanitize_app_artifact_type(value: Any) -> str:
+    artifact_type = str(value or "spec").strip().lower()
+    if artifact_type not in APP_ARTIFACT_TYPES:
+        raise HTTPException(422, "artifact_type must be mockup, spec, component, data_contract, review_note, or preview_stub")
+    return artifact_type
+
+
+def _sanitize_app_artifact_status(value: Any) -> str:
+    status = str(value or "draft").strip().lower()
+    if status not in APP_ARTIFACT_STATUSES:
+        raise HTTPException(422, "status must be draft, review_ready, approved_metadata, or archived")
+    return status
+
+
+def _sanitize_app_artifact_review_status(value: Any) -> str:
+    status = str(value or "unreviewed").strip().lower()
+    return status if status in APP_ARTIFACT_REVIEW_STATUSES else "unreviewed"
+
+
+def _app_artifact_safety() -> dict[str, bool | str]:
+    return {
+        "mode": "metadata_only",
+        "files_created": False,
+        "file_contents_included": False,
+        "host_paths_accepted": False,
+        "urls_included": False,
+        "raw_code_included": False,
+        "code_executed": False,
+        "packages_installed": False,
+        "apps_published": False,
+        "toolgate_called": False,
+    }
+
+
+def _workspace_or_404(workspace_id: str) -> dict[str, Any]:
+    workspace = getattr(app.state, "app_workspaces", {}).get(workspace_id)
+    if not workspace:
+        raise HTTPException(404, "app workspace not found")
+    return workspace
+
+
+def _sanitize_app_artifact_profile(
+    payload: dict[str, Any],
+    *,
+    workspace: dict[str, Any],
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    existing = existing or {}
+    agent_id_value = (
+        payload.get("created_by_agent_id")
+        or existing.get("created_by_agent_id")
+        or workspace.get("owner_agent_id")
+        or "agent_pi_operator"
+    )
+    agent_id = str(agent_id_value or "").strip()
+    team_id_value = payload.get("team_id") or existing.get("team_id") or workspace.get("team_id")
+    team_id = str(team_id_value or "").strip() or None
+    if workspace.get("team_id") and team_id != workspace.get("team_id"):
+        raise HTTPException(403, "artifact team must match the app workspace team")
+    actor = _permission_context(agent_id, team_id)
+    if workspace.get("team_id") and actor.get("team_id") != workspace.get("team_id"):
+        raise HTTPException(403, "agent is not a member of the app workspace team")
+    profile: dict[str, Any] = {
+        "created_by_agent_id": actor["agent_id"],
+        "team_id": actor["team_id"],
+    }
+    if "name" in payload:
+        name = _redact_app_workspace_text(payload.get("name"), limit=120)
+        if not name:
+            raise HTTPException(422, "name is required")
+        profile["name"] = name
+    if "artifact_type" in payload:
+        profile["artifact_type"] = _sanitize_app_artifact_type(payload.get("artifact_type"))
+    if "status" in payload:
+        profile["status"] = _sanitize_app_artifact_status(payload.get("status"))
+    if "risk_level" in payload:
+        profile["risk_level"] = _sanitize_app_workspace_risk(payload.get("risk_level"))
+    if "summary" in payload:
+        profile["summary"] = _redact_app_workspace_text(payload.get("summary"), limit=1000)
+    if "review_status" in payload:
+        profile["review_status"] = _sanitize_app_artifact_review_status(payload.get("review_status"))
+    return profile
+
+
+def _public_app_artifact(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item.get("id"),
+        "workspace_id": item.get("workspace_id"),
+        "name": _redact_app_workspace_text(item.get("name"), limit=120),
+        "artifact_type": _sanitize_app_artifact_type(item.get("artifact_type")),
+        "status": _sanitize_app_artifact_status(item.get("status")),
+        "risk_level": _sanitize_app_workspace_risk(item.get("risk_level")),
+        "summary": _redact_app_workspace_text(item.get("summary"), limit=1000),
+        "review_status": _sanitize_app_artifact_review_status(item.get("review_status")),
+        "created_by_agent_id": item.get("created_by_agent_id"),
+        "team_id": item.get("team_id"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _app_workspace_artifacts(workspace_id: str) -> list[dict[str, Any]]:
+    artifacts = [
+        _public_app_artifact(item)
+        for item in sorted(
+            getattr(app.state, "app_artifacts", {}).values(),
+            key=lambda row: row.get("updated_at") or row.get("created_at") or "",
+            reverse=True,
+        )
+        if item.get("workspace_id") == workspace_id
+    ]
+    return artifacts
+
+
+def _app_artifacts_response(workspace_id: str, *, deleted: bool | None = None) -> dict[str, Any]:
+    artifacts = _app_workspace_artifacts(workspace_id)
+    response: dict[str, Any] = {
+        "summary": {
+            "total": len(artifacts),
+            "draft": sum(1 for item in artifacts if item.get("status") == "draft"),
+            "review_ready": sum(1 for item in artifacts if item.get("status") == "review_ready"),
+            "approved_metadata": sum(1 for item in artifacts if item.get("status") == "approved_metadata"),
+            "archived": sum(1 for item in artifacts if item.get("status") == "archived"),
+            "by_type": {artifact_type: sum(1 for item in artifacts if item.get("artifact_type") == artifact_type) for artifact_type in sorted(APP_ARTIFACT_TYPES)},
+        },
+        "artifacts": artifacts,
+        "safety": _app_artifact_safety(),
+    }
+    if deleted is not None:
+        response["deleted"] = deleted
+    return response
 
 
 def _sanitize_app_workspace_profile(payload: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -5490,6 +5678,14 @@ def delete_app_workspace(workspace_id: str):
     item = getattr(app.state, "app_workspaces", {}).get(workspace_id)
     if not item:
         raise HTTPException(404, "app workspace not found")
+    artifact_ids = [
+        artifact_id
+        for artifact_id, artifact in getattr(app.state, "app_artifacts", {}).items()
+        if artifact.get("workspace_id") == workspace_id
+    ]
+    for artifact_id in artifact_ids:
+        app.state.app_artifacts.pop(artifact_id, None)
+        _delete_registry_item("app_artifact", artifact_id)
     app.state.app_workspaces.pop(workspace_id, None)
     _delete_registry_item("app_workspace", workspace_id)
     _record_activity(
@@ -5503,6 +5699,100 @@ def delete_app_workspace(workspace_id: str):
         ref_id=workspace_id,
     )
     return {"deleted": True}
+
+
+@app.get("/api/app-workspaces/{workspace_id}/artifacts")
+def list_app_workspace_artifacts(workspace_id: str):
+    _ensure_registry_seeded()
+    _workspace_or_404(workspace_id)
+    return _app_artifacts_response(workspace_id)
+
+
+@app.post("/api/app-workspaces/{workspace_id}/artifacts")
+def create_app_workspace_artifact(workspace_id: str, payload: AppArtifactInput):
+    _ensure_registry_seeded()
+    workspace = _workspace_or_404(workspace_id)
+    profile = _sanitize_app_artifact_profile(payload.model_dump(), workspace=workspace)
+    artifact_id = f"appart_{workspace_id}_{_slug(profile.get('name') or payload.name)}"
+    if artifact_id in getattr(app.state, "app_artifacts", {}):
+        artifact_id = f"{artifact_id}_{uuid.uuid4().hex[:6]}"
+    timestamp = now()
+    item = {
+        "id": artifact_id,
+        "workspace_id": workspace_id,
+        "name": profile.get("name") or "Artifact metadata",
+        "artifact_type": profile.get("artifact_type") or "spec",
+        "status": profile.get("status") or "draft",
+        "risk_level": profile.get("risk_level") or "low",
+        "summary": profile.get("summary") or "",
+        "review_status": profile.get("review_status") or "unreviewed",
+        "created_by_agent_id": profile["created_by_agent_id"],
+        "team_id": profile["team_id"],
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    app.state.app_artifacts[artifact_id] = item
+    _save_registry_item("app_artifact", item)
+    _record_activity(
+        item["created_by_agent_id"],
+        event_type="app_artifact.created",
+        status=item["status"],
+        source="AgentGate",
+        summary=f"App artifact metadata created: {item['name']}",
+        team_id=item.get("team_id"),
+        ref_type="app_artifact",
+        ref_id=artifact_id,
+    )
+    return _app_artifacts_response(workspace_id)
+
+
+@app.patch("/api/app-workspaces/{workspace_id}/artifacts/{artifact_id}")
+def update_app_workspace_artifact(workspace_id: str, artifact_id: str, payload: AppArtifactUpdateInput):
+    _ensure_registry_seeded()
+    workspace = _workspace_or_404(workspace_id)
+    item = getattr(app.state, "app_artifacts", {}).get(artifact_id)
+    if not item or item.get("workspace_id") != workspace_id:
+        raise HTTPException(404, "app artifact not found")
+    update_payload = payload.model_dump(exclude_unset=True)
+    if update_payload:
+        profile = _sanitize_app_artifact_profile(update_payload, workspace=workspace, existing=item)
+        item.update(profile)
+        item["updated_at"] = now()
+        app.state.app_artifacts[artifact_id] = item
+        _save_registry_item("app_artifact", item)
+        _record_activity(
+            item.get("created_by_agent_id"),
+            event_type="app_artifact.updated",
+            status=item.get("status") or "updated",
+            source="AgentGate",
+            summary=f"App artifact metadata updated: {item.get('name') or artifact_id}",
+            team_id=item.get("team_id"),
+            ref_type="app_artifact",
+            ref_id=artifact_id,
+        )
+    return _app_artifacts_response(workspace_id)
+
+
+@app.delete("/api/app-workspaces/{workspace_id}/artifacts/{artifact_id}")
+def delete_app_workspace_artifact(workspace_id: str, artifact_id: str):
+    _ensure_registry_seeded()
+    _workspace_or_404(workspace_id)
+    item = getattr(app.state, "app_artifacts", {}).get(artifact_id)
+    if not item or item.get("workspace_id") != workspace_id:
+        raise HTTPException(404, "app artifact not found")
+    app.state.app_artifacts.pop(artifact_id, None)
+    _delete_registry_item("app_artifact", artifact_id)
+    _record_activity(
+        item.get("created_by_agent_id"),
+        event_type="app_artifact.deleted",
+        status="deleted",
+        source="AgentGate",
+        summary=f"App artifact metadata deleted: {item.get('name') or artifact_id}",
+        team_id=item.get("team_id"),
+        ref_type="app_artifact",
+        ref_id=artifact_id,
+    )
+    return _app_artifacts_response(workspace_id, deleted=True)
 
 
 @app.get("/api/workrooms")
