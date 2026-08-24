@@ -6289,11 +6289,25 @@ def get_team(team_id: str):
 
 
 @app.get("/api/teams/{team_id}/activity")
-def get_team_activity(team_id: str, limit: int = 20):
+def get_team_activity(
+    team_id: str,
+    limit: int = 20,
+    status: str | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
+    ref_type: str | None = None,
+):
     _ensure_registry_seeded()
     if team_id not in app.state.teams:
         raise HTTPException(404, "team not found")
-    return {"activity": _list_activity(team_id=team_id, limit=limit)}
+    return _activity_lens(
+        team_id=team_id,
+        limit=limit,
+        status=status,
+        event_type=event_type,
+        source=source,
+        ref_type=ref_type,
+    )
 
 
 @app.post("/api/teams")
@@ -6316,6 +6330,16 @@ def create_team(payload: TeamInput):
     app.state.teams[team_id] = item
     _save_registry_item("team", item)
     _sync_agent_team_memberships(team_id, member_agent_ids)
+    _record_activity(
+        item.get("orchestrator_agent_id") or "agent_pi_operator",
+        event_type="team.created",
+        status="draft",
+        source="AgentGate",
+        summary=f"Team created: {item.get('name') or team_id}",
+        team_id=team_id,
+        ref_type="team",
+        ref_id=team_id,
+    )
     if item.get("tool_ids"):
         _sync_toolgate_execution_scopes()
     return _public_team(item, activity_limit=3)
@@ -6340,6 +6364,16 @@ def update_team(team_id: str, payload: dict[str, Any]):
         _sync_agent_team_memberships(team_id, item.get("member_agent_ids", []), previous_member_agent_ids)
     if "tool_ids" in payload:
         _sync_toolgate_execution_scopes()
+    _record_activity(
+        item.get("orchestrator_agent_id") or "agent_pi_operator",
+        event_type="team.updated",
+        status=item.get("status") or "updated",
+        source="AgentGate",
+        summary=f"Team updated: {item.get('name') or team_id}",
+        team_id=team_id,
+        ref_type="team",
+        ref_id=team_id,
+    )
     return _public_team(item, activity_limit=10)
 
 
@@ -6350,13 +6384,23 @@ def delete_team(team_id: str):
         raise HTTPException(422, "default team cannot be deleted")
     if team_id not in app.state.teams:
         raise HTTPException(404, "team not found")
-    app.state.teams.pop(team_id, None)
+    item = app.state.teams.pop(team_id, None) or {}
     for agent in app.state.agents.values():
         agent["team_ids"] = [item for item in agent.get("team_ids", []) if item != team_id]
         agent["updated_at"] = now()
         _save_registry_item("agent", agent)
     _delete_registry_item("team", team_id)
     _sync_toolgate_execution_scopes()
+    _record_activity(
+        item.get("orchestrator_agent_id") or "agent_pi_operator",
+        event_type="team.deleted",
+        status="deleted",
+        source="AgentGate",
+        summary=f"Team deleted: {item.get('name') or team_id}",
+        team_id=team_id,
+        ref_type="team",
+        ref_id=team_id,
+    )
     return {"deleted": True}
 
 

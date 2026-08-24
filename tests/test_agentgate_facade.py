@@ -2862,16 +2862,43 @@ def test_team_activity_rollup_uses_safe_metadata(monkeypatch, tmp_path):
         assert chat.status_code == 200
         teams = client.get("/api/teams").json()["teams"]
         team = client.get("/api/teams/team_core").json()
-        activity = client.get("/api/teams/team_core/activity").json()["activity"]
+        activity_body = client.get(
+            "/api/teams/team_core/activity",
+            params={"event_type": "chat.completed", "limit": 40},
+        ).json()
+        activity = activity_body["activity"]
+        lifecycle_team = client.post(
+            "/api/teams",
+            json={
+                "name": "Lifecycle Lens Team",
+                "purpose": "Purpose with token=abc123 and https://private.example omitted from activity.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator"],
+            },
+        ).json()
+        lifecycle_activity_body = client.get(
+            f"/api/teams/{lifecycle_team['id']}/activity",
+            params={"event_type": "team.created", "limit": 10},
+        ).json()
+        client.delete(f"/api/teams/{lifecycle_team['id']}")
 
     core_rollup = next(item for item in teams if item["id"] == "team_core")
     assert core_rollup["recent_activity"]
     assert team["recent_activity"]
     assert [item["team_id"] for item in activity]
     assert all(item["team_id"] == "team_core" for item in activity)
-    assert "chat.started" in [item["event_type"] for item in activity]
     assert "chat.completed" in [item["event_type"] for item in activity]
+    assert activity_body["summary"]["filtered_count"] >= 1
+    assert activity_body["summary"]["event_type_counts"]["chat.completed"] >= 1
+    assert activity_body["filters"] == {"event_type": "chat.completed"}
+    assert activity_body["safety"]["metadata_only"] is True
     assert "Sensitive" not in str(activity)
+    assert lifecycle_activity_body["summary"]["filtered_count"] == 1
+    assert lifecycle_activity_body["activity"][0]["event_type"] == "team.created"
+    assert lifecycle_activity_body["activity"][0]["team_id"] == lifecycle_team["id"]
+    assert lifecycle_activity_body["safety"]["metadata_only"] is True
+    assert "token=abc123" not in str(lifecycle_activity_body)
+    assert "private.example" not in str(lifecycle_activity_body)
 
 
 def test_workroom_snapshot_aggregates_safe_team_metadata(monkeypatch, tmp_path):
