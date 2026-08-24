@@ -850,6 +850,121 @@ def test_app_workspace_preview_proposals_redact_tokens_urls_paths_and_raw_code(m
     assert response.json()["safety"]["raw_code_included"] is False
 
 
+def test_app_workspace_preview_proposal_promotion_approval_queues_redacted_toolgate_request(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post(
+            "/api/app-workspaces",
+            json={"name": "Promotion Desk", "purpose": "Metadata-only promotion review."},
+        ).json()
+        created = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={
+                "name": "Dashboard Plugin token=abc123 path=/home/private/app",
+                "proposal_type": "dashboard_plugin",
+                "status": "review_ready",
+                "risk_level": "medium",
+                "summary": "Owner package review. url=https://private.example/app raw_code=print(secret)",
+            },
+        ).json()["proposals"][0]
+        response = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals/{created['id']}/promotion-approval",
+            json={
+                "target_kind": "dashboard_plugin",
+                "owner_note": "Review this package at https://private.example/app token=abc123 path=/tmp/app.py ```console.log(secret)```",
+                "requested_by_agent_id": "agent_pi_operator",
+                "requested_by_team_id": None,
+                "raw_tool_args": {"token": "abc123"},
+                "package_manifest": {"scripts": {"postinstall": "curl https://private.example"}},
+            },
+        )
+
+    assert response.status_code == 200
+    body = json.dumps(
+        {
+            "response": response.json(),
+            "toolgate_request": app.state.gates.requests[response.json()["approval"]["approval_request_id"]],
+        },
+        sort_keys=True,
+    ).lower()
+    for forbidden in [
+        "abc123",
+        "https://private.example",
+        "/home/private",
+        "/tmp/app.py",
+        "print(secret)",
+        "console.log(secret)",
+        "postinstall",
+        "\"raw_tool_args\": {",
+    ]:
+        assert forbidden not in body
+    request = app.state.gates.requests[response.json()["approval"]["approval_request_id"]]
+    proposal = response.json()["proposals"][0]
+    assert request["kind"] == "app_preview_promotion_review"
+    assert request["payload"]["subject_type"] == "app_preview_proposal"
+    assert request["payload"]["target_kind"] == "dashboard_plugin"
+    assert request["payload"]["metadata_only"] is True
+    assert "owner_note_digest" in request["payload"]
+    assert proposal["approval_request_id"] == request["id"]
+    assert proposal["approval_status"] == "pending"
+    assert proposal["approval_target_kind"] == "dashboard_plugin"
+    assert response.json()["safety"]["toolgate_approval_queued"] is True
+    assert response.json()["safety"]["toolgate_execution_called"] is False
+    assert response.json()["safety"]["packages_installed"] is False
+    assert response.json()["safety"]["apps_published"] is False
+    assert response.json()["safety"]["plugins_promoted"] is False
+    assert response.json()["safety"]["raw_tool_args_stored"] is False
+    assert not hasattr(app.state.gates, "invoked_tool")
+
+
+def test_app_workspace_preview_proposal_promotion_approval_archived_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post("/api/app-workspaces", json={"name": "Archived Promotion Desk"}).json()
+        proposal = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals",
+            json={"name": "Archived Package", "status": "archived", "proposal_type": "tool_package"},
+        ).json()["proposals"][0]
+        response = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals/{proposal['id']}/promotion-approval",
+            json={"target_kind": "tool_package", "owner_note": "please review"},
+        )
+
+    assert response.status_code == 409
+    assert "not eligible" in response.text
+    assert getattr(app.state.gates, "requests", {}) == {}
+
+
+def test_app_workspace_preview_proposal_promotion_approval_missing_workspace_or_proposal_404(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        workspace = client.post("/api/app-workspaces", json={"name": "Missing Promotion Desk"}).json()
+        missing_workspace = client.post(
+            "/api/app-workspaces/appws_missing/preview-proposals/appprop_missing/promotion-approval",
+            json={"target_kind": "static_preview"},
+        )
+        missing_proposal = client.post(
+            f"/api/app-workspaces/{workspace['id']}/preview-proposals/appprop_missing/promotion-approval",
+            json={"target_kind": "static_preview"},
+        )
+
+    assert missing_workspace.status_code == 404
+    assert missing_proposal.status_code == 404
+    assert getattr(app.state.gates, "requests", {}) == {}
+
+
 def test_agent_identity_profile_is_bounded_and_sanitized(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

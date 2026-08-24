@@ -280,6 +280,13 @@ class AppPreviewProposalUpdateInput(BaseModel):
     linked_artifact_ids: list[str] | None = None
 
 
+class AppPreviewProposalPromotionApprovalInput(BaseModel):
+    target_kind: str = "static_preview"
+    owner_note: str | None = Field(default=None, max_length=1000)
+    requested_by_agent_id: str | None = None
+    requested_by_team_id: str | None = None
+
+
 TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
     "persona-development": {
         "id": "persona-development",
@@ -1965,6 +1972,9 @@ APP_ARTIFACT_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed", 
 APP_PREVIEW_PROPOSAL_TYPES = {"static_preview", "component_stub", "dashboard_plugin", "tool_package", "review_bundle"}
 APP_PREVIEW_PROPOSAL_STATUSES = {"draft", "review_ready", "approved_metadata", "archived"}
 APP_PREVIEW_PROPOSAL_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed", "blocked", "approved_metadata"}
+APP_PREVIEW_PROMOTION_TARGET_KINDS = {"dashboard_plugin", "tool_package", "static_preview"}
+APP_PREVIEW_PROMOTION_REVIEWABLE_STATUSES = {"draft", "review_ready", "approved_metadata"}
+APP_PREVIEW_PROMOTION_REVIEWABLE_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed", "approved_metadata"}
 
 
 def _redact_app_workspace_text(value: Any, *, limit: int) -> str:
@@ -2027,6 +2037,13 @@ def _sanitize_app_preview_proposal_type(value: Any) -> str:
     return proposal_type
 
 
+def _sanitize_app_preview_promotion_target_kind(value: Any) -> str:
+    target_kind = str(value or "static_preview").strip().lower()
+    if target_kind not in APP_PREVIEW_PROMOTION_TARGET_KINDS:
+        raise HTTPException(422, "target_kind must be dashboard_plugin, tool_package, or static_preview")
+    return target_kind
+
+
 def _sanitize_app_preview_proposal_status(value: Any) -> str:
     status = str(value or "draft").strip().lower()
     if status not in APP_PREVIEW_PROPOSAL_STATUSES:
@@ -2070,6 +2087,21 @@ def _app_preview_proposal_safety() -> dict[str, bool | str]:
         "plugins_promoted": False,
         "toolgate_called": False,
     }
+
+
+def _app_preview_proposal_promotion_safety() -> dict[str, bool | str]:
+    safety = _app_preview_proposal_safety()
+    safety.update(
+        {
+            "toolgate_called": True,
+            "toolgate_approval_queued": True,
+            "toolgate_execution_called": False,
+            "raw_tool_args_stored": False,
+            "package_manifest_stored": False,
+            "credentials_stored": False,
+        }
+    )
+    return safety
 
 
 def _workspace_or_404(workspace_id: str) -> dict[str, Any]:
@@ -2228,7 +2260,7 @@ def _sanitize_app_preview_proposal_profile(
 
 
 def _public_app_preview_proposal(item: dict[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         "id": item.get("id"),
         "workspace_id": item.get("workspace_id"),
         "name": _redact_app_workspace_text(item.get("name"), limit=120),
@@ -2243,6 +2275,12 @@ def _public_app_preview_proposal(item: dict[str, Any]) -> dict[str, Any]:
         "created_at": item.get("created_at"),
         "updated_at": item.get("updated_at"),
     }
+    if item.get("approval_request_id"):
+        result["approval_request_id"] = _safe_text(item.get("approval_request_id"), limit=120)
+        result["approval_status"] = _safe_text(item.get("approval_status") or "pending", limit=40)
+        result["approval_target_kind"] = _sanitize_app_preview_promotion_target_kind(item.get("approval_target_kind"))
+        result["approval_requested_at"] = item.get("approval_requested_at")
+    return result
 
 
 def _app_workspace_preview_proposals(workspace_id: str) -> list[dict[str, Any]]:
@@ -2274,6 +2312,76 @@ def _app_preview_proposals_response(workspace_id: str, *, deleted: bool | None =
     if deleted is not None:
         response["deleted"] = deleted
     return response
+
+
+def _create_app_preview_promotion_approval_request(
+    item: dict[str, Any],
+    *,
+    workspace: dict[str, Any],
+    payload: AppPreviewProposalPromotionApprovalInput,
+) -> dict[str, Any]:
+    status = _sanitize_app_preview_proposal_status(item.get("status"))
+    review_status = _sanitize_app_preview_proposal_review_status(item.get("review_status"))
+    if status not in APP_PREVIEW_PROMOTION_REVIEWABLE_STATUSES or review_status not in APP_PREVIEW_PROMOTION_REVIEWABLE_REVIEW_STATUSES:
+        raise HTTPException(409, "app preview proposal is not eligible for promotion approval review")
+    existing_request_id = item.get("approval_request_id")
+    if existing_request_id:
+        request = app.state.gates.request_status(str(existing_request_id))
+        if request and str(request.get("status") or "pending") == "pending":
+            return request
+    target_kind = _sanitize_app_preview_promotion_target_kind(payload.target_kind)
+    actor = _permission_context(
+        _safe_text(payload.requested_by_agent_id, limit=120) or item.get("created_by_agent_id") or workspace.get("owner_agent_id") or "agent_pi_operator",
+        _safe_text(payload.requested_by_team_id, limit=120) or item.get("team_id") or workspace.get("team_id"),
+    )
+    owner_note = _redact_app_workspace_text(payload.owner_note, limit=600)
+    request_payload = {
+        "subject_type": "app_preview_proposal",
+        "subject_id": item["id"],
+        "workspace_id": workspace["id"],
+        "action": "review_preview_package_promotion",
+        "target_kind": target_kind,
+        "proposal_type": _sanitize_app_preview_proposal_type(item.get("proposal_type")),
+        "risk_level": _sanitize_app_workspace_risk(item.get("risk_level")),
+        "requested_by_agent_id": actor["agent_id"],
+        "requested_by_team_id": actor.get("team_id"),
+        "proposal_summary_digest": _job_prompt_digest(item.get("summary") or ""),
+        "owner_note_digest": _job_prompt_digest(owner_note),
+        "metadata_only": True,
+        "no_install_publish_promote_or_execution": True,
+    }
+    request = app.state.gates.create_admin_request(
+        kind="app_preview_promotion_review",
+        title=f"Review app preview promotion: {_redact_app_workspace_text(item.get('name') or item['id'], limit=120)}",
+        details=(
+            "Owner review requested for a metadata-only AgentGate app preview/package promotion proposal. "
+            f"Target kind: {target_kind}. "
+            f"Proposal summary: {_redact_app_workspace_text(item.get('summary') or '', limit=400)}. "
+            f"Owner note: {owner_note or 'none'}. "
+            "No install, publish, build, package promotion, tool execution, raw tool arguments, code, URLs, host paths, manifests, or credentials were sent."
+        ),
+        payload=request_payload,
+        severity="warning" if item.get("risk_level") != "high" else "critical",
+    )
+    item["approval_request_id"] = request.get("id")
+    item["approval_status"] = str(request.get("status") or "pending")
+    item["approval_target_kind"] = target_kind
+    item["approval_requested_at"] = now()
+    item["review_status"] = "needs_review"
+    item["updated_at"] = now()
+    app.state.app_preview_proposals[item["id"]] = item
+    _save_registry_item("app_preview_proposal", item)
+    _record_activity(
+        actor["agent_id"],
+        event_type="app_preview_proposal.promotion_approval_requested",
+        status="pending",
+        source="ToolGate",
+        summary=f"App preview/package promotion queued for owner approval: {item.get('name') or item['id']}",
+        team_id=actor.get("team_id"),
+        ref_type="app_preview_proposal",
+        ref_id=item["id"],
+    )
+    return request
 
 
 def _sanitize_app_workspace_profile(payload: dict[str, Any], *, existing: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -6093,6 +6201,30 @@ def update_app_workspace_preview_proposal(workspace_id: str, proposal_id: str, p
             ref_id=proposal_id,
         )
     return _app_preview_proposals_response(workspace_id)
+
+
+@app.post("/api/app-workspaces/{workspace_id}/preview-proposals/{proposal_id}/promotion-approval")
+def request_app_workspace_preview_proposal_promotion_approval(
+    workspace_id: str,
+    proposal_id: str,
+    payload: AppPreviewProposalPromotionApprovalInput,
+):
+    _ensure_registry_seeded()
+    workspace = _workspace_or_404(workspace_id)
+    item = getattr(app.state, "app_preview_proposals", {}).get(proposal_id)
+    if not item or item.get("workspace_id") != workspace_id:
+        raise HTTPException(404, "app preview proposal not found")
+    request = _create_app_preview_promotion_approval_request(item, workspace=workspace, payload=payload)
+    response = _app_preview_proposals_response(workspace_id)
+    response["approval"] = {
+        "approval_request_id": _safe_text(request.get("id"), limit=120),
+        "approval_status": _safe_text(request.get("status") or "pending", limit=40),
+        "target_kind": _sanitize_app_preview_promotion_target_kind(item.get("approval_target_kind")),
+        "requested_at": item.get("approval_requested_at"),
+        "metadata_only": True,
+    }
+    response["safety"] = _app_preview_proposal_promotion_safety()
+    return response
 
 
 @app.delete("/api/app-workspaces/{workspace_id}/preview-proposals/{proposal_id}")
