@@ -2543,14 +2543,27 @@ def test_agent_activity_records_safe_chat_and_job_metadata(monkeypatch, tmp_path
         assert created.status_code == 200
         ran = client.post(f"/api/jobs/{created.json()['id']}/run")
         assert ran.status_code == 200
-        activity = client.get("/api/agents/agent_pi_operator/activity").json()["activity"]
+        activity_response = client.get("/api/agents/agent_pi_operator/activity").json()
+        activity = activity_response["activity"]
+        filtered_response = client.get(
+            "/api/agents/agent_pi_operator/activity?status=ok&event_type=job.completed&limit=5"
+        ).json()
 
     event_types = [item["event_type"] for item in activity]
     assert "chat.started" in event_types
     assert "chat.completed" in event_types
     assert "job.created" in event_types
     assert "job.completed" in event_types
-    assert "Sensitive" not in str(activity)
+    assert activity_response["summary"]["total_recent"] >= 4
+    assert activity_response["summary"]["status_counts"]["ok"] >= 1
+    assert activity_response["summary"]["event_type_counts"]["job.completed"] == 1
+    assert "Pi adapter" in activity_response["available_filters"]["sources"]
+    assert activity_response["safety"]["metadata_only"] is True
+    assert filtered_response["summary"]["filtered_count"] == 1
+    assert filtered_response["activity"][0]["event_type"] == "job.completed"
+    assert filtered_response["filters"] == {"status": "ok", "event_type": "job.completed"}
+    assert "Sensitive" not in str(activity_response)
+    assert "Sensitive" not in str(filtered_response)
     assert all("summary" in item and "created_at" in item for item in activity)
 
 

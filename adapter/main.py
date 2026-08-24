@@ -1304,6 +1304,91 @@ def _list_activity(
     return [dict(row) for row in rows]
 
 
+def _activity_lens(
+    *,
+    agent_id: str | None = None,
+    team_id: str | None = None,
+    limit: int = 20,
+    status: str | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
+    ref_type: str | None = None,
+) -> dict[str, Any]:
+    base_limit = 100
+    rows = _list_activity(agent_id=agent_id, team_id=team_id, limit=base_limit)
+    filters = {
+        "status": _safe_text(status, limit=80),
+        "event_type": _safe_text(event_type, limit=120),
+        "source": _safe_text(source, limit=120),
+        "ref_type": _safe_text(ref_type, limit=80),
+    }
+    filtered = [
+        item
+        for item in rows
+        if (not filters["status"] or item.get("status") == filters["status"])
+        and (not filters["event_type"] or item.get("event_type") == filters["event_type"])
+        and (not filters["source"] or item.get("source") == filters["source"])
+        and (not filters["ref_type"] or item.get("ref_type") == filters["ref_type"])
+    ]
+    bounded_limit = min(max(limit, 1), 100)
+
+    def counts_for(field: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in rows:
+            key = str(item.get(field) or "none")
+            counts[key] = counts.get(key, 0) + 1
+        return dict(sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:12])
+
+    recent_refs: list[dict[str, Any]] = []
+    seen_refs: set[tuple[str, str]] = set()
+    for item in filtered:
+        ref_key = (str(item.get("ref_type") or ""), str(item.get("ref_id") or ""))
+        if not ref_key[0] or not ref_key[1] or ref_key in seen_refs:
+            continue
+        seen_refs.add(ref_key)
+        recent_refs.append({
+            "ref_type": ref_key[0],
+            "ref_id": ref_key[1],
+            "latest_event_type": item.get("event_type") or "",
+            "latest_status": item.get("status") or "",
+            "latest_at": item.get("created_at") or "",
+        })
+        if len(recent_refs) >= 8:
+            break
+
+    active_filters = {key: value for key, value in filters.items() if value}
+    return {
+        "activity": filtered[:bounded_limit],
+        "summary": {
+            "total_recent": len(rows),
+            "filtered_count": len(filtered),
+            "returned_count": min(len(filtered), bounded_limit),
+            "status_counts": counts_for("status"),
+            "event_type_counts": counts_for("event_type"),
+            "source_counts": counts_for("source"),
+            "ref_type_counts": counts_for("ref_type"),
+            "recent_refs": recent_refs,
+        },
+        "filters": active_filters,
+        "available_filters": {
+            "statuses": sorted({str(item.get("status") or "none") for item in rows}),
+            "event_types": sorted({str(item.get("event_type") or "none") for item in rows}),
+            "sources": sorted({str(item.get("source") or "none") for item in rows}),
+            "ref_types": sorted({str(item.get("ref_type") or "none") for item in rows if item.get("ref_type")}),
+        },
+        "safety": {
+            "metadata_only": True,
+            "excludes": [
+                "raw prompts",
+                "memory contents",
+                "tool arguments",
+                "credentials",
+                "provider URLs",
+            ],
+        },
+    }
+
+
 def _redact_audit_text(value: Any, *, limit: int = 180) -> str:
     text = " ".join(str(value or "").split())
     for pattern, replacement in (
@@ -5924,11 +6009,25 @@ def get_agent(agent_id: str):
 
 
 @app.get("/api/agents/{agent_id}/activity")
-def get_agent_activity(agent_id: str, limit: int = 20):
+def get_agent_activity(
+    agent_id: str,
+    limit: int = 20,
+    status: str | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
+    ref_type: str | None = None,
+):
     _ensure_registry_seeded()
     if agent_id not in app.state.agents:
         raise HTTPException(404, "agent not found")
-    return {"activity": _list_activity(agent_id, limit=limit)}
+    return _activity_lens(
+        agent_id=agent_id,
+        limit=limit,
+        status=status,
+        event_type=event_type,
+        source=source,
+        ref_type=ref_type,
+    )
 
 
 @app.post("/api/agents")
