@@ -1025,7 +1025,7 @@ def _team_orchestration_readiness(item: dict[str, Any]) -> dict[str, Any]:
         risk_notes.append("toolgate_boundary_not_required")
     return {
         "score": score,
-        "ready": score >= 75 and not {"orchestrator", "orchestrator_member", "toolgate_boundary"} & set(missing),
+        "ready": score >= 75 and not {"orchestrator", "orchestrator_member", "policy_review", "toolgate_boundary"} & set(missing),
         "missing_fields": missing,
         "risk_notes": risk_notes,
         "review_status": policy.get("review_status") or "unreviewed",
@@ -1037,6 +1037,41 @@ def _team_orchestration_readiness(item: dict[str, Any]) -> dict[str, Any]:
         "member_count": len(member_ids),
         "shared_access_count": len(_clean_list(item.get("memory_scopes"))) + len(_clean_list(item.get("tool_ids"))) + len(_clean_list(item.get("skill_ids"))),
     }
+
+
+def _group_execution_policy_block(team_id: str | None, team: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not team_id or not isinstance(team, dict):
+        return {
+            "reason": "team_policy_review_required",
+            "message": "Group execution requires an owner-reviewed team policy before Pi can run multiple agents.",
+            "team_id": team_id,
+            "review_status": "missing",
+            "approval_mode": "missing",
+            "missing_fields": ["team"],
+        }
+    readiness = _team_orchestration_readiness(team)
+    missing = set(_clean_list(readiness.get("missing_fields")))
+    required_missing = [
+        field
+        for field in ("orchestrator", "orchestrator_member", "policy_review", "toolgate_boundary")
+        if field in missing
+    ]
+    if required_missing:
+        return {
+            "reason": "team_policy_review_required",
+            "message": "Group execution requires an owner-reviewed team policy with ToolGate as the approval boundary.",
+            "team_id": team_id,
+            "review_status": readiness.get("review_status") or "unreviewed",
+            "approval_mode": readiness.get("approval_mode") or "toolgate_required",
+            "missing_fields": required_missing,
+        }
+    return None
+
+
+def _require_group_execution_policy(team_id: str | None, team: dict[str, Any] | None) -> None:
+    block = _group_execution_policy_block(team_id, team)
+    if block:
+        raise HTTPException(409, block)
 
 
 def _public_team(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str, Any]:
@@ -5495,6 +5530,7 @@ async def _run_group_round(
     team_id = payload.team_id if payload.team_id is not None else session.get("team_id")
     team = app.state.teams.get(team_id) if team_id else None
     has_team_policy = isinstance(team, dict)
+    _require_group_execution_policy(team_id, team if has_team_policy else None)
     policy = _safe_orchestrator_policy(team.get("orchestrator_policy") if has_team_policy else {})
     ordered_participants = list(participant_ids)
     turn_order = policy.get("turn_order") if has_team_policy else "roster"
@@ -5698,7 +5734,8 @@ async def group_round_stream(session_id: str, payload: GroupRoundInput):
             try:
                 await _run_group_round(session_id, payload, emit=emit)
             except HTTPException as exc:
-                await queue.put(PiEvent("run.failed", {"message": str(exc.detail)[:1000]}))
+                detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)[:1000]}
+                await queue.put(PiEvent("run.failed", detail))
             except Exception as exc:
                 await queue.put(PiEvent("run.failed", {"message": _safe_error_summary(exc)}))
             finally:
@@ -5727,6 +5764,7 @@ async def _run_group_sequence(session_id: str, payload: GroupSequenceInput, emit
         raise HTTPException(409, "group sequence requires at least two participants")
     team_id = payload.team_id if payload.team_id is not None else session.get("team_id")
     team = app.state.teams.get(team_id) if team_id else None
+    _require_group_execution_policy(team_id, team if isinstance(team, dict) else None)
     policy = _safe_orchestrator_policy(team.get("orchestrator_policy") if isinstance(team, dict) else {})
     policy_rounds = int(policy.get("max_sequence_rounds") or 3)
     effective_rounds = min(payload.rounds, policy_rounds)
@@ -5795,7 +5833,8 @@ async def group_sequence_stream(session_id: str, payload: GroupSequenceInput):
             try:
                 await _run_group_sequence(session_id, payload, emit=emit)
             except HTTPException as exc:
-                await queue.put(PiEvent("run.failed", {"message": str(exc.detail)[:1000]}))
+                detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)[:1000]}
+                await queue.put(PiEvent("run.failed", detail))
             except Exception as exc:
                 await queue.put(PiEvent("run.failed", {"message": _safe_error_summary(exc)}))
             finally:

@@ -3707,6 +3707,10 @@ def test_group_round_runs_each_roster_speaker_once(monkeypatch, tmp_path):
                 "orchestrator_agent_id": "agent_pi_operator",
                 "member_agent_ids": ["agent_pi_operator", teammate["id"]],
                 "memory_scopes": ["project-context"],
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                },
             },
         ).json()
         session = client.post(
@@ -3746,6 +3750,50 @@ def test_group_round_runs_each_roster_speaker_once(monkeypatch, tmp_path):
     assert "Everyone give one short view" not in str(activity)
 
 
+def test_group_round_requires_owner_reviewed_team_policy(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = MultiSpeakerPi()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={"name": "Group Teammate", "purpose": "Participate only after team policy review."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Unreviewed Group Team",
+                "purpose": "Should not run before review.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Blocked Group Round",
+                "agent_id": "agent_pi_operator",
+                "team_id": team["id"],
+                "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        result = client.post(
+            f"/api/sessions/{session['id']}/group-round",
+            json={"input": "private marker should not be echoed in the block."},
+        )
+
+    assert result.status_code == 409
+    detail = result.json()["detail"]
+    assert detail["reason"] == "team_policy_review_required"
+    assert detail["team_id"] == team["id"]
+    assert detail["review_status"] == "unreviewed"
+    assert "policy_review" in detail["missing_fields"]
+    assert app.state.pi.calls == []
+    assert "private marker" not in str(detail)
+
+
 def test_group_round_stream_emits_live_speaker_events(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
@@ -3764,6 +3812,10 @@ def test_group_round_stream_emits_live_speaker_events(monkeypatch, tmp_path):
                 "purpose": "Test live group round events.",
                 "orchestrator_agent_id": "agent_pi_operator",
                 "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                },
             },
         ).json()
         session = client.post(
@@ -3813,6 +3865,10 @@ def test_group_sequence_runs_bounded_rounds_for_each_speaker(monkeypatch, tmp_pa
                 "purpose": "Test bounded group sequences.",
                 "orchestrator_agent_id": "agent_pi_operator",
                 "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                },
             },
         ).json()
         session = client.post(
@@ -3851,6 +3907,53 @@ def test_group_sequence_runs_bounded_rounds_for_each_speaker(monkeypatch, tmp_pa
     assert "group.sequence_completed" in [item["event_type"] for item in activity]
 
 
+def test_group_sequence_requires_toolgate_approval_boundary(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = MultiSpeakerPi()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={"name": "Group Teammate", "purpose": "Participate only with ToolGate boundary."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Metadata Boundary Team",
+                "purpose": "Should not run under metadata-only approval.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                "orchestrator_policy": {
+                    "approval_mode": "metadata_only",
+                    "review_status": "owner_reviewed",
+                },
+            },
+        ).json()
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Blocked Group Sequence",
+                "agent_id": "agent_pi_operator",
+                "team_id": team["id"],
+                "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        result = client.post(
+            f"/api/sessions/{session['id']}/group-sequence",
+            json={"input": "Discuss the private plan.", "rounds": 2},
+        )
+
+    assert result.status_code == 409
+    detail = result.json()["detail"]
+    assert detail["reason"] == "team_policy_review_required"
+    assert detail["approval_mode"] == "metadata_only"
+    assert "toolgate_boundary" in detail["missing_fields"]
+    assert app.state.pi.calls == []
+    assert "private plan" not in str(detail).lower()
+
+
 def test_group_sequence_obeys_team_turn_policy(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
@@ -3874,6 +3977,8 @@ def test_group_sequence_obeys_team_turn_policy(monkeypatch, tmp_path):
                 "orchestrator_agent_id": "agent_pi_operator",
                 "member_agent_ids": ["agent_pi_operator", teammate_a["id"], teammate_b["id"]],
                 "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
                     "turn_order": "reverse_roster",
                     "max_sequence_rounds": 1,
                     "max_speakers_per_round": 2,
@@ -3926,6 +4031,10 @@ def test_group_sequence_stream_emits_sequence_metadata(monkeypatch, tmp_path):
                 "purpose": "Test live group sequence events.",
                 "orchestrator_agent_id": "agent_pi_operator",
                 "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+                "orchestrator_policy": {
+                    "approval_mode": "toolgate_required",
+                    "review_status": "owner_reviewed",
+                },
             },
         ).json()
         session = client.post(
