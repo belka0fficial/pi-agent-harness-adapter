@@ -158,6 +158,15 @@ class ModelRouteSaveInput(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+class AuxiliaryModelRouteInput(BaseModel):
+    provider: str = Field(default="", max_length=120)
+    model: str = Field(default="", max_length=160)
+    enabled: bool = False
+    purpose: str = Field(default="", max_length=500)
+    risk_policy: str = "low_risk_only"
+    owner_review_status: str = "unreviewed"
+
+
 class AgentInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     title: str = Field(default="Agent", max_length=120)
@@ -371,6 +380,7 @@ app.state.app_workspaces = {}
 app.state.app_artifacts = {}
 app.state.app_preview_proposals = {}
 app.state.model_route_proposals = {}
+app.state.auxiliary_model_routes = {}
 app.state.notification_channels = {}
 app.state.notification_deliveries = {}
 app.state.character_sources = {}
@@ -479,6 +489,7 @@ def _load_registry() -> None:
     app.state.app_artifacts = {}
     app.state.app_preview_proposals = {}
     app.state.model_route_proposals = {}
+    app.state.auxiliary_model_routes = {}
     app.state.notification_channels = {}
     app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
@@ -506,6 +517,8 @@ def _load_registry() -> None:
             app.state.app_preview_proposals[row["id"]] = item
         elif row["kind"] == "model_route_proposal":
             app.state.model_route_proposals[row["id"]] = item
+        elif row["kind"] == "auxiliary_model_route":
+            app.state.auxiliary_model_routes[row["id"]] = item
         elif row["kind"] == "notification_channel":
             app.state.notification_channels[row["id"]] = item
         elif row["kind"] == "notification_delivery":
@@ -538,7 +551,7 @@ def _normalize_agent_model_defaults() -> None:
 
 
 def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "notification_channel", "notification_delivery", "memory_candidate", "character_source"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "model_route_proposal", "auxiliary_model_route", "notification_channel", "notification_delivery", "memory_candidate", "character_source"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute(
@@ -554,7 +567,7 @@ def _save_registry_item(kind: str, item: dict[str, Any]) -> None:
 
 
 def _delete_registry_item(kind: str, item_id: str) -> None:
-    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "notification_delivery", "memory_candidate", "character_source"}:
+    if kind not in {"agent", "team", "job", "task", "tool_draft", "app_workspace", "app_artifact", "app_preview_proposal", "notification_channel", "notification_delivery", "memory_candidate", "character_source", "auxiliary_model_route"}:
         raise ValueError(f"unsupported registry kind: {kind}")
     with _registry() as conn:
         conn.execute("DELETE FROM registry_items WHERE kind = ? AND id = ?", (kind, item_id))
@@ -5437,6 +5450,139 @@ def _provider_risk(provider_id: str) -> dict[str, str]:
     }
 
 
+AUXILIARY_MODEL_TASKS = {
+    "summary": {
+        "id": "summary",
+        "label": "Summaries",
+        "description": "Short titles, chat/task summaries, and owner-visible digest text.",
+        "allowed_policy": "low_risk_only",
+    },
+    "classification": {
+        "id": "classification",
+        "label": "Classification",
+        "description": "Low-risk tagging, routing labels, priority labels, and status hints.",
+        "allowed_policy": "low_risk_only",
+    },
+    "character_draft": {
+        "id": "character_draft",
+        "label": "Character drafts",
+        "description": "Character/profile metadata drafts before owner review.",
+        "allowed_policy": "low_risk_only",
+    },
+    "ui_copy": {
+        "id": "ui_copy",
+        "label": "UI helper copy",
+        "description": "Low-risk interface text, empty states, and explanatory labels.",
+        "allowed_policy": "low_risk_only",
+    },
+    "research_notes": {
+        "id": "research_notes",
+        "label": "Research notes",
+        "description": "Public-source research note cleanup without private memory or secrets.",
+        "allowed_policy": "low_risk_only",
+    },
+}
+
+AUXILIARY_MODEL_POLICIES = {"disabled", "low_risk_only", "owner_reviewed"}
+AUXILIARY_MODEL_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed"}
+
+
+def _safe_auxiliary_model_route(task_id: str, value: Any | None = None) -> dict[str, Any]:
+    task = AUXILIARY_MODEL_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(404, "auxiliary model task not found")
+    source = value if isinstance(value, dict) else {}
+    provider = _safe_text(source.get("provider"), limit=120)
+    model = _safe_text(source.get("model"), limit=160)
+    risk_policy = str(source.get("risk_policy") or task["allowed_policy"])
+    if risk_policy not in AUXILIARY_MODEL_POLICIES:
+        risk_policy = task["allowed_policy"]
+    review_status = str(source.get("owner_review_status") or "unreviewed")
+    if review_status not in AUXILIARY_MODEL_REVIEW_STATUSES:
+        review_status = "unreviewed"
+    enabled = bool(source.get("enabled")) and bool(provider and model)
+    if risk_policy == "disabled":
+        enabled = False
+    purpose = _redact_profile_metadata_text(source.get("purpose") or "", limit=500)
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "label": task["label"],
+        "description": task["description"],
+        "provider": provider,
+        "model": model,
+        "enabled": enabled,
+        "purpose": purpose,
+        "risk_policy": risk_policy,
+        "owner_review_status": review_status,
+        "updated_at": source.get("updated_at"),
+    }
+
+
+def _public_auxiliary_model_route(task_id: str, value: Any | None = None) -> dict[str, Any]:
+    row = _safe_auxiliary_model_route(task_id, value)
+    probe = (
+        _safe_route_probe("auxiliary", row["provider"], row["model"], optional=True)
+        if row.get("provider") or row.get("model")
+        else _empty_route_probe("auxiliary", optional=True)
+    )
+    blocked: list[str] = []
+    if row["enabled"] and probe.get("status") != "ready":
+        blocked.append(f"route is {probe.get('status')}")
+    if row["enabled"] and row["risk_policy"] != "owner_reviewed" and probe.get("risk") == "external":
+        blocked.append("external helper route still limited to low-risk metadata tasks")
+    return {
+        **row,
+        "route": {
+            "provider": row["provider"],
+            "model": row["model"],
+            "status": probe.get("status"),
+            "model_visible": bool(probe.get("model_visible")),
+            "provider_status": probe.get("provider_status"),
+            "risk": probe.get("risk"),
+            "policy": probe.get("policy"),
+            "note": probe.get("note"),
+        },
+        "ready": bool(row["enabled"] and probe.get("status") == "ready"),
+        "blocked_reasons": blocked[:6],
+        "safety": {
+            "metadata_only": True,
+            "execution_enabled": False,
+            "automatic_prompt_routing": False,
+            "secrets_included": False,
+            "raw_prompts_included": False,
+            "memory_contents_included": False,
+            "tool_arguments_included": False,
+            "provider_urls_included": False,
+        },
+    }
+
+
+def _auxiliary_routes_payload() -> dict[str, Any]:
+    _ensure_registry_seeded()
+    routes = [
+        _public_auxiliary_model_route(task_id, app.state.auxiliary_model_routes.get(task_id))
+        for task_id in AUXILIARY_MODEL_TASKS
+    ]
+    return {
+        "routes": routes,
+        "summary": {
+            "total": len(routes),
+            "enabled": sum(1 for item in routes if item.get("enabled")),
+            "ready": sum(1 for item in routes if item.get("ready")),
+            "external": sum(1 for item in routes if (item.get("route") or {}).get("risk") == "external"),
+            "needs_review": sum(1 for item in routes if item.get("owner_review_status") != "owner_reviewed"),
+        },
+        "safety": {
+            "metadata_only": True,
+            "execution_enabled": False,
+            "automatic_prompt_routing": False,
+            "allowed_tasks": list(AUXILIARY_MODEL_TASKS),
+            "excludes": ["provider URLs", "credentials", "raw prompts", "memory contents", "tool arguments"],
+        },
+    }
+
+
 def _safe_gateway_model(row: dict[str, Any]) -> dict[str, Any] | None:
     model_id = _safe_text(row.get("id") or row.get("name"), limit=160)
     if not model_id:
@@ -5582,6 +5728,32 @@ def model_providers():
     return {"providers": providers}
 
 
+@app.get("/api/model/auxiliary-routes")
+def list_auxiliary_model_routes():
+    return _auxiliary_routes_payload()
+
+
+@app.patch("/api/model/auxiliary-routes/{task_id}")
+def update_auxiliary_model_route(task_id: str, payload: AuxiliaryModelRouteInput):
+    _ensure_registry_seeded()
+    if task_id not in AUXILIARY_MODEL_TASKS:
+        raise HTTPException(404, "auxiliary model task not found")
+    item = _safe_auxiliary_model_route(task_id, payload.model_dump())
+    item["updated_at"] = now()
+    app.state.auxiliary_model_routes[task_id] = item
+    _save_registry_item("auxiliary_model_route", item)
+    _record_activity(
+        "agent_pi_operator",
+        event_type="model.auxiliary_route_updated",
+        status="enabled" if item.get("enabled") else "metadata_only",
+        source="AgentGate Models",
+        summary=f"Auxiliary model route updated: {item.get('label') or task_id}",
+        ref_type="model_auxiliary_route",
+        ref_id=task_id,
+    )
+    return _public_auxiliary_model_route(task_id, item)
+
+
 @app.post("/api/model/route-check")
 def model_route_check(payload: ModelRouteProbeInput):
     return _model_route_probe(payload.provider, payload.model)
@@ -5651,7 +5823,7 @@ def _safe_route_probe(label: str, provider: str, model: str, *, optional: bool =
         return item
     try:
         item = _model_route_probe(provider, model)
-    except HTTPException:
+    except Exception:
         item = _empty_route_probe(label, optional=optional)
         item.update({
             "provider": _safe_text(provider, limit=120),

@@ -313,6 +313,7 @@ def reset_state():
     app.state.app_workspaces = {}
     app.state.app_artifacts = {}
     app.state.app_preview_proposals = {}
+    app.state.auxiliary_model_routes = {}
     app.state.notification_channels = {}
     app.state.notification_deliveries = {}
     app.state.memory_candidates = {}
@@ -2578,6 +2579,51 @@ def test_chat_uses_selected_agent_model_defaults_when_payload_omits_model():
     assert response.status_code == 200
     assert pi.options["provider"] == "openai-codex"
     assert pi.options["model"] == "gpt-5.6-luna"
+
+
+def test_auxiliary_model_routes_are_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        initial = client.get("/api/model/auxiliary-routes").json()
+        saved = client.patch(
+            "/api/model/auxiliary-routes/summary",
+            json={
+                "provider": "openai-codex",
+                "model": "gpt-5.6-luna",
+                "enabled": True,
+                "purpose": "Summaries only; do not store token=abc123 or https://private.example/raw.",
+                "risk_policy": "low_risk_only",
+                "owner_review_status": "needs_review",
+            },
+        )
+        missing = client.patch(
+            "/api/model/auxiliary-routes/unknown",
+            json={"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        )
+        listed = client.get("/api/model/auxiliary-routes").json()
+
+    assert initial["summary"]["total"] >= 4
+    assert initial["safety"]["metadata_only"] is True
+    assert saved.status_code == 200
+    saved_body = saved.json()
+    assert saved_body["task_id"] == "summary"
+    assert saved_body["safety"]["metadata_only"] is True
+    assert saved_body["safety"]["execution_enabled"] is False
+    assert saved_body["safety"]["automatic_prompt_routing"] is False
+    assert saved_body["route"]["provider"] == "openai-codex"
+    assert saved_body["route"]["model"] == "gpt-5.6-luna"
+    assert "token=abc123" not in str(saved_body)
+    assert "private.example" not in str(saved_body)
+    assert missing.status_code == 404
+    summary_route = next(item for item in listed["routes"] if item["task_id"] == "summary")
+    assert summary_route["provider"] == "openai-codex"
+    assert listed["summary"]["enabled"] >= 1
+    assert listed["safety"]["execution_enabled"] is False
+    assert "token=abc123" not in str(listed)
+    assert "private.example" not in str(listed)
 
 
 def test_agent_activity_records_safe_chat_and_job_metadata(monkeypatch, tmp_path):
