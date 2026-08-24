@@ -2905,6 +2905,7 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
         )
         response = client.get("/api/workstream?limit=50")
         job_detail = client.get(f"/api/workstream/refs/job/{job.json()['id']}")
+        task_detail = client.get(f"/api/workstream/refs/task/{task.json()['id']}")
         memory_detail = client.get("/api/workstream/refs/memory_candidate/memcand_workstream")
         ghost_detail = client.get("/api/workstream/refs/job/job_missing_from_runtime")
         agent_detail = client.get("/api/workstream/refs/agent/agent_pi_operator")
@@ -2912,6 +2913,7 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
 
     assert response.status_code == 200
     assert job_detail.status_code == 200
+    assert task_detail.status_code == 200
     assert memory_detail.status_code == 200
     assert ghost_detail.status_code == 200
     assert agent_detail.status_code == 200
@@ -2941,6 +2943,7 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     ]:
         assert forbidden not in joined
         assert forbidden not in job_detail.text.lower()
+        assert forbidden not in task_detail.text.lower()
         assert forbidden not in memory_detail.text.lower()
         assert forbidden not in agent_detail.text.lower()
         assert forbidden not in team_detail.text.lower()
@@ -2948,27 +2951,45 @@ def test_workstream_merges_safe_metadata_without_private_payloads(monkeypatch, t
     assert job_body["ref_type"] == "job"
     assert job_body["detail"]["name"] == "Morning proof"
     assert job_body["detail"]["failure_policy"]["automatic_retries"] is False
+    assert job_body["insight"]["schema"] == "agentgate.workstream_ref_insight.v1"
+    assert job_body["insight"]["safety"]["metadata_only"] is True
+    assert job_body["insight"]["safety"]["actions_executed"] is False
+    assert job_body["insight"]["safety"]["jobs_started"] is False
+    assert job_body["insight"]["signal_counts"]["runs"] == 0
+    assert "Open Automations" in job_body["insight"]["owner_next_step"]
     assert job_body["safety"]["mode"] == "metadata_only"
+    task_body = task_detail.json()
+    assert task_body["ref_type"] == "task"
+    assert task_body["detail"]["title"] == "Safe task title"
+    assert "task-secret" not in json.dumps(task_body).lower()
+    assert task_body["insight"]["safety"]["actions_executed"] is False
+    assert "Open Tasks" in task_body["insight"]["owner_next_step"]
     memory_body = memory_detail.json()
     assert memory_body["ref_type"] == "memory_candidate"
     assert memory_body["detail"]["memory_type"] == "preference"
     assert memory_body["detail"]["confidence"] == "high"
+    assert memory_body["insight"]["safety"]["memory_written"] is False
+    assert "Open Memory review" in memory_body["insight"]["owner_next_step"]
     assert "text" not in memory_body["detail"]
     assert memory_body["safety"]["mode"] == "metadata_only"
     ghost_body = ghost_detail.json()
     assert ghost_body["ref_type"] == "job"
     assert ghost_body["detail"]["available"] is False
     assert ghost_body["detail"]["state"] == "audit_only"
+    assert ghost_body["insight"]["available"] is False
+    assert "audit-only" in ghost_body["insight"]["badges"]
     assert ghost_body["events"][0]["ref_id"] == "job_missing_from_runtime"
     agent_body = agent_detail.json()
     assert agent_body["ref_type"] == "agent"
     assert agent_body["detail"]["id"] == "agent_pi_operator"
     assert "profile_readiness" in agent_body["detail"]
+    assert "Open the Agent profile" in agent_body["insight"]["owner_next_step"]
     assert agent_body["safety"]["mode"] == "metadata_only"
     team_body = team_detail.json()
     assert team_body["ref_type"] == "team"
     assert team_body["detail"]["id"] == "team_core"
     assert "orchestration_readiness" in team_body["detail"]
+    assert "Open the Team workroom" in team_body["insight"]["owner_next_step"]
     assert team_body["safety"]["mode"] == "metadata_only"
 
 

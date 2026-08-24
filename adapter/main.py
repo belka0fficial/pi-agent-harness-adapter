@@ -1848,6 +1848,138 @@ def _safe_memory_candidate_detail(candidate_id: str) -> dict[str, Any]:
     }
 
 
+def _safe_workstream_task_detail(task_id: str) -> dict[str, Any]:
+    item = app.state.tasks.get(task_id)
+    if not item:
+        raise HTTPException(404, "workstream reference not found")
+    public = _public_task(item)
+    safe_history = [
+        _activity_audit_event(row)
+        for row in _list_activity(limit=20)
+        if row.get("ref_type") == "task" and row.get("ref_id") == task_id
+    ][:8]
+    return {
+        **public,
+        "title": _redact_handoff_text(public.get("title") or "Task", limit=160),
+        "summary": _redact_handoff_text(public.get("summary") or "", limit=260),
+        "checkpoint_note": _redact_handoff_text(public.get("checkpoint_note") or "", limit=220),
+        "execution_summary": _redact_handoff_text(public.get("execution_summary") or "", limit=260),
+        "execution_history": [],
+        "history": safe_history,
+    }
+
+
+def _workstream_ref_insight(ref_type: str, ref_id: str, detail: dict[str, Any], events: list[dict[str, Any]], activity: list[dict[str, Any]]) -> dict[str, Any]:
+    available = detail.get("available") is not False
+    status = _safe_summary(detail.get("status") or detail.get("state") or detail.get("review_status") or detail.get("approval_status") or "metadata", limit=80)
+    if ref_type == "job":
+        owner_next_step = "Open Automations to review schedule, approval state, run history, or stop a running job."
+        review_state = detail.get("approval_status") or detail.get("approval_policy") or detail.get("status")
+        signal_counts = {
+            "runs": int(detail.get("runs") or 0),
+            "history": len(detail.get("history") or []),
+            "required_tools": len(detail.get("required_tool_ids") or []),
+            "required_memory": len(detail.get("required_memory_scopes") or []),
+        }
+    elif ref_type == "task":
+        owner_next_step = "Open Tasks to review checkpoint state, dependencies, or the scoped task room."
+        review_state = detail.get("checkpoint_status") or detail.get("status")
+        signal_counts = {
+            "dependencies": len(detail.get("depends_on") or detail.get("dependency_ids") or []),
+            "events": len(events),
+            "activity": len(activity),
+        }
+    elif ref_type == "session":
+        owner_next_step = "Open Chat to continue the room, inspect visible messages, fork, or stop an active run."
+        review_state = detail.get("mode") or detail.get("status")
+        signal_counts = {
+            "messages": int(detail.get("message_count") or 0),
+            "participants": int(detail.get("participant_count") or 0),
+        }
+    elif ref_type == "agent":
+        readiness = detail.get("profile_readiness") if isinstance(detail.get("profile_readiness"), dict) else {}
+        owner_next_step = "Open the Agent profile to review soul, model route, access grants, and readiness."
+        review_state = readiness.get("status") or detail.get("status")
+        signal_counts = {
+            "tools": len(detail.get("tool_ids") or []),
+            "skills": len(detail.get("skill_ids") or []),
+            "memory_scopes": len(detail.get("memory_scopes") or []),
+            "readiness_score": int(readiness.get("score") or 0),
+        }
+    elif ref_type == "team":
+        readiness = detail.get("orchestration_readiness") if isinstance(detail.get("orchestration_readiness"), dict) else {}
+        owner_next_step = "Open the Team workroom to review roster, orchestrator policy, handoffs, and group turns."
+        review_state = readiness.get("status") or detail.get("status")
+        signal_counts = {
+            "members": len(detail.get("member_agent_ids") or []),
+            "tools": len(detail.get("tool_ids") or []),
+            "skills": len(detail.get("skill_ids") or []),
+            "readiness_score": int(readiness.get("score") or 0),
+        }
+    elif ref_type == "tool_draft":
+        owner_next_step = "Open Tools to review the draft metadata and queue ToolGate owner review."
+        review_state = detail.get("review_state") or detail.get("status")
+        signal_counts = {
+            "events": len(events),
+            "activity": len(activity),
+        }
+    elif ref_type == "memory_candidate":
+        owner_next_step = "Open Memory review to approve, reject, or inspect source metadata before any MemoryGate write."
+        review_state = detail.get("status") or "pending"
+        signal_counts = {
+            "tags": int(detail.get("tag_count") or 0),
+            "events": len(events),
+            "activity": len(activity),
+        }
+    elif ref_type.startswith("app_"):
+        owner_next_step = "Open Apps to review workspace, artifact, proposal, approval, archive, or delete metadata."
+        review_state = detail.get("review_status") or detail.get("approval_status") or detail.get("status")
+        signal_counts = {
+            "events": len(events),
+            "activity": len(activity),
+        }
+    else:
+        owner_next_step = "Open the owning AgentGate screen to review this reference."
+        review_state = detail.get("status") or status
+        signal_counts = {
+            "events": len(events),
+            "activity": len(activity),
+        }
+    badges = [
+        item
+        for item in [
+            status,
+            _safe_summary(review_state or "", limit=60),
+            "audit-only" if not available else "live",
+        ]
+        if item
+    ][:6]
+    return {
+        "schema": "agentgate.workstream_ref_insight.v1",
+        "available": bool(available),
+        "status": status,
+        "review_state": _safe_summary(review_state or status, limit=80),
+        "owner_next_step": _redact_audit_text(owner_next_step, limit=220),
+        "badges": badges,
+        "signal_counts": signal_counts,
+        "recent_event_count": len(events),
+        "recent_activity_count": len(activity),
+        "safety": {
+            "metadata_only": True,
+            "actions_executed": False,
+            "approvals_decided": False,
+            "jobs_started": False,
+            "memory_written": False,
+            "tools_installed": False,
+            "raw_prompts_included": False,
+            "memory_contents_included": False,
+            "tool_arguments_included": False,
+            "credentials_included": False,
+            "provider_urls_included": False,
+        },
+    }
+
+
 def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
     clean_type = _safe_summary(ref_type, limit=80)
     clean_id = _safe_summary(ref_id, limit=160)
@@ -1917,7 +2049,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
                 "summary": "Reference is present in audit history but not in current runtime state.",
             }
         else:
-            detail = _public_task(app.state.tasks[clean_id])
+            detail = _safe_workstream_task_detail(clean_id)
     elif clean_type == "session":
         if clean_id not in app.state.sessions:
             detail = {
@@ -1988,6 +2120,7 @@ def _safe_workstream_ref_detail(ref_type: str, ref_id: str) -> dict[str, Any]:
         "ref_type": clean_type,
         "ref_id": clean_id,
         "detail": detail,
+        "insight": _workstream_ref_insight(clean_type, clean_id, detail, events, activity),
         "activity": activity,
         "events": events,
         "safety": {
