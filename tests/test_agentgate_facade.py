@@ -667,6 +667,103 @@ def test_agent_profile_readiness_public_projection_redacts_provenance(monkeypatc
     assert "secret" not in combined
 
 
+def test_sidecar_readiness_is_metadata_only_agent_projection(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/agents",
+            json={
+                "name": "Sidecar Probe",
+                "title": "Expression agent",
+                "purpose": "Check sidecar readiness metadata.",
+                "soul": "Never expose private prompt text token=soul-secret.",
+                "voice": "Brief and calm.",
+                "personality": ["steady"],
+                "appearance": {"style": "simple profile card"},
+                "primary_provider": "openai-codex",
+                "primary_model": "gpt-test",
+                "memory_scopes": ["project-context"],
+                "expression_profile": {
+                    "sidecar_mode": "local_sidecar",
+                    "voice_sidecar": "https://provider.example/private-voice",
+                    "avatar_sidecar": "asset=/home/private/avatar.glb",
+                    "read_aloud": "owner_triggered",
+                    "call_mode": "push_to_talk",
+                    "mic_policy": "push_to_talk",
+                    "camera_policy": "owner_started",
+                    "expression_analysis": "metadata_only",
+                    "idle_animation": "subtle",
+                    "safety_notes": "token=abc123 path=/home/private/sample.wav",
+                },
+                "profile_provenance": {
+                    "review_status": "needs_review",
+                    "source_confidence": "low",
+                    "usage_policy": "needs_review",
+                    "asset_review_status": "needs_review",
+                    "source_labels": ["https://private.example/profile", "api_key=abc"],
+                    "notes_summary": "Private notes with bearer abc123.",
+                },
+            },
+        ).json()
+        response = client.get("/api/sidecars/readiness")
+
+    assert response.status_code == 200
+    body = response.json()
+    row = next(item for item in body["agents"] if item["agent_id"] == created["id"])
+    assert body["summary"]["total_agents"] >= 1
+    assert body["summary"]["enabled_candidates"] >= 1
+    assert body["summary"]["review_needed"] >= 1
+    assert body["summary"]["blocked"] >= 1
+    assert body["safety"] == {
+        "mode": "metadata_only",
+        "media_included": False,
+        "assets_included": False,
+        "prompts_included": False,
+        "memory_contents_included": False,
+        "raw_tool_args_included": False,
+        "provider_urls_included": False,
+        "host_paths_included": False,
+    }
+    assert row == {
+        "agent_id": created["id"],
+        "name": "Sidecar Probe",
+        "status": "draft",
+        "sidecar_mode": "local_sidecar",
+        "read_aloud": "owner_triggered",
+        "call_mode": "push_to_talk",
+        "mic_policy": "push_to_talk",
+        "camera_policy": "owner_started",
+        "expression_analysis": "metadata_only",
+        "idle_animation": "subtle",
+        "readiness": row["readiness"],
+        "risk_notes": row["risk_notes"],
+        "review_needed": True,
+    }
+    assert row["readiness"]["review_status"] == "needs_review"
+    assert "source_review_pending" in row["risk_notes"]
+    assert "expression_sidecar_review_pending" in row["risk_notes"]
+    joined = json.dumps(body).lower()
+    for forbidden in [
+        "soul-secret",
+        "abc123",
+        "https://provider.example",
+        "https://private.example",
+        "/home/private",
+        "private prompt",
+        "source_labels",
+        "notes_summary",
+        "voice_sidecar",
+        "avatar_sidecar",
+        "safety_notes",
+        "memory_scopes",
+        "primary_model",
+    ]:
+        assert forbidden not in joined
+
+
 def test_agent_tool_grants_sync_to_native_toolgate_scopes(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

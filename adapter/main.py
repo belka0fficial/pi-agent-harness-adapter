@@ -689,6 +689,42 @@ def _public_agent(item: dict[str, Any], *, activity_limit: int = 3) -> dict[str,
     }
 
 
+def _sidecar_readiness_row(item: dict[str, Any]) -> dict[str, Any]:
+    expression = _safe_expression_profile(item.get("expression_profile"))
+    provenance = _safe_profile_provenance(item.get("profile_provenance"))
+    readiness = _agent_profile_readiness({
+        **item,
+        "expression_profile": expression,
+        "profile_provenance": provenance,
+    })
+    review_needed = (
+        not readiness["ready"]
+        or bool(readiness["risk_notes"])
+        or readiness["review_status"] != "owner_reviewed"
+        or expression.get("sidecar_mode") == "external_review_required"
+    )
+    return {
+        "agent_id": item.get("id"),
+        "name": _redact_profile_metadata_text(item.get("name") or item.get("id"), limit=80),
+        "status": _redact_profile_metadata_text(item.get("status") or "draft", limit=40),
+        "sidecar_mode": expression.get("sidecar_mode") or "disabled",
+        "read_aloud": expression.get("read_aloud") or "disabled",
+        "call_mode": expression.get("call_mode") or "disabled",
+        "mic_policy": expression.get("mic_policy") or "disabled",
+        "camera_policy": expression.get("camera_policy") or "disabled",
+        "expression_analysis": expression.get("expression_analysis") or "disabled",
+        "idle_animation": expression.get("idle_animation") or "disabled",
+        "readiness": {
+            "score": readiness["score"],
+            "ready": readiness["ready"],
+            "review_status": readiness["review_status"],
+            "missing_fields": readiness["missing_fields"],
+        },
+        "risk_notes": readiness["risk_notes"],
+        "review_needed": review_needed,
+    }
+
+
 def _safe_orchestrator_policy(value: Any) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     result: dict[str, Any] = {}
@@ -4874,6 +4910,38 @@ def list_agents():
     _ensure_registry_seeded()
     _normalize_agent_model_defaults()
     return {"agents": [_public_agent(item, activity_limit=3) for item in app.state.agents.values()]}
+
+
+@app.get("/api/sidecars/readiness")
+def sidecar_readiness():
+    _ensure_registry_seeded()
+    _normalize_agent_model_defaults()
+    rows = [
+        _sidecar_readiness_row(item)
+        for item in sorted(app.state.agents.values(), key=lambda row: row.get("id", ""))
+    ]
+    enabled_modes = {"metadata_only", "local_sidecar", "external_review_required"}
+    return {
+        "summary": {
+            "total_agents": len(rows),
+            "enabled_candidates": sum(1 for row in rows if row["sidecar_mode"] in enabled_modes),
+            "ready": sum(1 for row in rows if row["readiness"]["ready"]),
+            "review_needed": sum(1 for row in rows if row["review_needed"]),
+            "blocked": sum(1 for row in rows if "asset_review_pending" in row["risk_notes"]),
+            "risk_notes": sum(len(row["risk_notes"]) for row in rows),
+        },
+        "agents": rows,
+        "safety": {
+            "mode": "metadata_only",
+            "media_included": False,
+            "assets_included": False,
+            "prompts_included": False,
+            "memory_contents_included": False,
+            "raw_tool_args_included": False,
+            "provider_urls_included": False,
+            "host_paths_included": False,
+        },
+    }
 
 
 @app.get("/api/registry/export")
