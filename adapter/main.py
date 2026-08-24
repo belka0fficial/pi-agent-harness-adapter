@@ -6666,8 +6666,25 @@ def _append_job_run_history(item: dict[str, Any], result: dict[str, Any]) -> Non
     item["run_history"] = [run_record, *list(item.get("run_history") or [])][:12]
 
 
+def _public_job_result(result: dict[str, Any] | None) -> dict[str, Any]:
+    if not result:
+        return {}
+    public: dict[str, Any] = {
+        "status": result.get("status", "never"),
+        "output_summary": result.get("output_summary") or "",
+        "output_chars": int(result.get("output_chars") or 0),
+    }
+    if result.get("job_id"):
+        public["job_id"] = result.get("job_id")
+    if result.get("completed_at"):
+        public["completed_at"] = result.get("completed_at")
+    if result.get("error"):
+        public["error"] = result.get("error")
+    return public
+
+
 def _public_job(item: dict[str, Any]) -> dict[str, Any]:
-    result = item.get("last_result") or {}
+    result = _public_job_result(item.get("last_result") or {})
     failure_policy = _sanitize_failure_policy(item.get("failure_policy"))
     active_run = getattr(app.state, "active_job_runs", {}).get(item.get("id")) or {}
     status = "running" if active_run else "pending_approval" if item.get("approval_status") == "pending" else "paused" if item.get("paused") else "active"
@@ -6690,9 +6707,11 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
         "last_status": result.get("status", "never"),
         "last_run": item.get("last_run_at") or "—",
         "last_result": result,
-        "output": result.get("output_summary") or "No runs yet",
         "history": item.get("history", "------------"),
-        "run_history": item.get("run_history", []),
+        "run_history": [
+            _public_job_result(record)
+            for record in list(item.get("run_history") or [])[:12]
+        ],
         "agent_id": item.get("agent_id"),
         "team_id": item.get("team_id"),
         "deliver": item.get("deliver", "local"),

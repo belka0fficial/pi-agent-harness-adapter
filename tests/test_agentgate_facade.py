@@ -7060,8 +7060,52 @@ def test_automation_run_persists_safe_result_summary_only():
     assert "prompt" not in ran["run_history"][0]
     assert facade_job["last_result"]["status"] == "ok"
     assert facade_job["last_result"]["output_summary"] == "context-aware"
+    assert "output" not in facade_job
     assert "output" not in facade_job["last_result"]
     assert "prompt" not in facade_job["last_result"]
+
+
+def test_public_automation_projection_drops_legacy_raw_output_fields():
+    reset_state()
+
+    with TestClient(app) as client:
+        app.state.jobs = {
+            "job-legacy-output": {
+                "id": "job-legacy-output",
+                "name": "Legacy Output Probe",
+                "schedule": "0 9 * * *",
+                "prompt": "private prompt token=hidden",
+                "last_result": {
+                    "job_id": "job-legacy-output",
+                    "status": "ok",
+                    "output": "raw automation output token=hidden https://private.invalid",
+                    "output_summary": "safe summary",
+                    "output_chars": 61,
+                    "completed_at": "2026-08-24T09:00:00+00:00",
+                },
+                "run_history": [
+                    {
+                        "status": "ok",
+                        "output": "raw historical output password=hidden",
+                        "output_summary": "historical summary",
+                        "output_chars": 37,
+                        "completed_at": "2026-08-24T09:00:00+00:00",
+                    }
+                ],
+            }
+        }
+        job = client.get("/api/jobs").json()["jobs"][0]
+
+    combined = json.dumps(job).lower()
+    assert "output" not in job
+    assert "output" not in job["last_result"]
+    assert "prompt" not in job["last_result"]
+    assert "output" not in job["run_history"][0]
+    assert "token=hidden" not in combined
+    assert "password=hidden" not in combined
+    assert "https://private.invalid" not in combined
+    assert job["last_result"]["output_summary"] == "safe summary"
+    assert job["run_history"][0]["output_summary"] == "historical summary"
 
 
 def test_automation_active_run_can_be_stopped_without_exposing_pi_run_id():
