@@ -3374,6 +3374,7 @@ def test_group_sequence_runs_bounded_rounds_for_each_speaker(monkeypatch, tmp_pa
         "status": "ok",
         "round_count": 2,
         "requested_rounds": 2,
+        "max_sequence_rounds": 3,
         "speaker_count": 2,
     }
     assert len(payload["rounds"]) == 2
@@ -3385,6 +3386,63 @@ def test_group_sequence_runs_bounded_rounds_for_each_speaker(monkeypatch, tmp_pa
     assert all("round_index" in response for item in payload["rounds"] for response in item["responses"])
     assert "Discuss the release plan safely" not in str(activity)
     assert "group.sequence_completed" in [item["event_type"] for item in activity]
+
+
+def test_group_sequence_obeys_team_turn_policy(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = MultiSpeakerPi()
+
+    with TestClient(app) as client:
+        teammate_a = client.post(
+            "/api/agents",
+            json={"name": "Group Teammate A", "purpose": "Participate in bounded group sequences."},
+        ).json()
+        teammate_b = client.post(
+            "/api/agents",
+            json={"name": "Group Teammate B", "purpose": "Participate in bounded group sequences."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Policy Sequence Team",
+                "purpose": "Test policy-bounded group sequences.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate_a["id"], teammate_b["id"]],
+                "orchestrator_policy": {
+                    "turn_order": "reverse_roster",
+                    "max_sequence_rounds": 1,
+                    "max_speakers_per_round": 2,
+                },
+            },
+        ).json()
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Policy Group Sequence",
+                "agent_id": "agent_pi_operator",
+                "team_id": team["id"],
+                "participant_agent_ids": ["agent_pi_operator", teammate_a["id"], teammate_b["id"]],
+            },
+        ).json()
+        result = client.post(
+            f"/api/sessions/{session['id']}/group-sequence",
+            json={"input": "Discuss the bounded policy safely.", "rounds": 3, "max_speakers": 12},
+        )
+
+    assert result.status_code == 200
+    payload = result.json()
+    assert team["orchestrator_policy"]["turn_order"] == "reverse_roster"
+    assert payload["sequence"]["round_count"] == 1
+    assert payload["sequence"]["requested_rounds"] == 3
+    assert payload["sequence"]["max_sequence_rounds"] == 1
+    assert payload["sequence"]["speaker_count"] == 2
+    assert payload["rounds"][0]["requested_speaker_count"] == 3
+    assert payload["rounds"][0]["max_speakers_per_round"] == 2
+    assert payload["rounds"][0]["turn_order"] == "reverse_roster"
+    assert [item["agent_id"] for item in payload["rounds"][0]["responses"]] == [teammate_b["id"], teammate_a["id"]]
+    assert len(app.state.pi.calls) == 2
 
 
 def test_group_sequence_stream_emits_sequence_metadata(monkeypatch, tmp_path):

@@ -611,12 +611,14 @@ TEAM_ORCHESTRATOR_POLICY_FIELDS = {
     "handoff_mode": 40,
     "approval_mode": 40,
     "review_status": 40,
+    "turn_order": 40,
     "escalation_summary": 600,
 }
 
 TEAM_POLICY_REVIEW_STATUSES = {"unreviewed", "needs_review", "owner_reviewed"}
 TEAM_HANDOFF_MODES = {"manual", "owner_confirmed", "bounded_auto"}
 TEAM_APPROVAL_MODES = {"toolgate_required", "owner_checkpoint", "metadata_only"}
+TEAM_TURN_ORDERS = {"roster", "orchestrator_first", "reverse_roster"}
 
 
 def _safe_text(value: Any, *, limit: int) -> str:
@@ -837,6 +839,8 @@ def _safe_orchestrator_policy(value: Any) -> dict[str, Any]:
             text = "toolgate_required"
         if key == "review_status" and text not in TEAM_POLICY_REVIEW_STATUSES:
             text = "unreviewed"
+        if key == "turn_order" and text not in TEAM_TURN_ORDERS:
+            text = "roster"
         if text:
             result[key] = text
     max_parallel = source.get("max_parallel_tasks")
@@ -845,9 +849,22 @@ def _safe_orchestrator_policy(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         max_parallel_int = 1
     result["max_parallel_tasks"] = min(max(max_parallel_int, 1), 8)
+    max_sequence_rounds = source.get("max_sequence_rounds")
+    try:
+        max_sequence_rounds_int = int(max_sequence_rounds)
+    except (TypeError, ValueError):
+        max_sequence_rounds_int = 3
+    result["max_sequence_rounds"] = min(max(max_sequence_rounds_int, 1), 3)
+    max_speakers = source.get("max_speakers_per_round")
+    try:
+        max_speakers_int = int(max_speakers)
+    except (TypeError, ValueError):
+        max_speakers_int = 6
+    result["max_speakers_per_round"] = min(max(max_speakers_int, 2), 12)
     result.setdefault("handoff_mode", "manual")
     result.setdefault("approval_mode", "toolgate_required")
     result.setdefault("review_status", "unreviewed")
+    result.setdefault("turn_order", "roster")
     return result
 
 
@@ -907,6 +924,9 @@ def _team_orchestration_readiness(item: dict[str, Any]) -> dict[str, Any]:
         "review_status": policy.get("review_status") or "unreviewed",
         "handoff_mode": policy.get("handoff_mode") or "manual",
         "approval_mode": policy.get("approval_mode") or "toolgate_required",
+        "turn_order": policy.get("turn_order") or "roster",
+        "max_sequence_rounds": policy.get("max_sequence_rounds") or 3,
+        "max_speakers_per_round": policy.get("max_speakers_per_round") or 6,
         "member_count": len(member_ids),
         "shared_access_count": len(_clean_list(item.get("memory_scopes"))) + len(_clean_list(item.get("tool_ids"))) + len(_clean_list(item.get("skill_ids"))),
     }
@@ -4833,7 +4853,23 @@ async def _run_group_round(
     if len(participant_ids) < 2:
         raise HTTPException(409, "group round requires at least two participants")
     team_id = payload.team_id if payload.team_id is not None else session.get("team_id")
-    speakers = participant_ids[: payload.max_speakers]
+    team = app.state.teams.get(team_id) if team_id else None
+    has_team_policy = isinstance(team, dict)
+    policy = _safe_orchestrator_policy(team.get("orchestrator_policy") if has_team_policy else {})
+    ordered_participants = list(participant_ids)
+    turn_order = policy.get("turn_order") if has_team_policy else "roster"
+    orchestrator_id = str(team.get("orchestrator_agent_id") or "").strip() if has_team_policy else ""
+    if turn_order == "orchestrator_first" and orchestrator_id in ordered_participants:
+        ordered_participants = [orchestrator_id, *[agent_id for agent_id in ordered_participants if agent_id != orchestrator_id]]
+    elif turn_order == "reverse_roster":
+        ordered_participants = list(reversed(ordered_participants))
+    speaker_policy_limit = (
+        int(policy.get("max_speakers_per_round") or payload.max_speakers)
+        if has_team_policy
+        else payload.max_speakers
+    )
+    max_speakers = min(payload.max_speakers, speaker_policy_limit)
+    speakers = ordered_participants[:max_speakers]
     actors = [_permission_context(agent_id, team_id) for agent_id in speakers]
     if team_id:
         for actor in actors:
@@ -4862,6 +4898,9 @@ async def _run_group_round(
             "session_id": session_id,
             "team_id": team_id,
             "speaker_count": len(actors),
+            "requested_speaker_count": min(payload.max_speakers, len(participant_ids)),
+            "max_speakers_per_round": speaker_policy_limit,
+            "turn_order": turn_order,
             "round_index": round_index,
             "round_count": round_count,
         }))
@@ -4989,6 +5028,9 @@ async def _run_group_round(
         "round": {
             "status": "ok" if all(item["status"] == "ok" for item in results) else "partial_failed",
             "speaker_count": len(results),
+            "requested_speaker_count": min(payload.max_speakers, len(participant_ids)),
+            "max_speakers_per_round": speaker_policy_limit,
+            "turn_order": turn_order,
             "round_index": round_index,
             "round_count": round_count,
             "responses": results,
@@ -5043,18 +5085,25 @@ async def _run_group_sequence(session_id: str, payload: GroupSequenceInput, emit
     participant_ids = session.get("participant_agent_ids") or [session.get("agent_id") or "agent_pi_operator"]
     if len(participant_ids) < 2:
         raise HTTPException(409, "group sequence requires at least two participants")
+    team_id = payload.team_id if payload.team_id is not None else session.get("team_id")
+    team = app.state.teams.get(team_id) if team_id else None
+    policy = _safe_orchestrator_policy(team.get("orchestrator_policy") if isinstance(team, dict) else {})
+    policy_rounds = int(policy.get("max_sequence_rounds") or 3)
+    effective_rounds = min(payload.rounds, policy_rounds)
     if emit:
         await emit(PiEvent("group.sequence.started", {
             "session_id": session_id,
-            "team_id": payload.team_id if payload.team_id is not None else session.get("team_id"),
-            "round_count": payload.rounds,
+            "team_id": team_id,
+            "round_count": effective_rounds,
+            "requested_rounds": payload.rounds,
+            "max_sequence_rounds": policy_rounds,
             "max_speakers": payload.max_speakers,
         }))
     rounds: list[dict[str, Any]] = []
-    for index in range(payload.rounds):
+    for index in range(effective_rounds):
         round_payload = payload.model_copy(
             update={
-                "input": f"{payload.input}\n\nRound {index + 1} of {payload.rounds}: answer once, briefly, then wait for the next participant.",
+                "input": f"{payload.input}\n\nRound {index + 1} of {effective_rounds}: answer once, briefly, then wait for the next participant.",
             }
         )
         result = await _run_group_round(
@@ -5062,15 +5111,16 @@ async def _run_group_sequence(session_id: str, payload: GroupSequenceInput, emit
             round_payload,
             emit=emit,
             round_index=index + 1,
-            round_count=payload.rounds,
+            round_count=effective_rounds,
         )
         rounds.append(result["round"])
         if result["round"].get("status") != "ok":
             break
     sequence = {
-        "status": "ok" if all(item.get("status") == "ok" for item in rounds) and len(rounds) == payload.rounds else "partial_failed",
+        "status": "ok" if all(item.get("status") == "ok" for item in rounds) and len(rounds) == effective_rounds else "partial_failed",
         "round_count": len(rounds),
         "requested_rounds": payload.rounds,
+        "max_sequence_rounds": policy_rounds,
         "speaker_count": rounds[-1].get("speaker_count", 0) if rounds else 0,
     }
     _record_activity(
