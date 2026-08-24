@@ -195,6 +195,15 @@ class TaskInput(BaseModel):
     source_message_id: str | None = None
 
 
+class WorkroomHandoffInput(BaseModel):
+    objective: str = Field(min_length=1, max_length=1200)
+    target_agent_ids: list[str] = Field(default_factory=list)
+    max_tasks: int = Field(default=3, ge=1, le=8)
+    priority: str = "medium"
+    risk: str = "medium"
+    owner_checkpoint: bool = True
+
+
 TEAM_TEMPLATES: dict[str, dict[str, Any]] = {
     "persona-development": {
         "id": "persona-development",
@@ -1022,6 +1031,20 @@ def _redact_audit_text(value: Any, *, limit: int = 180) -> str:
         (r"https?://\S+", "[redacted-url]"),
         (r"(?i)\b(raw\s+)?(tool\s+)?arguments?\b", "redacted arguments"),
         (r"(?i)\b(prompt|memory contents?|transcript)\b", "redacted content"),
+    ):
+        text = re.sub(pattern, replacement, text)
+    return _safe_summary(text, limit=limit)
+
+
+def _redact_handoff_text(value: Any, *, limit: int = 220) -> str:
+    text = " ".join(str(value or "").replace("\x00", "").split())
+    for pattern, replacement in (
+        (r"https?://\S+", "[private-link]"),
+        (r"(?i)\b(api[_-]?key|token|password|secret|bearer)\s*[:=]\s*\S+", "[private-detail]"),
+        (r"(?i)\bbearer\s+\S+", "[private-detail]"),
+        (r"(?i)\b(api[_-]?key|token|password|secret|bearer)\b", "private-detail"),
+        (r"(?i)\b(raw\s+)?(tool\s+)?arguments?\b", "private action details"),
+        (r"(?i)\b(prompt|memory contents?|transcript)\b", "private content"),
     ):
         text = re.sub(pattern, replacement, text)
     return _safe_summary(text, limit=limit)
@@ -5097,6 +5120,118 @@ def create_workroom_session(team_id: str, payload: dict[str, Any] | None = None)
         ref_id=session_id,
     )
     return _public_session(item)
+
+
+@app.post("/api/workrooms/{team_id}/handoff-plan")
+def create_workroom_handoff_plan(team_id: str, payload: WorkroomHandoffInput):
+    _ensure_registry_seeded()
+    team = app.state.teams.get(team_id)
+    if not team:
+        raise HTTPException(404, "team not found")
+    member_ids = [
+        str(agent_id)
+        for agent_id in team.get("member_agent_ids") or []
+        if str(agent_id) in app.state.agents
+    ]
+    selected_ids = [
+        str(agent_id).strip()
+        for agent_id in payload.target_agent_ids
+        if str(agent_id).strip()
+    ]
+    if selected_ids:
+        invalid = [agent_id for agent_id in selected_ids if agent_id not in member_ids]
+        if invalid:
+            raise HTTPException(403, "handoff targets must be members of the team")
+        target_ids = selected_ids
+    else:
+        target_ids = member_ids
+    if not target_ids:
+        raise HTTPException(409, "team has no available member agents")
+    policy = _safe_orchestrator_policy(team.get("orchestrator_policy"))
+    policy_limit = int(policy.get("max_parallel_tasks") or 1)
+    task_limit = min(
+        max(1, int(payload.max_tasks or 1)),
+        max(1, policy_limit),
+        len(target_ids),
+        8,
+    )
+    objective_label = _redact_handoff_text(payload.objective, limit=90) or "Team handoff"
+    objective_digest = _job_prompt_digest(payload.objective)
+    priority = _sanitize_priority(payload.priority)
+    risk = _sanitize_risk(payload.risk)
+    created: list[dict[str, Any]] = []
+    for agent_id in target_ids[:task_limit]:
+        actor = _permission_context(agent_id, team_id)
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
+        agent_name = app.state.agents.get(agent_id, {}).get("name") or agent_id
+        item = {
+            "id": task_id,
+            "title": _safe_text(f"Handoff: {objective_label}", limit=160),
+            "summary": _safe_text(
+                "Metadata-only workroom handoff shell. "
+                f"Target agent: {_redact_handoff_text(agent_name, limit=80)}. "
+                f"Objective digest: {objective_digest[:16]}. "
+                f"Handoff mode: {policy.get('handoff_mode') or 'manual'}. "
+                f"Approval mode: {policy.get('approval_mode') or 'toolgate_required'}.",
+                limit=1200,
+            ),
+            "agent_id": actor["agent_id"],
+            "team_id": actor["team_id"],
+            "status": "queued",
+            "priority": priority,
+            "risk": risk,
+            "required_tool_ids": [],
+            "required_memory_scopes": [],
+            "depends_on_task_ids": [],
+            "owner_checkpoint": True,
+            "checkpoint_status": "pending",
+            "checkpoint_note": "Owner checkpoint required before any task chat or tool execution.",
+            "execution_summary": "",
+            "source": "AgentGate workroom handoff",
+            "source_session_id": None,
+            "source_message_id": None,
+            "session_id": None,
+            "created_at": now(),
+            "updated_at": now(),
+            "completed_at": None,
+            "handoff_digest": objective_digest,
+        }
+        app.state.tasks[task_id] = item
+        _save_registry_item("task", item)
+        _record_activity(
+            actor["agent_id"],
+            event_type="workroom.handoff_task_created",
+            status="queued",
+            source="AgentGate",
+            summary=f"Workroom handoff task queued for {agent_name}",
+            team_id=team_id,
+            ref_type="task",
+            ref_id=task_id,
+        )
+        created.append(_public_task(item))
+    _record_activity(
+        team.get("orchestrator_agent_id") or target_ids[0],
+        event_type="workroom.handoff_planned",
+        status="metadata_only",
+        source="AgentGate",
+        summary=f"Workroom handoff planned {len(created)} task shells",
+        team_id=team_id,
+        ref_type="team",
+        ref_id=team_id,
+    )
+    return {
+        "status": "queued",
+        "metadata_only": True,
+        "team_id": team_id,
+        "objective_digest": objective_digest,
+        "task_count": len(created),
+        "policy": {
+            "handoff_mode": policy.get("handoff_mode") or "manual",
+            "approval_mode": policy.get("approval_mode") or "toolgate_required",
+            "max_parallel_tasks": policy_limit,
+        },
+        "tasks": created,
+    }
 
 
 @app.get("/api/tasks")

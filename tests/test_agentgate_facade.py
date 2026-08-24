@@ -2103,6 +2103,73 @@ def test_workroom_session_creation_validates_team_membership(monkeypatch, tmp_pa
     assert "workroom.session_created" in [item["event_type"] for item in activity]
 
 
+def test_workroom_handoff_plan_creates_checkpointed_safe_task_shells(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        helper = client.post(
+            "/api/agents",
+            json={
+                "name": "Helper Agent",
+                "purpose": "Assist with team handoffs.",
+            },
+        ).json()
+        client.patch(
+            "/api/teams/team_core",
+            json={
+                "member_agent_ids": ["agent_pi_operator", helper["id"]],
+                "orchestrator_policy": {
+                    "handoff_mode": "bounded_auto",
+                    "approval_mode": "owner_checkpoint",
+                    "max_parallel_tasks": 2,
+                },
+            },
+        )
+        plan = client.post(
+            "/api/workrooms/team_core/handoff-plan",
+            json={
+                "objective": "Coordinate api_key=abc123 via https://private.invalid with raw tool arguments",
+                "max_tasks": 4,
+                "risk": "medium",
+                "priority": "high",
+                "owner_checkpoint": False,
+            },
+        ).json()
+        outsider = client.post(
+            "/api/agents",
+            json={"name": "Outsider", "purpose": "Not a team member."},
+        ).json()
+        rejected = client.post(
+            "/api/workrooms/team_core/handoff-plan",
+            json={
+                "objective": "bad target",
+                "target_agent_ids": [outsider["id"]],
+            },
+        )
+        workroom = client.get("/api/workrooms/team_core").json()
+        activity = client.get("/api/activity?team_id=team_core").json()["activity"]
+
+    assert plan["metadata_only"] is True
+    assert plan["task_count"] == 2
+    assert len(plan["objective_digest"]) == 64
+    assert plan["policy"]["handoff_mode"] == "bounded_auto"
+    assert all(task["owner_checkpoint"] for task in plan["tasks"])
+    assert all(task["checkpoint_status"] == "pending" for task in plan["tasks"])
+    assert {task["agent_id"] for task in plan["tasks"]} == {"agent_pi_operator", helper["id"]}
+    assert workroom["readiness"]["task_count"] == 2
+    assert rejected.status_code == 403
+    combined = f"{plan} {workroom}".lower()
+    assert "abc123" not in combined
+    assert "api_key" not in combined
+    assert "https://private.invalid" not in combined
+    assert "raw tool arguments" not in combined
+    assert "workroom.handoff_planned" in [item["event_type"] for item in activity]
+    assert "workroom.handoff_task_created" in [item["event_type"] for item in activity]
+
+
 def test_delegated_task_queue_uses_safe_metadata_and_registry_grants(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
