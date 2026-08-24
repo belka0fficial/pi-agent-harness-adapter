@@ -3332,6 +3332,108 @@ def test_group_round_stream_emits_live_speaker_events(monkeypatch, tmp_path):
     assert [message["role"] for message in messages] == ["owner", "agent", "agent"]
 
 
+def test_group_sequence_runs_bounded_rounds_for_each_speaker(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = MultiSpeakerPi()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={"name": "Group Teammate", "purpose": "Participate in bounded group sequences."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Group Sequence Team",
+                "purpose": "Test bounded group sequences.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Group Sequence",
+                "agent_id": "agent_pi_operator",
+                "team_id": team["id"],
+                "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        result = client.post(
+            f"/api/sessions/{session['id']}/group-sequence",
+            json={"input": "Discuss the release plan safely.", "rounds": 2},
+        )
+        messages = client.get(f"/api/chats/{session['id']}/messages").json()["messages"]
+        activity = client.get(f"/api/activity?team_id={team['id']}").json()["activity"]
+
+    assert result.status_code == 200
+    payload = result.json()
+    assert payload["sequence"] == {
+        "status": "ok",
+        "round_count": 2,
+        "requested_rounds": 2,
+        "speaker_count": 2,
+    }
+    assert len(payload["rounds"]) == 2
+    assert [round_item["round_index"] for round_item in payload["rounds"]] == [1, 2]
+    assert len(app.state.pi.calls) == 4
+    assert [message["role"] for message in messages] == ["owner", "agent", "agent", "owner", "agent", "agent"]
+    assert messages[0]["content"].startswith("Discuss the release plan safely.")
+    assert messages[3]["content"].startswith("Discuss the release plan safely.")
+    assert all("round_index" in response for item in payload["rounds"] for response in item["responses"])
+    assert "Discuss the release plan safely" not in str(activity)
+    assert "group.sequence_completed" in [item["event_type"] for item in activity]
+
+
+def test_group_sequence_stream_emits_sequence_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+    app.state.pi = MultiSpeakerPi()
+
+    with TestClient(app) as client:
+        teammate = client.post(
+            "/api/agents",
+            json={"name": "Group Teammate", "purpose": "Participate in live group sequences."},
+        ).json()
+        team = client.post(
+            "/api/teams",
+            json={
+                "name": "Group Sequence Stream Team",
+                "purpose": "Test live group sequence events.",
+                "orchestrator_agent_id": "agent_pi_operator",
+                "member_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        session = client.post(
+            "/api/sessions",
+            json={
+                "title": "Group Sequence Stream",
+                "agent_id": "agent_pi_operator",
+                "team_id": team["id"],
+                "participant_agent_ids": ["agent_pi_operator", teammate["id"]],
+            },
+        ).json()
+        with client.stream(
+            "POST",
+            f"/api/sessions/{session['id']}/group-sequence/stream",
+            json={"input": "Live sequence update.", "rounds": 2},
+        ) as response:
+            body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "event: group.sequence.started" in body
+    assert body.count("event: group.round.started") == 2
+    assert body.count("event: group.speaker.started") == 4
+    assert body.count("event: group.speaker.completed") == 4
+    assert "event: group.sequence.completed" in body
+    assert '"round_index": 1' in body
+    assert '"round_index": 2' in body
+    assert "Live sequence update" not in body
+
+
 def test_tool_draft_artifacts_are_metadata_only(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")

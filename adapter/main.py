@@ -44,6 +44,10 @@ class GroupRoundInput(ChatInput):
     max_speakers: int = Field(default=6, ge=2, le=12)
 
 
+class GroupSequenceInput(GroupRoundInput):
+    rounds: int = Field(default=2, ge=2, le=3)
+
+
 class JobInput(BaseModel):
     name: str = Field(min_length=1)
     schedule: str = Field(min_length=1)
@@ -4814,7 +4818,14 @@ async def chat_stream(session_id: str, payload: ChatInput, request: Request):
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-async def _run_group_round(session_id: str, payload: GroupRoundInput, emit=None) -> dict[str, Any]:
+async def _run_group_round(
+    session_id: str,
+    payload: GroupRoundInput,
+    emit=None,
+    *,
+    round_index: int | None = None,
+    round_count: int | None = None,
+) -> dict[str, Any]:
     session = app.state.sessions.get(session_id)
     if not session:
         raise HTTPException(404, "session not found")
@@ -4851,6 +4862,8 @@ async def _run_group_round(session_id: str, payload: GroupRoundInput, emit=None)
             "session_id": session_id,
             "team_id": team_id,
             "speaker_count": len(actors),
+            "round_index": round_index,
+            "round_count": round_count,
         }))
 
     for actor in actors:
@@ -4903,6 +4916,8 @@ async def _run_group_round(session_id: str, payload: GroupRoundInput, emit=None)
                 "agent_id": actor["agent_id"],
                 "team_id": actor["team_id"],
                 "status": "running",
+                "round_index": round_index,
+                "round_count": round_count,
             }))
         try:
             async for event in app.state.pi.stream(payload.input, session_id=session_id, options=options):
@@ -4915,6 +4930,8 @@ async def _run_group_round(session_id: str, payload: GroupRoundInput, emit=None)
                             "delta": delta,
                             "agent_id": actor["agent_id"],
                             "team_id": actor["team_id"],
+                            "round_index": round_index,
+                            "round_count": round_count,
                         }))
                 if event.event in {"run.failed", "run.stopped"}:
                     run_status = "failed" if event.event == "run.failed" else "stopped"
@@ -4947,6 +4964,8 @@ async def _run_group_round(session_id: str, payload: GroupRoundInput, emit=None)
             "status": run_status,
             "output_chars": len(content),
             "error_summary": error_summary or None,
+            "round_index": round_index,
+            "round_count": round_count,
         }
         results.append(result)
         if emit:
@@ -4960,6 +4979,8 @@ async def _run_group_round(session_id: str, payload: GroupRoundInput, emit=None)
         "round": {
             "status": "ok" if all(item["status"] == "ok" for item in results) else "partial_failed",
             "speaker_count": len(results),
+            "round_index": round_index,
+            "round_count": round_count,
             "responses": results,
         },
     }
@@ -4984,6 +5005,95 @@ async def group_round_stream(session_id: str, payload: GroupRoundInput):
         async def run() -> None:
             try:
                 await _run_group_round(session_id, payload, emit=emit)
+            except HTTPException as exc:
+                await queue.put(PiEvent("run.failed", {"message": str(exc.detail)[:1000]}))
+            except Exception as exc:
+                await queue.put(PiEvent("run.failed", {"message": _safe_error_summary(exc)}))
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield event_to_sse(event)
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+async def _run_group_sequence(session_id: str, payload: GroupSequenceInput, emit=None) -> dict[str, Any]:
+    session = app.state.sessions.get(session_id)
+    if not session:
+        raise HTTPException(404, "session not found")
+    participant_ids = session.get("participant_agent_ids") or [session.get("agent_id") or "agent_pi_operator"]
+    if len(participant_ids) < 2:
+        raise HTTPException(409, "group sequence requires at least two participants")
+    if emit:
+        await emit(PiEvent("group.sequence.started", {
+            "session_id": session_id,
+            "team_id": payload.team_id if payload.team_id is not None else session.get("team_id"),
+            "round_count": payload.rounds,
+            "max_speakers": payload.max_speakers,
+        }))
+    rounds: list[dict[str, Any]] = []
+    for index in range(payload.rounds):
+        round_payload = payload.model_copy(
+            update={
+                "input": f"{payload.input}\n\nRound {index + 1} of {payload.rounds}: answer once, briefly, then wait for the next participant.",
+            }
+        )
+        result = await _run_group_round(
+            session_id,
+            round_payload,
+            emit=emit,
+            round_index=index + 1,
+            round_count=payload.rounds,
+        )
+        rounds.append(result["round"])
+        if result["round"].get("status") != "ok":
+            break
+    sequence = {
+        "status": "ok" if all(item.get("status") == "ok" for item in rounds) and len(rounds) == payload.rounds else "partial_failed",
+        "round_count": len(rounds),
+        "requested_rounds": payload.rounds,
+        "speaker_count": rounds[-1].get("speaker_count", 0) if rounds else 0,
+    }
+    _record_activity(
+        session.get("agent_id") or "agent_pi_operator",
+        event_type="group.sequence_completed",
+        status=sequence["status"],
+        source="Pi adapter",
+        summary=f"Group sequence {sequence['status']}: {sequence['round_count']}/{sequence['requested_rounds']} rounds",
+        team_id=session.get("team_id"),
+        ref_type="session",
+        ref_id=session_id,
+    )
+    if emit:
+        await emit(PiEvent("group.sequence.completed", sequence))
+    return {"session": _public_session(app.state.sessions[session_id]), "sequence": sequence, "rounds": rounds}
+
+
+@app.post("/api/sessions/{session_id}/group-sequence")
+async def group_sequence(session_id: str, payload: GroupSequenceInput):
+    return await _run_group_sequence(session_id, payload)
+
+
+@app.post("/api/sessions/{session_id}/group-sequence/stream")
+async def group_sequence_stream(session_id: str, payload: GroupSequenceInput):
+    async def events():
+        queue: asyncio.Queue[PiEvent | None] = asyncio.Queue()
+
+        async def emit(event: PiEvent) -> None:
+            await queue.put(event)
+
+        async def run() -> None:
+            try:
+                await _run_group_sequence(session_id, payload, emit=emit)
             except HTTPException as exc:
                 await queue.put(PiEvent("run.failed", {"message": str(exc.detail)[:1000]}))
             except Exception as exc:
