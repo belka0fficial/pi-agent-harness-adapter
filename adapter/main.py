@@ -5904,6 +5904,23 @@ def _provider_risk(provider_id: str) -> dict[str, str]:
     }
 
 
+def _safe_model_route_label(value: Any, *, field: str, limit: int) -> str:
+    label = _safe_text(value, limit=limit)
+    if not label:
+        return ""
+    lowered = label.lower()
+    if (
+        "://" in lowered
+        or re.search(r"\s", label)
+        or re.search(r"\S+@\S+", label)
+        or re.search(r"\b(token|secret|password|api[_-]?key|bearer|webhook|endpoint|url)\b", lowered)
+        or re.search(r"\+?\d[\d\s()./-]{6,}\d", label)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:+-]{0,159}", label)
+    ):
+        raise HTTPException(422, f"{field} must be a safe provider/model label, not a URL, credential, contact, or raw config value")
+    return label
+
+
 AUXILIARY_MODEL_TASKS = {
     "summary": {
         "id": "summary",
@@ -5946,8 +5963,8 @@ def _safe_auxiliary_model_route(task_id: str, value: Any | None = None) -> dict[
     if not task:
         raise HTTPException(404, "auxiliary model task not found")
     source = value if isinstance(value, dict) else {}
-    provider = _safe_text(source.get("provider"), limit=120)
-    model = _safe_text(source.get("model"), limit=160)
+    provider = _safe_model_route_label(source.get("provider"), field="provider", limit=120)
+    model = _safe_model_route_label(source.get("model"), field="model", limit=160)
     risk_policy = str(source.get("risk_policy") or task["allowed_policy"])
     if risk_policy not in AUXILIARY_MODEL_POLICIES:
         risk_policy = task["allowed_policy"]
@@ -6054,10 +6071,16 @@ def _auxiliary_routes_payload(*, probe_routes: bool = True) -> dict[str, Any]:
 
 
 def _safe_gateway_model(row: dict[str, Any]) -> dict[str, Any] | None:
-    model_id = _safe_text(row.get("id") or row.get("name"), limit=160)
+    try:
+        model_id = _safe_model_route_label(row.get("id") or row.get("name"), field="model", limit=160)
+    except HTTPException:
+        return None
     if not model_id:
         return None
-    owned_by = _safe_text(row.get("owned_by") or row.get("provider") or "freellmapi", limit=80)
+    try:
+        owned_by = _safe_model_route_label(row.get("owned_by") or row.get("provider") or "freellmapi", field="provider", limit=80)
+    except HTTPException:
+        owned_by = "freellmapi"
     context = row.get("context_window") or row.get("context") or row.get("max_context")
     modalities = row.get("modalities") if isinstance(row.get("modalities"), list) else []
     capabilities = row.get("capabilities") if isinstance(row.get("capabilities"), list) else []
@@ -6230,8 +6253,8 @@ def model_route_check(payload: ModelRouteProbeInput):
 
 
 def _model_route_probe(provider_value: str, model_value: str) -> dict[str, Any]:
-    provider = _safe_text(provider_value, limit=120)
-    model = _safe_text(model_value, limit=160)
+    provider = _safe_model_route_label(provider_value, field="provider", limit=120)
+    model = _safe_model_route_label(model_value, field="model", limit=160)
     if not provider or not model:
         raise HTTPException(422, "provider and model are required")
     options = _model_options_payload()
@@ -6284,8 +6307,8 @@ def _safe_route_probe(label: str, provider: str, model: str, *, optional: bool =
     if not provider or not model:
         item = _empty_route_probe(label, optional=False)
         item.update({
-            "provider": _safe_text(provider, limit=120),
-            "model": _safe_text(model, limit=160),
+            "provider": _safe_model_route_label(provider, field="provider", limit=120) if provider else "",
+            "model": _safe_model_route_label(model, field="model", limit=160) if model else "",
             "status": "incomplete",
             "policy": "required" if not optional else "blocked",
             "note": "Set both provider and model before relying on this route.",
@@ -6296,8 +6319,8 @@ def _safe_route_probe(label: str, provider: str, model: str, *, optional: bool =
     except Exception:
         item = _empty_route_probe(label, optional=optional)
         item.update({
-            "provider": _safe_text(provider, limit=120),
-            "model": _safe_text(model, limit=160),
+            "provider": "[invalid]",
+            "model": "[invalid]",
             "status": "incomplete",
             "policy": "blocked",
             "note": "Route could not be checked with safe metadata.",
@@ -6352,10 +6375,10 @@ MODEL_ROUTE_FIELDS = {
 
 def _route_values_from_payload(agent: dict[str, Any], payload: dict[str, Any]) -> dict[str, str]:
     return {
-        "primary_provider": _safe_text(payload.get("primary_provider", agent.get("primary_provider") or ""), limit=120),
-        "primary_model": _safe_text(payload.get("primary_model", agent.get("primary_model") or ""), limit=160),
-        "fallback_provider": _safe_text(payload.get("fallback_provider", agent.get("fallback_provider") or ""), limit=120),
-        "fallback_model": _safe_text(payload.get("fallback_model", agent.get("fallback_model") or ""), limit=160),
+        "primary_provider": _safe_model_route_label(payload.get("primary_provider", agent.get("primary_provider") or ""), field="primary_provider", limit=120),
+        "primary_model": _safe_model_route_label(payload.get("primary_model", agent.get("primary_model") or ""), field="primary_model", limit=160),
+        "fallback_provider": _safe_model_route_label(payload.get("fallback_provider", agent.get("fallback_provider") or ""), field="fallback_provider", limit=120),
+        "fallback_model": _safe_model_route_label(payload.get("fallback_model", agent.get("fallback_model") or ""), field="fallback_model", limit=160),
     }
 
 
@@ -6426,6 +6449,11 @@ def _route_digest(agent_id: str, route: dict[str, str]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _current_agent_route_digest(agent_id: str) -> str:
+    agent = app.state.agents.get(agent_id) or {}
+    return _route_digest(agent_id, _route_values_from_payload(agent, {}))
+
+
 def _apply_model_route(agent_id: str, route: dict[str, str], *, source: str, request_id: str | None = None) -> dict[str, Any]:
     item = app.state.agents.get(agent_id)
     if not item:
@@ -6448,6 +6476,7 @@ def _apply_model_route(agent_id: str, route: dict[str, str], *, source: str, req
 
 def _create_model_route_request(agent_id: str, route: dict[str, str], plan: dict[str, Any], risk: dict[str, Any], reason: str = "") -> dict[str, Any]:
     route_digest = _route_digest(agent_id, route)
+    current_route_digest = _current_agent_route_digest(agent_id)
     existing = [
         item for item in app.state.model_route_proposals.values()
         if item.get("agent_id") == agent_id and item.get("status") == "pending"
@@ -6457,7 +6486,12 @@ def _create_model_route_request(agent_id: str, route: dict[str, str], plan: dict
             request = app.state.gates.request_status(str(item.get("toolgate_request_id") or ""))
         except Exception:
             request = None
-        if request and str(request.get("status") or "") == "pending" and item.get("route_digest") == route_digest:
+        if (
+            request
+            and str(request.get("status") or "") == "pending"
+            and item.get("route_digest") == route_digest
+            and item.get("current_route_digest") == current_route_digest
+        ):
             return {"proposal": item, "request": request}
     agent = app.state.agents.get(agent_id) or {}
     proposal_id = f"modelroute_{uuid.uuid4().hex[:12]}"
@@ -6468,6 +6502,7 @@ def _create_model_route_request(agent_id: str, route: dict[str, str], plan: dict
         "agent_id": agent_id,
         "route": route,
         "route_digest": route_digest,
+        "current_route_digest": current_route_digest,
         "route_summary": _safe_route_change_summary(plan),
         "approval_reasons": risk["reasons"],
         "owner_reason_digest": _job_prompt_digest(reason or ""),
@@ -6489,6 +6524,7 @@ def _create_model_route_request(agent_id: str, route: dict[str, str], plan: dict
         "agent_id": agent_id,
         "route": route,
         "route_digest": route_digest,
+        "current_route_digest": current_route_digest,
         "route_summary": payload["route_summary"],
         "approval_reasons": risk["reasons"],
         "toolgate_request_id": request.get("id"),
@@ -6525,6 +6561,17 @@ def _apply_model_route_request(result: dict[str, Any], decision: str) -> None:
             app.state.model_route_proposals[proposal_id] = proposal
             _save_registry_item("model_route_proposal", proposal)
             result["model_route_status"] = "digest_mismatch"
+            return
+        current_digest = _current_agent_route_digest(str(proposal.get("agent_id") or ""))
+        expected_current_digest = proposal.get("current_route_digest") or request_payload.get("current_route_digest")
+        if expected_current_digest and current_digest != expected_current_digest:
+            proposal["status"] = "stale"
+            proposal["stale_reason"] = "agent model route changed after ToolGate review was requested"
+            proposal["updated_at"] = now()
+            app.state.model_route_proposals[proposal_id] = proposal
+            _save_registry_item("model_route_proposal", proposal)
+            result["model_route_status"] = "stale"
+            result["model_route_stale_reason"] = proposal["stale_reason"]
             return
         _apply_model_route(
             str(proposal.get("agent_id") or ""),

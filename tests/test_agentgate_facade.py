@@ -2713,6 +2713,161 @@ def test_auxiliary_model_routes_are_metadata_only(monkeypatch, tmp_path):
     assert "private.example" not in str(listed)
 
 
+def test_model_route_labels_reject_urls_and_credentials_before_toolgate(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        before_proposals = len(app.state.model_route_proposals)
+        response = client.post(
+            "/api/model/routes/agent_pi_operator/save",
+            json={
+                "primary_provider": "freellmapi",
+                "primary_model": "https://private.invalid/model?token=secret-value",
+                "fallback_provider": "bearer secret-value",
+                "fallback_model": "",
+            },
+        )
+        aux = client.patch(
+            "/api/model/auxiliary-routes/summary",
+            json={
+                "provider": "freellmapi",
+                "model": "https://private.invalid/model?token=secret-value",
+                "enabled": False,
+            },
+        )
+        probe = client.post(
+            "/api/model/route-check",
+            json={"provider": "bearer secret-value", "model": "stealth/ox-alpha"},
+        )
+
+    assert response.status_code == 422
+    assert aux.status_code == 422
+    assert probe.status_code == 422
+    assert len(app.state.model_route_proposals) == before_proposals
+    visible = json.dumps({
+        "route": response.json(),
+        "aux": aux.json(),
+        "probe": probe.json(),
+        "proposals": app.state.model_route_proposals,
+    }).lower()
+    assert "https://private.invalid" not in visible
+    assert "token=secret-value" not in visible
+    assert "bearer secret-value" not in visible
+
+
+def test_gateway_candidates_skip_hostile_model_labels():
+    skipped = main._safe_gateway_model({
+        "id": "https://private.invalid/model?token=secret-value",
+        "owned_by": "bearer secret-value",
+    })
+    safe = main._safe_gateway_model({
+        "id": "stealth/ox-alpha",
+        "owned_by": "StealthProvider",
+        "modalities": ["text"],
+    })
+
+    assert skipped is None
+    assert safe
+    assert safe["model"] == "stealth/ox-alpha"
+    assert safe["provider"] == "freellmapi"
+    assert "https://private.invalid" not in json.dumps(safe).lower()
+    assert "token=secret-value" not in json.dumps(safe).lower()
+
+
+def test_model_route_approval_applies_and_rejects_metadata_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        original = client.get("/api/agents/agent_pi_operator").json()
+        queued = client.post(
+            "/api/model/routes/agent_pi_operator/save",
+            json={
+                "primary_provider": "freellmapi",
+                "primary_model": "stealth/ox-alpha",
+                "fallback_provider": "",
+                "fallback_model": "",
+                "reason": "try https://private.invalid with token=secret-value",
+            },
+        ).json()
+        request = app.state.gates.requests[queued["request_id"]]
+        approved = client.post(
+            f"/api/approvals/{queued['request_id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        after_approval = client.get("/api/agents/agent_pi_operator").json()
+        rejected = client.post(
+            "/api/model/routes/agent_pi_operator/save",
+            json={
+                "primary_provider": "freellmapi",
+                "primary_model": "stealth/reject-me",
+                "fallback_provider": "",
+                "fallback_model": "",
+                "reason": "reject this one",
+            },
+        ).json()
+        reject_decision = client.post(
+            f"/api/approvals/{rejected['request_id']}/decision",
+            json={"decision": "rejected"},
+        ).json()
+        after_reject = client.get("/api/agents/agent_pi_operator").json()
+
+    visible = json.dumps({"queued": queued, "request": request, "approved": approved}).lower()
+    assert original["primary_model"] != "stealth/ox-alpha"
+    assert queued["status"] == "pending_approval"
+    assert queued["safe_metadata_only"] is True
+    assert queued["credentials_included"] is False
+    assert queued["raw_prompts_included"] is False
+    assert queued["upstream_details_included"] is False
+    assert request["payload"]["metadata_only"] is True
+    assert request["payload"]["route_digest"]
+    assert request["payload"]["current_route_digest"]
+    assert "owner_reason_digest" in request["payload"]
+    assert "https://private.invalid" not in visible
+    assert "token=secret-value" not in visible
+    assert approved["model_route_status"] == "applied"
+    assert after_approval["primary_provider"] == "freellmapi"
+    assert after_approval["primary_model"] == "stealth/ox-alpha"
+    assert reject_decision["model_route_status"] == "rejected"
+    assert after_reject["primary_model"] == "stealth/ox-alpha"
+
+
+def test_model_route_approval_goes_stale_after_agent_route_change(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
+    reset_state()
+
+    with TestClient(app) as client:
+        main._ensure_registry_seeded()
+        app.state.agents["agent_pi_operator"]["primary_provider"] = "openai-codex"
+        app.state.agents["agent_pi_operator"]["primary_model"] = "gpt-5.6-luna"
+        queued = client.post(
+            "/api/model/routes/agent_pi_operator/save",
+            json={
+                "primary_provider": "freellmapi",
+                "primary_model": "stealth/stale-route",
+                "fallback_provider": "",
+                "fallback_model": "",
+            },
+        ).json()
+        app.state.agents["agent_pi_operator"]["primary_model"] = "gpt-5.6-terra"
+        stale = client.post(
+            f"/api/approvals/{queued['request_id']}/decision",
+            json={"decision": "approved"},
+        ).json()
+        after = client.get("/api/agents/agent_pi_operator").json()
+
+    assert stale["model_route_status"] == "stale"
+    assert stale["model_route_stale_reason"]
+    assert after["primary_provider"] == "openai-codex"
+    assert after["primary_model"] == "gpt-5.6-terra"
+
+
 def test_agent_activity_records_safe_chat_and_job_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(main, "REGISTRY_DB", tmp_path / "registry.sqlite3")
