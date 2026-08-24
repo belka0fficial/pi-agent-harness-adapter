@@ -226,6 +226,7 @@ app.state.jobs = {}
 app.state.tasks = {}
 app.state.tool_drafts = {}
 app.state.active_runs = {}
+app.state.active_job_runs = {}
 app.state.approval_runs = {}
 app.state.agents = {}
 app.state.teams = {}
@@ -2601,7 +2602,8 @@ def _append_job_run_history(item: dict[str, Any], result: dict[str, Any]) -> Non
 def _public_job(item: dict[str, Any]) -> dict[str, Any]:
     result = item.get("last_result") or {}
     failure_policy = _sanitize_failure_policy(item.get("failure_policy"))
-    status = "pending_approval" if item.get("approval_status") == "pending" else "paused" if item.get("paused") else "active"
+    active_run = getattr(app.state, "active_job_runs", {}).get(item.get("id")) or {}
+    status = "running" if active_run else "pending_approval" if item.get("approval_status") == "pending" else "paused" if item.get("paused") else "active"
     return {
         "id": item.get("id"),
         "job_id": item.get("job_id") or item.get("id"),
@@ -2612,6 +2614,11 @@ def _public_job(item: dict[str, Any]) -> dict[str, Any]:
         "schedule_preview": item.get("schedule_preview", []),
         "next": item.get("next_run_at") or "—",
         "status": status,
+        "is_running": bool(active_run),
+        "active_run": {
+            "status": "running",
+            "started_at": active_run.get("started_at"),
+        } if active_run else None,
         "runs": item.get("runs", 0),
         "last_status": result.get("status", "never"),
         "last_run": item.get("last_run_at") or "—",
@@ -2878,20 +2885,40 @@ async def run_job(job_id: str):
     chunks = []
     status = "ok"
     error = None
-    async for event in app.state.pi.stream(
-        item["prompt"],
-        session_id=f"job:{job_id}",
-        options={
-            "headless": True,
-            "deliver": item.get("deliver"),
-            "toolgate_execution_key": toolgate_execution_key,
-        },
-    ):
-        if event.event == "message.delta":
-            chunks.append(str(event.data.get("delta") or event.data.get("text") or event.data.get("content") or ""))
-        elif event.event == "run.failed":
-            status = "failed"
-            error = event.data.get("message") or "Pi run failed"
+    active_run_id = ""
+    try:
+        async for event in app.state.pi.stream(
+            item["prompt"],
+            session_id=f"job:{job_id}",
+            options={
+                "headless": True,
+                "deliver": item.get("deliver"),
+                "toolgate_execution_key": toolgate_execution_key,
+            },
+        ):
+            event_data = event.data if isinstance(event.data, dict) else {}
+            run_id = str(event_data.get("run_id") or "")
+            if event.event == "run.started" and run_id:
+                active_run_id = run_id
+                app.state.active_job_runs[job_id] = {
+                    "run_id": run_id,
+                    "started_at": item["last_run_at"],
+                }
+            if event.event == "message.delta":
+                chunks.append(str(event_data.get("delta") or event_data.get("text") or event_data.get("content") or ""))
+            elif event.event == "run.failed":
+                status = "failed"
+                error = event_data.get("message") or "Pi run failed"
+            elif event.event == "run.stopped":
+                status = "stopped"
+                error = _redact_audit_text(event_data.get("message") or "Run stopped by owner", limit=240)
+    except Exception as exc:
+        status = "failed"
+        error = _safe_error_summary(exc)
+    finally:
+        active = app.state.active_job_runs.get(job_id)
+        if active and (not active_run_id or active.get("run_id") == active_run_id):
+            app.state.active_job_runs.pop(job_id, None)
     output = "".join(chunks)
     result = {
         "job_id": job_id,
@@ -2911,6 +2938,8 @@ async def run_job(job_id: str):
             item["next_run_at"] = None
             item["quarantine_reason"] = f"paused after {failure_policy['max_consecutive_failures']} consecutive failed runs"
             _sync_scheduler(job_id)
+    elif status == "stopped":
+        item.pop("quarantine_reason", None)
     else:
         item["failure_count"] = 0
         item.pop("quarantine_reason", None)
@@ -3130,6 +3159,48 @@ async def run_now(job_id: str):
         raise HTTPException(404, "job not found")
     await run_job(job_id)
     return _public_job(app.state.jobs[job_id])
+
+
+@app.post("/api/jobs/{job_id}/stop")
+async def stop_job_run(job_id: str):
+    if job_id not in app.state.jobs:
+        raise HTTPException(404, "job not found")
+    active = app.state.active_job_runs.get(job_id)
+    if not active:
+        raise HTTPException(404, "active job run not found")
+    run_id = str(active.get("run_id") or "")
+    if not run_id:
+        app.state.active_job_runs.pop(job_id, None)
+        raise HTTPException(404, "active job run not found")
+    try:
+        await app.state.pi.stop_run(run_id)
+    except ValueError:
+        app.state.active_job_runs.pop(job_id, None)
+        raise HTTPException(404, "run not found")
+    item = app.state.jobs[job_id]
+    item["updated_at"] = now()
+    try:
+        _record_activity(
+            item.get("agent_id") or "agent_pi_operator",
+            event_type="job.stop_requested",
+            status="stopping",
+            source="AgentGate",
+            summary=f"Stop requested for automation job: {item.get('name') or job_id}",
+            team_id=item.get("team_id"),
+            ref_type="job",
+            ref_id=job_id,
+        )
+    except sqlite3.OperationalError:
+        _note_persistence_failure(job_id, "registry unavailable: stop request activity not persisted")
+    return {
+        "job_id": job_id,
+        "status": "stopping",
+        "requested_at": item["updated_at"],
+        "active_run": {
+            "status": "stopping",
+            "started_at": active.get("started_at"),
+        },
+    }
 
 
 @app.post("/api/sessions/{session_id}/fork")

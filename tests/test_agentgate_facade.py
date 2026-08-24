@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 
 from fastapi.testclient import TestClient
 
@@ -278,6 +279,7 @@ def reset_state():
     app.state.teams = {}
     app.state.tool_drafts = {}
     app.state.memory_candidates = {}
+    app.state.active_job_runs = {}
     app.state.approval_runs = {}
 
 
@@ -1544,6 +1546,26 @@ class BlockedJobPi:
         yield
 
 
+class StoppableJobPi:
+    def __init__(self):
+        self.started = threading.Event()
+        self.stop_requested = threading.Event()
+
+    async def stream(self, prompt: str, *, session_id: str, options=None):
+        from adapter.pi_client import PiEvent
+        yield PiEvent("run.started", {"run_id": "run-private-job", "session_id": session_id})
+        self.started.set()
+        while not self.stop_requested.is_set():
+            await asyncio.sleep(0.01)
+        yield PiEvent("run.stopped", {"run_id": "run-private-job", "message": "Run stopped by owner"})
+
+    async def stop_run(self, run_id: str):
+        if run_id != "run-private-job":
+            raise ValueError("run not found")
+        self.stop_requested.set()
+        return {"run_id": run_id}
+
+
 def test_chat_retrieves_memorygate_context_and_records_completed_transcript():
     reset_state()
     pi = CapturingPi()
@@ -2774,6 +2796,77 @@ def test_automation_run_persists_safe_result_summary_only():
     assert facade_job["last_result"]["output_summary"] == "context-aware"
     assert "output" not in facade_job["last_result"]
     assert "prompt" not in facade_job["last_result"]
+
+
+def test_automation_active_run_can_be_stopped_without_exposing_pi_run_id():
+    reset_state()
+    pi = StoppableJobPi()
+    app.state.pi = pi
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Stoppable Job",
+                "schedule": "0 9 * * *",
+                "prompt": "private long-running automation prompt",
+            },
+        ).json()
+        result_holder = {}
+
+        def run_job_now():
+            result_holder["response"] = client.post(f"/api/jobs/{created['id']}/run")
+
+        thread = threading.Thread(target=run_job_now)
+        thread.start()
+        assert pi.started.wait(timeout=3)
+
+        running = next(
+            item for item in client.get("/api/automations").json()["automations"] if item["id"] == created["id"]
+        )
+        stopped = client.post(f"/api/jobs/{created['id']}/stop")
+        thread.join(timeout=3)
+        completed = result_holder["response"].json()
+        listed = next(
+            item for item in client.get("/api/automations").json()["automations"] if item["id"] == created["id"]
+        )
+
+    assert stopped.status_code == 200
+    assert running["status"] == "running"
+    assert running["is_running"] is True
+    assert running["active_run"]["status"] == "running"
+    assert "run_id" not in running["active_run"]
+    assert stopped.json()["status"] == "stopping"
+    assert stopped.json()["active_run"]["status"] == "stopping"
+    assert "run_id" not in stopped.text
+    assert "run-private-job" not in stopped.text
+    assert "private long-running automation prompt" not in stopped.text
+    assert completed["last_result"]["status"] == "stopped"
+    assert completed["is_running"] is False
+    assert completed["active_run"] is None
+    assert completed["failure_count"] == 0
+    assert listed["status"] == "active"
+    assert listed["last_result"]["status"] == "stopped"
+    assert "run-private-job" not in str(completed)
+    assert "private long-running automation prompt" not in str(completed["last_result"])
+
+
+def test_automation_stop_without_active_run_fails_safely():
+    reset_state()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "name": "Idle Job",
+                "schedule": "0 9 * * *",
+                "prompt": "private idle prompt",
+            },
+        ).json()
+        stopped = client.post(f"/api/jobs/{created['id']}/stop")
+
+    assert stopped.status_code == 404
+    assert "run_id" not in stopped.text
+    assert "private idle prompt" not in stopped.text
 
 
 def test_automation_pauses_after_three_failures():
